@@ -54,6 +54,40 @@ def get_settings() -> Settings:
     """Return the cached application settings."""
 ```
 
+## Pull Request Workflow
+
+- **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`
+  first. If either fails, stop, report it, and do not push or open a PR.
+- **Check the current branch before pushing.** Confirm `git branch --show-current` is the
+  intended feature branch — never push from `main` on someone's behalf.
+- **Verify working tree status before committing/pushing.** Run `git status` and review the
+  diff; only stage the files that belong to the change.
+- **Never push unrelated files.** Commit and push exactly what the task scoped — no drive-by
+  cleanups bundled into an unrelated PR.
+- **Prefer small, focused PRs.** One milestone or one concern per PR, matching the "small
+  incremental milestones" rule above.
+
+### PR title style
+
+Short, imperative, present tense, no trailing period — e.g. `Add Ollama provider health checks`.
+
+### PR description format
+
+Every PR description follows this structure, in this order:
+
+1. **Summary** — one or two sentences on what the PR does.
+2. **Why** — the motivating requirement or problem.
+3. **Changes** — bullet list of what was added/modified.
+4. **Verification** — the exact commands run and their output/result (e.g. `pytest -q`,
+   `ruff check .`, `mypy app`, `docker compose config`). Include real output, not a claim that
+   it passed.
+5. **Explicit exclusions / intentionally not implemented** — what this PR deliberately does not
+   do, so reviewers don't wonder if something was missed.
+6. **Next recommended milestone** — one concrete, scoped suggestion for what comes after this PR.
+
+If the PR is documentation-only or otherwise doesn't change application behavior, say so
+explicitly in the Summary (e.g. "Documentation-only change; no application behavior changed.").
+
 ## Final report format
 
 At the end of any non-trivial change, report back with these sections, in this order:

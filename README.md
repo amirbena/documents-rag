@@ -98,6 +98,22 @@ cleanly before committing.
 - **Full reset** (drops Postgres/Qdrant/Ollama volumes — deletes local data):
   `docker compose down -v`.
 
+## GitHub CLI / PR workflow
+
+Pull requests are created from the terminal with the [GitHub CLI](https://cli.github.com/)
+(`gh`), not the web UI. Before opening a PR:
+
+```bash
+gh --version       # verify the CLI is installed
+gh auth status     # verify you're authenticated
+```
+
+PRs should be small and focused (one milestone per PR) and their description should include
+verification results (test/lint/type-check output), not just a claim that checks passed. PR
+titles and the full description format (Summary, Why, Changes, Verification, Explicit
+exclusions, Next recommended milestone) are defined in [CLAUDE.md](CLAUDE.md) under
+"Pull Request Workflow" — follow that format for every PR.
+
 ## Current milestone status
 
 Infrastructure scaffold complete and verified: FastAPI app, Docker Compose topology (app,
