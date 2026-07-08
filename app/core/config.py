@@ -30,8 +30,14 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = Field(default="nomic-embed-text", alias="OLLAMA_EMBEDDING_MODEL")
 
     llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
+    llm_model: str | None = Field(default=None, alias="LLM_MODEL")
     embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
     vector_store_provider: str = Field(default="qdrant", alias="VECTOR_STORE_PROVIDER")
+
+    @property
+    def resolved_llm_model(self) -> str:
+        """Return LLM_MODEL if set, else OLLAMA_CHAT_MODEL for backward compatibility."""
+        return self.llm_model or self.ollama_chat_model
 
 
 @lru_cache

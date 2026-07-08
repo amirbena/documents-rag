@@ -26,8 +26,9 @@ The app queries Ollama's `/api/tags` endpoint (via `app/services/ollama_client.p
 reachability and whether the configured models are pulled, calls `/api/embeddings` (via
 `app/rag/providers/ollama_embedding_provider.py`) to embed text with `OLLAMA_EMBEDDING_MODEL`,
 and calls `/api/generate` with `stream=true` (via `app/rag/providers/ollama_llm_provider.py`) to
-stream completions from `OLLAMA_CHAT_MODEL`. The LLM provider is internal-only — there is no
-public chat or SSE endpoint yet. Callers resolve these providers through
+stream completions from the configured chat model (`LLM_MODEL`, falling back to
+`OLLAMA_CHAT_MODEL` — see "LLM provider vs. model" below). The LLM provider is internal-only —
+there is no public chat or SSE endpoint yet. Callers resolve these providers through
 `app/rag/providers/provider_factory.py` rather than importing Ollama classes directly — see
 "Provider factory" below. Postgres, Redis, and Qdrant are still unused beyond connection
 configuration and abstract interfaces (`app/rag/providers/`).
@@ -53,6 +54,21 @@ providers through it rather than importing `OllamaEmbeddingProvider`/`OllamaLLMP
 The factory never falls back to Ollama for a misconfigured or unimplemented provider — every
 non-`ollama` value either resolves to its own explicit failure or a real alternative
 implementation.
+
+## LLM provider vs. model
+
+`LLM_PROVIDER` (which backend to use, e.g. `ollama`) and `LLM_MODEL` (which model that backend
+should use, e.g. `llama3.1`) are deliberately separate settings — changing the model doesn't
+require touching provider selection, and vice versa. `Settings.resolved_llm_model`
+(`app/core/config.py`) is the single place that decides the effective model: it returns
+`LLM_MODEL` if set, otherwise falls back to `OLLAMA_CHAT_MODEL` for backward compatibility.
+`OllamaLLMProvider` calls `resolved_llm_model`, never `ollama_chat_model` directly, when building
+its `/api/generate` request.
+
+`OLLAMA_EMBEDDING_MODEL` is intentionally **not** part of this model-selection mechanism —
+embeddings use a fixed model, independent of `LLM_MODEL`, since swapping the embedding model
+would silently invalidate any previously-computed vectors. `OllamaEmbeddingProvider` always reads
+`ollama_embedding_model` directly.
 
 ## Future LLM provider stubs
 
@@ -103,9 +119,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed |
 | `QDRANT_URL`               | `http://qdrant:6333`                                                  | Not yet consumed |
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
-| `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; used by `OllamaLLMProvider` to stream completions |
-| `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; used by `OllamaEmbeddingProvider` to embed |
+| `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; backward-compatible fallback for `LLM_MODEL` if unset |
+| `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; always used by `OllamaEmbeddingProvider` — fixed, not selectable via `LLM_MODEL` |
 | `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation; `openai`/`gemini`/`anthropic` are recognized stubs |
+| `LLM_MODEL`                | *(unset)*                                                              | Selects the model `OllamaLLMProvider` uses; falls back to `OLLAMA_CHAT_MODEL` if unset (see "LLM provider vs. model") |
 | `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
 | `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Recognized but not yet implemented — `get_vector_store()` raises `NotImplementedError` |
 
@@ -125,7 +142,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   - `OllamaEmbeddingProvider` (`app/rag/providers/ollama_embedding_provider.py`) — calls
     `POST /api/embeddings` for `OLLAMA_EMBEDDING_MODEL` only.
   - `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) — calls
-    `POST /api/generate` with `stream=true` for `OLLAMA_CHAT_MODEL`, exposing
+    `POST /api/generate` with `stream=true` for `Settings.resolved_llm_model`
+    (`LLM_MODEL`, falling back to `OLLAMA_CHAT_MODEL`), exposing
     `stream_generate(prompt) -> AsyncIterator[str]` (yields text chunks as Ollama streams them)
     and `generate(prompt) -> str` (joins the streamed chunks, satisfying the abstract
     `LLMProvider` contract). Internal-only — no ingestion, no Qdrant writes, no public chat/SSE

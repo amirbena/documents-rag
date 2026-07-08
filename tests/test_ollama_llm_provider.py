@@ -1,9 +1,11 @@
 """Tests for streaming OllamaLLMProvider with a mocked Ollama HTTP transport."""
 
+import json
+
 import httpx
 import pytest
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.rag.providers.ollama_llm_provider import OllamaLLMError, OllamaLLMProvider
 
 
@@ -116,3 +118,35 @@ async def test_stream_generate_ending_without_done_raises_ollama_llm_error() -> 
 
     with pytest.raises(OllamaLLMError):
         await _collect(provider, "hi")
+
+
+async def test_stream_generate_sends_llm_model_when_configured() -> None:
+    """The request body's model field should use LLM_MODEL when it's set."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=b'{"response": "ok", "done": true}\n')
+
+    settings = Settings(LLM_MODEL="llama3.2")
+    provider = OllamaLLMProvider(settings=settings, transport=httpx.MockTransport(handler))
+
+    await _collect(provider, "hi")
+
+    assert captured["body"]["model"] == "llama3.2"
+
+
+async def test_stream_generate_falls_back_to_ollama_chat_model() -> None:
+    """Without LLM_MODEL, the request body's model field should fall back to OLLAMA_CHAT_MODEL."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=b'{"response": "ok", "done": true}\n')
+
+    settings = Settings(OLLAMA_CHAT_MODEL="mistral")
+    provider = OllamaLLMProvider(settings=settings, transport=httpx.MockTransport(handler))
+
+    await _collect(provider, "hi")
+
+    assert captured["body"]["model"] == "mistral"

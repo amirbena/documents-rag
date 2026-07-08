@@ -19,7 +19,11 @@ class OllamaLLMError(Exception):
 
 
 class OllamaLLMProvider(LLMProvider):
-    """LLMProvider that streams completions from Ollama's /api/generate for OLLAMA_CHAT_MODEL."""
+    """LLMProvider that streams completions from Ollama's /api/generate for the configured model.
+
+    Uses Settings.resolved_llm_model — LLM_MODEL if set, else OLLAMA_CHAT_MODEL — so the model
+    can be changed independently of LLM_PROVIDER.
+    """
 
     def __init__(
         self,
@@ -48,7 +52,7 @@ class OllamaLLMProvider(LLMProvider):
                     "POST",
                     "/api/generate",
                     json={
-                        "model": self._settings.ollama_chat_model,
+                        "model": self._settings.resolved_llm_model,
                         "prompt": prompt,
                         "stream": True,
                     },
