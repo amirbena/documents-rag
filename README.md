@@ -51,6 +51,15 @@ docker compose exec ollama ollama pull llama3.1
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 
+Check whether Ollama is reachable and those models are pulled via:
+
+```bash
+curl http://localhost:8000/api/v1/providers/ollama/health
+```
+
+Returns `200` when Ollama is reachable and both models are available, or `503` (with the same
+JSON body showing which check failed) otherwise.
+
 ## Test commands
 
 ```bash
@@ -93,6 +102,8 @@ cleanly before committing.
 
 Infrastructure scaffold complete and verified: FastAPI app, Docker Compose topology (app,
 postgres, redis, qdrant, ollama), configuration, async DB wiring, Alembic scaffold, and abstract
-provider interfaces. Document ingestion, embedding pipelines, vector search, and chat/RAG
-orchestration are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list
-of what's intentionally deferred.
+provider interfaces. On top of that, Ollama reachability and model-availability checks are now
+implemented (`GET /api/v1/providers/ollama/health`), covered by tests with a mocked Ollama
+transport. Document ingestion, embedding pipelines, vector search, chat/RAG orchestration, and
+actual Ollama generate/embeddings calls are not yet implemented — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
