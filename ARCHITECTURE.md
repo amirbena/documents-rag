@@ -6,13 +6,14 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus six vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus seven vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
-concrete Qdrant-backed vector store, a rule-based RAG decision layer, and a document upload +
-ingestion job skeleton. No PDF parsing, chunking, embedding generation, Qdrant upsert, or chat
-endpoint happens yet — uploading a document only stores the file and creates `pending`
-database rows; nothing processes them.
+concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
+ingestion job skeleton, and an async ingestion worker that claims and resolves those jobs. No
+PDF parsing, chunking, embedding generation, Qdrant upsert, or chat endpoint happens yet — the
+worker's processing step is still a placeholder, so a claimed job goes straight from
+`processing` to `completed` without any real document processing occurring.
 
 ## Services
 
@@ -145,9 +146,39 @@ inside one request:
    (`pending`, `processing`, ...), not the enum member name.
 
 The endpoint returns `202 Accepted` with `{document_id, job_id, status}` — **it does not parse,
-chunk, embed, or index the document inside the request.** No later milestone's worker exists yet
-to pick up a `pending` job and actually process it; this milestone is the upload + bookkeeping
-skeleton only. An empty (zero-byte) upload is rejected with `400` before any row is created.
+chunk, embed, or index the document inside the request.** An empty (zero-byte) upload is
+rejected with `400` before any row is created. `IngestionWorker` (below) is what eventually
+picks up and resolves the `pending` job it creates.
+
+## Ingestion worker
+
+`IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — **no public API**
+— that claims and resolves one pending `IngestionJob` at a time via `process_next_job(session)`:
+
+1. **Claim**: `SELECT ... WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP
+   LOCKED` — Postgres row-level locking so multiple worker instances never claim the same job.
+   Returns `None` if there is no pending job.
+2. Flips the claimed job to `PROCESSING` and **commits immediately** — a separate transaction
+   boundary from the outcome below, so the claim is durable before any processing is attempted.
+3. Looks up the associated `Document` and calls the injected processing step (default: a no-op
+   placeholder, `_default_process_document`) with `(document, job)`.
+4. On success: `PROCESSING` → `COMPLETED`, committed.
+   On any exception: `PROCESSING` → `FAILED`, `error_message` set to `str(exception)`, committed.
+
+The processing step is injected via the constructor (`IngestionWorker(process_document=...)`)
+specifically so a **later milestone can replace the placeholder** with real PDF extraction,
+chunking, embedding generation, and Qdrant upsert — without changing the claim/lock/transition
+logic. `IngestionWorker` never imports or calls `EmbeddingProvider`, `LLMProvider`,
+`VectorStore`, or `provider_factory` itself.
+
+**Idempotent by construction**: once a job leaves `PENDING` (to `PROCESSING`, then `COMPLETED`
+or `FAILED`), the claim query's `WHERE status='pending'` filter can never select it again —
+calling `process_next_job()` repeatedly does not require any separate "already processed" check.
+
+`with_for_update(skip_locked=True)` is Postgres-specific row-locking syntax; SQLite does not
+represent it correctly even if it accepts the same SQLAlchemy call, so this project deliberately
+does not add SQLite/`aiosqlite` for testing this worker. Its tests use a fake `AsyncSession`
+double that faithfully simulates the pending-job filter and `Document` lookup instead.
 
 ## Future LLM provider stubs
 
@@ -216,9 +247,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `app/schemas` — Pydantic request/response schemas.
 - `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
   async HTTP client scoped strictly to reachability and model-availability checks — it
-  intentionally does not call generation or embedding endpoints; and `LocalFileStorage`
+  intentionally does not call generation or embedding endpoints; `LocalFileStorage`
   (`app/services/local_file_storage.py`), which saves uploaded files to local disk under a
-  generated safe filename (see "Document upload and ingestion job skeleton" above).
+  generated safe filename (see "Document upload and ingestion job skeleton" above); and
+  `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
+  ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -255,7 +288,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   from the upload/ingestion path yet)
 - Upserting uploaded-document vectors into Qdrant (the vector *store* exists; nothing calls it
   from the upload/ingestion path yet)
-- Anything that actually processes a `pending` `IngestionJob` (no worker picks it up yet)
+- Real processing inside `IngestionWorker` — its processing step is still the placeholder
+  `_default_process_document`, so a claimed job always resolves straight to `completed`
+- Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
+  or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
 - A public API endpoint for embeddings, vector store, or decision-layer operations (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
