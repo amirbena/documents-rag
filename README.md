@@ -76,20 +76,32 @@ choose the chat model without touching `LLM_PROVIDER`. If `LLM_MODEL` is unset, 
 it's never affected by `LLM_MODEL`, since embeddings must stay on one model to keep previously
 computed vectors valid.
 
+`QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) talks to Qdrant's HTTP API
+directly under `QDRANT_URL` (no official Qdrant SDK) via async `httpx`, supporting
+`create_collection_if_not_exists(collection_name, vector_size)`,
+`upsert_vectors(collection_name, points)`, and
+`search_similar(collection_name, query_vector, limit)`. Points and results carry payload
+metadata: `document_id`, `chunk_id`, `text`, `source`, and an optional `page_number`. It's an
+internal provider only — no document ingestion, upload, chat, or SSE endpoint touches it yet.
+
 Providers are resolved through `app/rag/providers/provider_factory.py` rather than importing
-Ollama classes directly:
+Ollama/Qdrant classes directly:
 
 ```python
-from app.rag.providers.provider_factory import get_embedding_provider, get_llm_provider
+from app.rag.providers.provider_factory import (
+    get_embedding_provider,
+    get_llm_provider,
+    get_vector_store,
+)
 
 embedding_provider = get_embedding_provider()   # reads EMBEDDING_PROVIDER
 llm_provider = get_llm_provider()               # reads LLM_PROVIDER
+vector_store = get_vector_store()               # reads VECTOR_STORE_PROVIDER
 ```
 
-`LLM_PROVIDER`/`EMBEDDING_PROVIDER` default to `ollama` (the only implementation so far);
-`VECTOR_STORE_PROVIDER` defaults to `qdrant`, which is recognized but not yet implemented —
-`get_vector_store()` raises `NotImplementedError`. An unrecognized provider name raises
-`UnsupportedProviderError` with a clear message.
+`LLM_PROVIDER`/`EMBEDDING_PROVIDER`/`VECTOR_STORE_PROVIDER` default to `ollama`/`ollama`/`qdrant`
+respectively — all currently resolve to real implementations. An unrecognized provider name
+raises `UnsupportedProviderError` with a clear message.
 
 Setting `LLM_PROVIDER=openai`, `LLM_PROVIDER=gemini`, or `LLM_PROVIDER=anthropic` is recognized
 but raises `ProviderNotImplementedError` immediately — these are explicit stub classes
@@ -169,13 +181,16 @@ Infrastructure scaffold complete and verified: FastAPI app, Docker Compose topol
 postgres, redis, qdrant, ollama), configuration, async DB wiring, Alembic scaffold, and abstract
 provider interfaces. On top of that, Ollama reachability and model-availability checks are
 implemented (`GET /api/v1/providers/ollama/health`), a concrete `OllamaEmbeddingProvider` can
-embed text via `/api/embeddings`, and a concrete `OllamaLLMProvider` can stream completions via
-`/api/generate` — all resolved through a configuration-driven provider factory
-(`app/rag/providers/provider_factory.py`) instead of being hardcoded to Ollama — covered by tests
-with a mocked Ollama transport. Explicit future-provider stubs (`OpenAIProvider`,
+embed text via `/api/embeddings`, a concrete `OllamaLLMProvider` can stream completions via
+`/api/generate`, and a concrete `QdrantVectorStore` can create collections, upsert vectors, and
+run similarity search over Qdrant's HTTP API — all resolved through a configuration-driven
+provider factory (`app/rag/providers/provider_factory.py`) instead of being hardcoded to a single
+backend — covered by tests with mocked HTTP transports (and a manual end-to-end smoke test
+against a real Qdrant container). Explicit future-provider stubs (`OpenAIProvider`,
 `GeminiProvider`, `AnthropicProvider`) exist so those `LLM_PROVIDER` values fail clearly instead
 of falling back to Ollama. `LLM_MODEL` selects the chat model independently of `LLM_PROVIDER`
 (falling back to `OLLAMA_CHAT_MODEL`), while `OLLAMA_EMBEDDING_MODEL` stays fixed for embeddings.
-Document ingestion, a public chat/query endpoint, and Qdrant indexing are not yet implemented —
-see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+Document ingestion, a public chat/query endpoint, and any pipeline wiring these providers
+together into a full RAG flow are not yet implemented — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
 intentionally deferred.

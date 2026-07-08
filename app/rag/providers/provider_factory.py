@@ -17,6 +17,7 @@ from app.rag.providers.llm_provider_stub import LLMProviderStub
 from app.rag.providers.ollama_embedding_provider import OllamaEmbeddingProvider
 from app.rag.providers.ollama_llm_provider import OllamaLLMProvider
 from app.rag.providers.openai_provider import OpenAIProvider
+from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorStore
 
 # Recognized LLM providers with no real implementation yet. Configuring one of these fails
@@ -69,12 +70,8 @@ def get_vector_store(settings: Settings | None = None) -> VectorStore:
     provider = settings.vector_store_provider
 
     if provider == "qdrant":
-        raise NotImplementedError(
-            "VECTOR_STORE_PROVIDER=qdrant is recognized but no concrete VectorStore "
-            "implementation exists yet — it will be added in a later milestone."
-        )
+        return QdrantVectorStore(settings=settings)
 
     raise UnsupportedProviderError(
-        f"Unsupported VECTOR_STORE_PROVIDER: {provider!r}. "
-        "Supported providers: 'qdrant' (not yet implemented)."
+        f"Unsupported VECTOR_STORE_PROVIDER: {provider!r}. Supported providers: 'qdrant'."
     )

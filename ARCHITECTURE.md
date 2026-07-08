@@ -6,11 +6,12 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus three vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus four vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
-concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, and
-placeholder interfaces for the rest. No ingestion, public chat endpoint, or Qdrant indexing logic
-exists yet.
+concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, and a
+concrete Qdrant-backed vector store. No ingestion, document upload, chat endpoint, SSE endpoint,
+or full RAG flow exists yet — the vector store supports collection creation, upsert, and search
+only, with no caller wiring any of it into a pipeline.
 
 ## Services
 
@@ -19,7 +20,7 @@ exists yet.
 | `app`      | built from `Dockerfile`  | FastAPI process: `/api/v1/health`, `/api/v1/providers/ollama/health` | RAG API: ingestion, retrieval, chat |
 | `postgres` | `postgres:16-alpine`     | Relational store, wired via async SQLAlchemy                     | Document/session/metadata storage |
 | `redis`    | `redis:7-alpine`         | Available on the network                                         | Caching, task queues |
-| `qdrant`   | `qdrant/qdrant:latest`   | Available on the network                                         | Vector storage/search for embeddings |
+| `qdrant`   | `qdrant/qdrant:latest`   | Collection create/upsert/search via `QdrantVectorStore`           | Backing document retrieval in a future RAG flow |
 | `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`nomic-embed-text`) + streaming generation (`llama3.1`) | Backing a future public chat endpoint |
 
 The app queries Ollama's `/api/tags` endpoint (via `app/services/ollama_client.py`) to check
@@ -28,10 +29,12 @@ reachability and whether the configured models are pulled, calls `/api/embedding
 and calls `/api/generate` with `stream=true` (via `app/rag/providers/ollama_llm_provider.py`) to
 stream completions from the configured chat model (`LLM_MODEL`, falling back to
 `OLLAMA_CHAT_MODEL` — see "LLM provider vs. model" below). The LLM provider is internal-only —
-there is no public chat or SSE endpoint yet. Callers resolve these providers through
-`app/rag/providers/provider_factory.py` rather than importing Ollama classes directly — see
-"Provider factory" below. Postgres, Redis, and Qdrant are still unused beyond connection
-configuration and abstract interfaces (`app/rag/providers/`).
+there is no public chat or SSE endpoint yet. The app also talks to Qdrant's HTTP API under
+`QDRANT_URL` (via `app/rag/providers/qdrant_vector_store.py`) to create collections, upsert
+vectors, and run similarity search — see "Vector store" below. Callers resolve all of these
+providers through `app/rag/providers/provider_factory.py` rather than importing Ollama/Qdrant
+classes directly — see "Provider factory" below. Postgres and Redis are still unused beyond
+connection configuration.
 
 ## Provider factory
 
@@ -43,8 +46,7 @@ based on three config variables, so the rest of the codebase depends on the `Emb
 - `get_llm_provider()` — `LLM_PROVIDER` (`"ollama"` → `OllamaLLMProvider`; `"openai"`, `"gemini"`,
   `"anthropic"` are recognized but raise `ProviderNotImplementedError` — see "Future LLM provider
   stubs" below)
-- `get_vector_store()` — `VECTOR_STORE_PROVIDER` (`"qdrant"` is recognized but raises
-  `NotImplementedError` — no concrete `VectorStore` exists yet)
+- `get_vector_store()` — `VECTOR_STORE_PROVIDER` (`"qdrant"` → `QdrantVectorStore`)
 
 An unrecognized provider name raises `UnsupportedProviderError` (a `ValueError`) with a message
 naming the offending value and the supported provider(s). All Ollama-specific logic (HTTP calls,
@@ -69,6 +71,32 @@ its `/api/generate` request.
 embeddings use a fixed model, independent of `LLM_MODEL`, since swapping the embedding model
 would silently invalidate any previously-computed vectors. `OllamaEmbeddingProvider` always reads
 `ollama_embedding_model` directly.
+
+## Vector store
+
+`app/rag/providers/vector_store.py` defines the abstract `VectorStore` contract plus its shared
+data types:
+
+- `VectorPoint` — one embedding vector to upsert, with `id`, `vector`, and payload metadata
+  (`document_id`, `chunk_id`, `text`, `source`, optional `page_number`).
+- `VectorSearchResult` — one nearest-neighbor match: `id`, `score`, plus the same payload fields.
+
+`VectorStore` methods: `create_collection_if_not_exists(collection_name, vector_size)`,
+`upsert_vectors(collection_name, points)`, `search_similar(collection_name, query_vector, limit)`.
+
+`QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) is the concrete implementation.
+It talks to Qdrant's REST API directly under `QDRANT_URL` via async `httpx` — **no official
+Qdrant SDK is used**, matching the same pattern as the Ollama providers. It calls:
+
+- `GET /collections/{name}` + `PUT /collections/{name}` — check-then-create a collection
+  (skips creation if the collection already exists).
+- `PUT /collections/{name}/points?wait=true` — upsert points (id, vector, payload).
+- `POST /collections/{name}/points/search` — similarity search, returning parsed
+  `VectorSearchResult` objects.
+
+`QdrantVectorStoreError` is raised on an unreachable server, a non-200 response, or a malformed
+response (e.g. missing payload fields). This provider is internal-only: no document
+ingestion/upload, no chat/SSE endpoint, and no caller wires it into a retrieval pipeline yet.
 
 ## Future LLM provider stubs
 
@@ -117,14 +145,14 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `LOG_LEVEL`                | `INFO`                                                                 | Not yet wired to a logger |
 | `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine |
 | `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed |
-| `QDRANT_URL`               | `http://qdrant:6333`                                                  | Not yet consumed |
+| `QDRANT_URL`               | `http://qdrant:6333`                                                  | Used by `QdrantVectorStore` for collection/upsert/search |
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
 | `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; backward-compatible fallback for `LLM_MODEL` if unset |
 | `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; always used by `OllamaEmbeddingProvider` — fixed, not selectable via `LLM_MODEL` |
 | `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation; `openai`/`gemini`/`anthropic` are recognized stubs |
 | `LLM_MODEL`                | *(unset)*                                                              | Selects the model `OllamaLLMProvider` uses; falls back to `OLLAMA_CHAT_MODEL` if unset (see "LLM provider vs. model") |
 | `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
-| `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Recognized but not yet implemented — `get_vector_store()` raises `NotImplementedError` |
+| `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Selects the `VectorStore` implementation via the provider factory |
 
 ## Current boundaries
 
@@ -138,7 +166,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   model-availability checks — it intentionally does not call generation or embedding endpoints.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
-  factory" above), and two concrete implementations:
+  factory" above), and three concrete implementations:
   - `OllamaEmbeddingProvider` (`app/rag/providers/ollama_embedding_provider.py`) — calls
     `POST /api/embeddings` for `OLLAMA_EMBEDDING_MODEL` only.
   - `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) — calls
@@ -148,24 +176,25 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     and `generate(prompt) -> str` (joins the streamed chunks, satisfying the abstract
     `LLMProvider` contract). Internal-only — no ingestion, no Qdrant writes, no public chat/SSE
     endpoint.
+  - `QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) — calls Qdrant's HTTP API
+    for collection create/upsert/search only (see "Vector store" above). Internal-only — no
+    ingestion, no document upload, no chat/SSE endpoint, no full RAG flow.
 
   Three future-provider stubs also exist — `OpenAIProvider`, `GeminiProvider`,
   `AnthropicProvider` (`app/rag/providers/{openai,gemini,anthropic}_provider.py`) — which
   implement `LLMProvider` but always raise `ProviderNotImplementedError` (see "Future LLM
   provider stubs" above).
 
-  `VectorStore` remains abstract-only. `OllamaClient` (health checks) is deliberately kept
-  separate from these provider interfaces so health checks don't get entangled with the
-  generation/embedding contracts.
+  `OllamaClient` (health checks) is deliberately kept separate from these provider interfaces so
+  health checks don't get entangled with the generation/embedding/storage contracts.
 - `app/workers` — background job placeholders.
 
 ## What is intentionally not implemented yet
 
 - Document ingestion/upload endpoints
 - A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings (the provider is internal-only for now)
-- Concrete `VectorStore` implementation (Qdrant client)
-- Qdrant collection creation
+- A public API endpoint for embeddings or vector store operations (both are internal-only)
+- Any pipeline wiring embeddings → vector store → retrieval → generation into a full RAG flow
 - Database models/migrations beyond the empty Alembic scaffold
 - Auth, rate limiting, observability/logging pipeline
 
