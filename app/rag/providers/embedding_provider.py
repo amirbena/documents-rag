@@ -1,7 +1,6 @@
 """Abstract interface for text embedding providers.
 
-No concrete implementation yet — an Ollama-backed provider (nomic-embed-text)
-will be added in a later milestone.
+See app/rag/providers/ollama_embedding_provider.py for the Ollama-backed implementation.
 """
 
 from abc import ABC, abstractmethod
