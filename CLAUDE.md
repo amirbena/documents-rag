@@ -86,6 +86,14 @@ def get_settings() -> Settings:
   would silently invalidate previously computed vectors, so it requires a deliberate, separate
   migration, not a config flag.
 
+## Provider Implementation Style
+
+- **Prefer calling a provider's HTTP API directly over its official SDK**, unless asked
+  otherwise. Both `OllamaEmbeddingProvider`/`OllamaLLMProvider` and `QdrantVectorStore` call raw
+  REST endpoints via `httpx` rather than pulling in `ollama`'s client library or `qdrant-client`.
+  This keeps dependencies minimal and behavior fully visible/testable via mocked `httpx`
+  transports instead of SDK-specific mocking.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`
