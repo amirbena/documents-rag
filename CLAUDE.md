@@ -69,6 +69,18 @@ def get_settings() -> Settings:
 - **Use the repository PR template.** Fill in `.github/pull_request_template.md` — don't write a
   free-form description instead of it.
 
+### Using the PR template with `gh`
+
+When opening a pull request with GitHub CLI:
+
+1. Read `.github/pull_request_template.md` first, before drafting any PR body.
+2. Use its sections (Summary, Why, Changes, Verification, Explicit exclusions / intentionally
+   not implemented, Next recommended milestone) as the PR body structure — do not invent a
+   different structure or skip a section.
+3. Write the filled-in body to a temporary file, then pass it with
+   `gh pr create --body-file <file>` — do not pass an ad-hoc description inline with `--body`
+   when the template exists.
+
 ### PR title style
 
 Short, imperative, present tense, no trailing period — e.g. `Add Ollama provider health checks`.
