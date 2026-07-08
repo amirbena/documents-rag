@@ -12,6 +12,7 @@ from app.rag.providers.provider_factory import (
     get_llm_provider,
     get_vector_store,
 )
+from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 
 
 def _settings(**overrides: str) -> Settings:
@@ -62,12 +63,13 @@ def test_get_llm_provider_raises_provider_not_implemented_for_future_stubs(provi
         get_llm_provider(settings)
 
 
-def test_get_vector_store_qdrant_raises_not_implemented() -> None:
-    """VECTOR_STORE_PROVIDER=qdrant is recognized but has no implementation yet."""
+def test_get_vector_store_returns_qdrant_when_configured() -> None:
+    """VECTOR_STORE_PROVIDER=qdrant should resolve to QdrantVectorStore."""
     settings = _settings(VECTOR_STORE_PROVIDER="qdrant")
 
-    with pytest.raises(NotImplementedError):
-        get_vector_store(settings)
+    store = get_vector_store(settings)
+
+    assert isinstance(store, QdrantVectorStore)
 
 
 def test_get_vector_store_raises_on_unsupported_provider() -> None:

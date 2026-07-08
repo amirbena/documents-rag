@@ -1,26 +1,54 @@
-"""Abstract interface for vector storage/search.
+"""Abstract interface for vector storage/search, plus its shared data types.
 
-No concrete implementation yet — a Qdrant-backed store will be added,
-and no collections are created, in a later milestone.
+See app/rag/providers/qdrant_vector_store.py for the Qdrant-backed implementation.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass
+
+
+@dataclass
+class VectorPoint:
+    """One embedding vector plus its id and payload metadata, ready to upsert."""
+
+    id: str
+    vector: list[float]
+    document_id: str
+    chunk_id: str
+    text: str
+    source: str
+    page_number: int | None = None
+
+
+@dataclass
+class VectorSearchResult:
+    """One nearest-neighbor match: similarity score plus the point's payload metadata."""
+
+    id: str
+    score: float
+    document_id: str
+    chunk_id: str
+    text: str
+    source: str
+    page_number: int | None = None
 
 
 class VectorStore(ABC):
-    """Contract for upserting and searching embedding vectors by collection."""
+    """Contract for collection creation, vector upsert, and similarity search."""
 
     @abstractmethod
-    async def upsert(
-        self, collection: str, vectors: list[list[float]], payloads: list[dict[str, Any]]
-    ) -> None:
-        """Insert or update vectors and their associated payloads in a collection."""
+    async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
+        """Create the collection with the given vector size if it doesn't already exist."""
         raise NotImplementedError
 
     @abstractmethod
-    async def search(
-        self, collection: str, query_vector: list[float], top_k: int = 5
-    ) -> list[dict[str, Any]]:
-        """Return the top_k nearest payloads to query_vector in a collection."""
+    async def upsert_vectors(self, collection_name: str, points: list[VectorPoint]) -> None:
+        """Insert or update the given vector points in a collection."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def search_similar(
+        self, collection_name: str, query_vector: list[float], limit: int = 5
+    ) -> list[VectorSearchResult]:
+        """Return the top `limit` nearest points to query_vector in a collection."""
         raise NotImplementedError
