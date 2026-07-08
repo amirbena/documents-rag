@@ -11,16 +11,44 @@ from enum import StrEnum
 
 _MIN_QUESTION_LENGTH = 4
 
-_OUT_OF_SCOPE_PATTERNS = (
-    r"\bssn\b",
-    r"\bsocial security (number|no\.?)\b",
-    r"\bcredit card\b",
-    r"\bpassword(s)?\b",
-    r"\bapi key(s)?\b",
-    r"\bprivate key(s)?\b",
-    r"\bdatabase credentials\b",
-    r"\bsecret key(s)?\b",
-    r"\bbank account\b",
+# Verbs that indicate the user wants an actual secret *revealed*, as opposed to a benign action
+# verb like "rotate"/"reset"/"open" performed on one's own credential.
+_EXTRACTION_VERBS = (
+    "show",
+    "reveal",
+    "extract",
+    "list",
+    "give",
+    "tell",
+    "disclose",
+    "dump",
+    "leak",
+    "provide",
+    "share",
+    "display",
+    "expose",
+    "print",
+    "send",
+)
+
+_SENSITIVE_NOUNS = (
+    r"ssn",
+    r"social security (?:number|no\.?)",
+    r"credit card(?:s)?(?: numbers?)?",
+    r"password(?:s)?",
+    r"api key(?:s)?",
+    r"private key(?:s)?",
+    r"secret key(?:s)?",
+    r"database credentials",
+    r"credentials",
+    r"bank account(?:s)?",
+)
+
+# OUT_OF_SCOPE requires an extraction verb followed by a sensitive noun within a few words —
+# e.g. "show me the api keys", "extract database credentials" — not just the noun on its own,
+# so "how do I rotate an API key?" or "how do I reset a password?" stay in scope.
+_EXTRACTION_INTENT_PATTERN = re.compile(
+    rf"\b(?:{'|'.join(_EXTRACTION_VERBS)})\b(?:\s+\S+){{0,4}}\s+\b(?:{'|'.join(_SENSITIVE_NOUNS)})\b"
 )
 
 _RETRIEVAL_PATTERNS = (
@@ -76,7 +104,7 @@ class RuleBasedRagDecider:
 
         lowered = stripped.lower()
 
-        if any(re.search(pattern, lowered) for pattern in _OUT_OF_SCOPE_PATTERNS):
+        if _EXTRACTION_INTENT_PATTERN.search(lowered):
             return DecisionResult(
                 decision=RagDecision.OUT_OF_SCOPE,
                 reason="Question appears to request sensitive or private data extraction.",
