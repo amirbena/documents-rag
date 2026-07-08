@@ -6,12 +6,13 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus four vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus five vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
-concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, and a
-concrete Qdrant-backed vector store. No ingestion, document upload, chat endpoint, SSE endpoint,
-or full RAG flow exists yet — the vector store supports collection creation, upsert, and search
-only, with no caller wiring any of it into a pipeline.
+concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
+concrete Qdrant-backed vector store, and a rule-based RAG decision layer. No ingestion, document
+upload, chat endpoint, SSE endpoint, or full RAG flow exists yet — the vector store supports
+collection creation, upsert, and search only, and the decision layer only classifies a question;
+neither is wired into a pipeline by any caller.
 
 ## Services
 
@@ -97,6 +98,30 @@ Qdrant SDK is used**, matching the same pattern as the Ollama providers. It call
 `QdrantVectorStoreError` is raised on an unreachable server, a non-200 response, or a malformed
 response (e.g. missing payload fields). This provider is internal-only: no document
 ingestion/upload, no chat/SSE endpoint, and no caller wires it into a retrieval pipeline yet.
+
+## RAG decision layer
+
+`app/rag/decision.py` is a small internal decision/orchestration layer that classifies a user
+question *before* any retrieval or generation happens — it does not itself perform retrieval,
+generation, ingestion, or document upload, and is not wired to any public API endpoint.
+
+- `RagDecision` (a `StrEnum`) — one of `NEEDS_RETRIEVAL`, `DIRECT_LLM`,
+  `CLARIFICATION_NEEDED`, `OUT_OF_SCOPE`.
+- `DecisionResult` — a dataclass with `decision`, `reason`, and an optional `confidence`.
+- `RuleBasedRagDecider.decide(question) -> DecisionResult` — deterministic, keyword/pattern-based
+  routing. **No LLM call is made to route** — rules are checked in order:
+  1. Empty or very short question → `CLARIFICATION_NEEDED`.
+  2. Sensitive/private data extraction requests (SSN, passwords, API keys, credentials, etc.) →
+     `OUT_OF_SCOPE` — checked *before* the retrieval keywords, so a request that mentions both
+     documents and sensitive data is still rejected.
+  3. Question references uploaded/indexed documents (`document`, `uploaded`, `pdf`, `knowledge
+     base`, etc.) → `NEEDS_RETRIEVAL`.
+  4. Otherwise → `DIRECT_LLM` (general question, no document reference, nothing sensitive).
+
+This is deliberately the simplest possible decider — a future milestone may replace or augment it
+with an LLM-based router, but the rule-based version exists first so the decision *contract*
+(`RagDecision`/`DecisionResult`) is fixed and testable before anything calls out to a model for
+routing.
 
 ## Future LLM provider stubs
 
@@ -187,14 +212,19 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
   `OllamaClient` (health checks) is deliberately kept separate from these provider interfaces so
   health checks don't get entangled with the generation/embedding/storage contracts.
+- `app/rag/decision.py` — the RAG decision layer (see "RAG decision layer" above): `RagDecision`,
+  `DecisionResult`, `RuleBasedRagDecider`. Separate from `app/rag/providers` since it doesn't call
+  any provider itself — it only classifies a question.
 - `app/workers` — background job placeholders.
 
 ## What is intentionally not implemented yet
 
 - Document ingestion/upload endpoints
 - A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings or vector store operations (both are internal-only)
-- Any pipeline wiring embeddings → vector store → retrieval → generation into a full RAG flow
+- A public API endpoint for embeddings, vector store, or decision-layer operations (all internal-only)
+- An LLM-based (as opposed to rule-based) question router
+- Any pipeline wiring the decision layer, embeddings, vector store, retrieval, and generation into
+  a full RAG flow
 - Database models/migrations beyond the empty Alembic scaffold
 - Auth, rate limiting, observability/logging pipeline
 
