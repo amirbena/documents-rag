@@ -65,10 +65,16 @@ Ollama's `POST /api/embeddings` with `OLLAMA_EMBEDDING_MODEL`. It's an internal 
 no API endpoint exposes it yet, and it doesn't call Ollama's generation endpoint or touch Qdrant.
 
 `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) streams completions from
-Ollama's `POST /api/generate` (`stream=true`) with `OLLAMA_CHAT_MODEL`, via
+Ollama's `POST /api/generate` (`stream=true`) with the configured chat model, via
 `stream_generate(prompt) -> AsyncIterator[str]` (yields chunks as they arrive) and
 `generate(prompt) -> str` (joins the streamed chunks). It's an internal provider only — there is
 no public chat endpoint or SSE endpoint yet, and it doesn't touch ingestion or Qdrant.
+
+The model it uses is set independently of the provider: set `LLM_MODEL` (e.g. `llama3.1`) to
+choose the chat model without touching `LLM_PROVIDER`. If `LLM_MODEL` is unset, it falls back to
+`OLLAMA_CHAT_MODEL` for backward compatibility. `OLLAMA_EMBEDDING_MODEL` is separate and fixed —
+it's never affected by `LLM_MODEL`, since embeddings must stay on one model to keep previously
+computed vectors valid.
 
 Providers are resolved through `app/rag/providers/provider_factory.py` rather than importing
 Ollama classes directly:
@@ -168,6 +174,8 @@ embed text via `/api/embeddings`, and a concrete `OllamaLLMProvider` can stream 
 (`app/rag/providers/provider_factory.py`) instead of being hardcoded to Ollama — covered by tests
 with a mocked Ollama transport. Explicit future-provider stubs (`OpenAIProvider`,
 `GeminiProvider`, `AnthropicProvider`) exist so those `LLM_PROVIDER` values fail clearly instead
-of falling back to Ollama. Document ingestion, a public chat/query endpoint, and Qdrant indexing
-are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+of falling back to Ollama. `LLM_MODEL` selects the chat model independently of `LLM_PROVIDER`
+(falling back to `OLLAMA_CHAT_MODEL`), while `OLLAMA_EMBEDDING_MODEL` stays fixed for embeddings.
+Document ingestion, a public chat/query endpoint, and Qdrant indexing are not yet implemented —
+see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
 intentionally deferred.

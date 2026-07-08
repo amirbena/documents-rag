@@ -1,9 +1,11 @@
 """Tests for OllamaEmbeddingProvider with a mocked Ollama HTTP transport."""
 
+import json
+
 import httpx
 import pytest
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.rag.providers.ollama_embedding_provider import OllamaEmbeddingError, OllamaEmbeddingProvider
 
 
@@ -87,3 +89,20 @@ async def test_embed_empty_text_raises_value_error() -> None:
 
     with pytest.raises(ValueError):
         await provider.embed_text("   ")
+
+
+async def test_embed_uses_ollama_embedding_model_unaffected_by_llm_model() -> None:
+    """Embedding requests must always use OLLAMA_EMBEDDING_MODEL, never LLM_MODEL."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"embedding": [0.1]})
+
+    settings = Settings(LLM_MODEL="some-other-chat-model")
+    provider = OllamaEmbeddingProvider(settings=settings, transport=httpx.MockTransport(handler))
+
+    await provider.embed_text("hello")
+
+    assert captured["body"]["model"] == settings.ollama_embedding_model
+    assert captured["body"]["model"] != "some-other-chat-model"

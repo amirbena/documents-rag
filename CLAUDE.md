@@ -71,6 +71,21 @@ def get_settings() -> Settings:
   Ollama, the factory must resolve to that provider (real or stub) or raise a clear configuration
   error — it must never quietly substitute the Ollama implementation instead.
 
+## Provider vs. Model Configuration
+
+- **Keep "which provider" and "which model" as separate settings.** `LLM_PROVIDER` selects the
+  backend (e.g. `ollama`); `LLM_MODEL` selects which model that backend uses (e.g. `llama3.1`).
+  Never conflate the two into a single setting — changing the model must not require touching
+  provider selection, and vice versa.
+- **Preserve backward compatibility when introducing a new setting that supersedes an old one.**
+  `LLM_MODEL` falls back to the older `OLLAMA_CHAT_MODEL` when unset
+  (`Settings.resolved_llm_model`), so existing `.env` files keep working. Apply this same
+  fallback pattern for future renames instead of a breaking cutover.
+- **Don't extend model selection to embeddings.** `OLLAMA_EMBEDDING_MODEL` stays fixed and is
+  not user-selectable via `LLM_MODEL` or any similar mechanism — swapping the embedding model
+  would silently invalidate previously computed vectors, so it requires a deliberate, separate
+  migration, not a config flag.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`
