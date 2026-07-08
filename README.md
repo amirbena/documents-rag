@@ -31,6 +31,49 @@ Running the API directly (without Docker) requires reachable Postgres/Redis/Qdra
 easiest to get via `docker compose up postgres redis qdrant ollama` and point `.env` at
 `localhost` instead of the service names.
 
+## Running locally
+
+**`python app/main.py` does not start the server.** `app/main.py` only defines the FastAPI `app`
+object — running it as a script just imports the module (which builds `app` and exits) and does
+nothing else. There is no `if __name__ == "__main__":` block that calls `uvicorn.run(...)`, so
+this command produces no running server and no error, which is easy to mistake for "it worked."
+
+The recommended way to run everything (app + Postgres + Redis + Qdrant + Ollama) is:
+
+```bash
+docker compose up --build
+```
+
+Verify it's up with:
+
+```bash
+curl http://localhost:8000/api/v1/health
+# {"status":"ok","environment":"local"}
+```
+
+See "Running with Docker Compose" below for the full walkthrough (pulling Ollama models,
+checking Ollama health, etc.).
+
+**Optional: running the app process only, without Docker**, once you've completed
+[Local setup](#local-setup) above and have Postgres/Redis/Qdrant/Ollama reachable some other way
+(e.g. `docker compose up postgres redis qdrant ollama` with `.env` pointed at `localhost`):
+
+```bash
+uvicorn app.main:app --reload
+```
+
+### PyCharm Run Configuration
+
+- **Prefer Docker Compose for full-stack local development** — PyCharm's Docker Compose run
+  configuration (or just running `docker compose up --build` in the terminal) covers the app and
+  all its dependencies together.
+- **For an app-only run** (no Docker, dependencies reachable separately — see above), create a
+  "Python" run configuration with:
+  - **Module name:** `uvicorn` (not "Script path")
+  - **Parameters:** `app.main:app --reload`
+  - **Working directory:** repository root
+  - **Python interpreter:** `.venv/bin/python`
+
 ## Running with Docker Compose
 
 ```bash
