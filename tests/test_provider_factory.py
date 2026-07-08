@@ -3,6 +3,7 @@
 import pytest
 
 from app.core.config import Settings
+from app.rag.providers.errors import ProviderNotImplementedError
 from app.rag.providers.ollama_embedding_provider import OllamaEmbeddingProvider
 from app.rag.providers.ollama_llm_provider import OllamaLLMProvider
 from app.rag.providers.provider_factory import (
@@ -46,9 +47,18 @@ def test_get_embedding_provider_raises_on_unsupported_provider() -> None:
 
 def test_get_llm_provider_raises_on_unsupported_provider() -> None:
     """An unrecognized LLM_PROVIDER should raise a clear configuration error."""
-    settings = _settings(LLM_PROVIDER="anthropic")
+    settings = _settings(LLM_PROVIDER="cohere")
 
-    with pytest.raises(UnsupportedProviderError, match="anthropic"):
+    with pytest.raises(UnsupportedProviderError, match="cohere"):
+        get_llm_provider(settings)
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "gemini", "anthropic"])
+def test_get_llm_provider_raises_provider_not_implemented_for_future_stubs(provider_name: str) -> None:
+    """A recognized-but-unimplemented LLM_PROVIDER should fail explicitly, not fall back to Ollama."""
+    settings = _settings(LLM_PROVIDER=provider_name)
+
+    with pytest.raises(ProviderNotImplementedError, match="not implemented yet"):
         get_llm_provider(settings)
 
 

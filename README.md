@@ -85,6 +85,12 @@ llm_provider = get_llm_provider()               # reads LLM_PROVIDER
 `get_vector_store()` raises `NotImplementedError`. An unrecognized provider name raises
 `UnsupportedProviderError` with a clear message.
 
+Setting `LLM_PROVIDER=openai`, `LLM_PROVIDER=gemini`, or `LLM_PROVIDER=anthropic` is recognized
+but raises `ProviderNotImplementedError` immediately — these are explicit stub classes
+(`OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`) that make no external API calls and
+never silently fall back to Ollama. They exist so future provider support has a place to land
+without changing how the factory or callers behave.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -160,6 +166,8 @@ implemented (`GET /api/v1/providers/ollama/health`), a concrete `OllamaEmbedding
 embed text via `/api/embeddings`, and a concrete `OllamaLLMProvider` can stream completions via
 `/api/generate` — all resolved through a configuration-driven provider factory
 (`app/rag/providers/provider_factory.py`) instead of being hardcoded to Ollama — covered by tests
-with a mocked Ollama transport. Document ingestion, a public chat/query endpoint, and Qdrant
-indexing are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
-what's intentionally deferred.
+with a mocked Ollama transport. Explicit future-provider stubs (`OpenAIProvider`,
+`GeminiProvider`, `AnthropicProvider`) exist so those `LLM_PROVIDER` values fail clearly instead
+of falling back to Ollama. Document ingestion, a public chat/query endpoint, and Qdrant indexing
+are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+intentionally deferred.
