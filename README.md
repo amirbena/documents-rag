@@ -51,6 +51,15 @@ docker compose exec ollama ollama pull llama3.1
 docker compose exec ollama ollama pull nomic-embed-text
 ```
 
+Check whether Ollama is reachable and those models are pulled via:
+
+```bash
+curl http://localhost:8000/api/v1/providers/ollama/health
+```
+
+Returns `200` when Ollama is reachable and both models are available, or `503` (with the same
+JSON body showing which check failed) otherwise.
+
 ## Test commands
 
 ```bash
@@ -89,10 +98,32 @@ cleanly before committing.
 - **Full reset** (drops Postgres/Qdrant/Ollama volumes — deletes local data):
   `docker compose down -v`.
 
+## GitHub CLI / PR workflow
+
+Pull requests are created from the terminal with the [GitHub CLI](https://cli.github.com/)
+(`gh`), not the web UI. Before opening a PR:
+
+```bash
+gh --version       # verify the CLI is installed
+gh auth status     # verify you're authenticated
+```
+
+PRs should be small and focused (one milestone per PR) and their description should include
+verification results (test/lint/type-check output), not just a claim that checks passed. This
+repository uses a PR template at
+[.github/pull_request_template.md](.github/pull_request_template.md) — the web UI picks it up
+automatically, and PRs opened via `gh pr create` from the terminal should follow that same
+template (e.g. via `gh pr create --body-file <filled-template>`) rather than an ad-hoc
+description. PR titles and the full description format (Summary, Why, Changes, Verification,
+Explicit exclusions, Next recommended milestone) are defined in [CLAUDE.md](CLAUDE.md) under
+"Pull Request Workflow" — follow that format for every PR.
+
 ## Current milestone status
 
 Infrastructure scaffold complete and verified: FastAPI app, Docker Compose topology (app,
 postgres, redis, qdrant, ollama), configuration, async DB wiring, Alembic scaffold, and abstract
-provider interfaces. Document ingestion, embedding pipelines, vector search, and chat/RAG
-orchestration are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list
-of what's intentionally deferred.
+provider interfaces. On top of that, Ollama reachability and model-availability checks are now
+implemented (`GET /api/v1/providers/ollama/health`), covered by tests with a mocked Ollama
+transport. Document ingestion, embedding pipelines, vector search, chat/RAG orchestration, and
+actual Ollama generate/embeddings calls are not yet implemented — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
