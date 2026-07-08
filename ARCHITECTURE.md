@@ -27,8 +27,27 @@ reachability and whether the configured models are pulled, calls `/api/embedding
 `app/rag/providers/ollama_embedding_provider.py`) to embed text with `OLLAMA_EMBEDDING_MODEL`,
 and calls `/api/generate` with `stream=true` (via `app/rag/providers/ollama_llm_provider.py`) to
 stream completions from `OLLAMA_CHAT_MODEL`. The LLM provider is internal-only — there is no
-public chat or SSE endpoint yet. Postgres, Redis, and Qdrant are still unused beyond connection
+public chat or SSE endpoint yet. Callers resolve these providers through
+`app/rag/providers/provider_factory.py` rather than importing Ollama classes directly — see
+"Provider factory" below. Postgres, Redis, and Qdrant are still unused beyond connection
 configuration and abstract interfaces (`app/rag/providers/`).
+
+## Provider factory
+
+`app/rag/providers/provider_factory.py` resolves which concrete provider class to construct,
+based on three config variables, so the rest of the codebase depends on the `EmbeddingProvider` /
+`LLMProvider` / `VectorStore` interfaces rather than being coupled to Ollama or Qdrant directly:
+
+- `get_embedding_provider()` — `EMBEDDING_PROVIDER` (`"ollama"` → `OllamaEmbeddingProvider`)
+- `get_llm_provider()` — `LLM_PROVIDER` (`"ollama"` → `OllamaLLMProvider`)
+- `get_vector_store()` — `VECTOR_STORE_PROVIDER` (`"qdrant"` is recognized but raises
+  `NotImplementedError` — no concrete `VectorStore` exists yet)
+
+An unrecognized provider name raises `UnsupportedProviderError` (a `ValueError`) with a message
+naming the offending value and the supported provider(s). All Ollama-specific logic (HTTP calls,
+error handling) stays inside the Ollama provider classes — the factory only selects and
+constructs; it never reimplements provider behavior, and business/service code should resolve
+providers through it rather than importing `OllamaEmbeddingProvider`/`OllamaLLMProvider` directly.
 
 ## Docker Compose topology
 
@@ -65,6 +84,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
 | `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; used by `OllamaLLMProvider` to stream completions |
 | `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; used by `OllamaEmbeddingProvider` to embed |
+| `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation via the provider factory |
+| `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
+| `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Recognized but not yet implemented — `get_vector_store()` raises `NotImplementedError` |
 
 ## Current boundaries
 
@@ -76,8 +98,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `app/services` — business logic layer. Currently just `OllamaClient`
   (`app/services/ollama_client.py`), a thin async HTTP client scoped strictly to reachability and
   model-availability checks — it intentionally does not call generation or embedding endpoints.
-- `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, plus
-  two concrete implementations:
+- `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
+  `provider_factory.py` that resolves the configured implementation for each (see "Provider
+  factory" above), and two concrete implementations:
   - `OllamaEmbeddingProvider` (`app/rag/providers/ollama_embedding_provider.py`) — calls
     `POST /api/embeddings` for `OLLAMA_EMBEDDING_MODEL` only.
   - `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) — calls
