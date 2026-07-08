@@ -64,23 +64,31 @@ JSON body showing which check failed) otherwise.
 Ollama's `POST /api/embeddings` with `OLLAMA_EMBEDDING_MODEL`. It's an internal provider only —
 no API endpoint exposes it yet, and it doesn't call Ollama's generation endpoint or touch Qdrant.
 
-## Test commands
+## Verification
+
+A `Makefile` wraps all quality gates behind one command:
 
 ```bash
-pytest              # run the suite
-pytest -q            # quiet output
+make test        # pytest -q
+make lint         # ruff check .
+make typecheck    # mypy app
+make compose      # docker compose config
+make verify       # runs test, lint, typecheck, compose, in order — stops at the first failure
 ```
 
-## Lint / type-check commands
+`make verify` is the standard pre-commit/pre-PR check. If `make` isn't available, run the
+underlying commands directly:
 
 ```bash
-ruff check .          # lint
+pytest -q
+ruff check .
 ruff check --fix .    # lint + autofix
-mypy app              # type-check the app package
+mypy app
+docker compose config
 ```
 
-All quality gates (`pytest`, `ruff check .`, `mypy app`, `docker compose config`) must pass
-cleanly before committing.
+All four gates (`pytest`, `ruff check .`, `mypy app`, `docker compose config`) must pass cleanly
+before committing.
 
 ## Troubleshooting
 

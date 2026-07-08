@@ -29,14 +29,16 @@ to run and test it.
 4. **Ship small, incremental milestones.** Prefer one clear, scoped, verifiable change over a
    large bundled change. Do not implement future milestones early "while you're in there" — stick
    to what was asked.
-5. **Quality gates must pass before a change is considered done.** Run all of:
-   - `pytest`
-   - `ruff check .`
-   - `mypy app`
-   - `docker compose config`
+5. **Quality gates must pass before a change is considered done.** Run `make verify` before
+   finishing any implementation task — it runs, in order, stopping at the first failure:
+   - `make test` (`pytest -q`)
+   - `make lint` (`ruff check .`)
+   - `make typecheck` (`mypy app`)
+   - `make compose` (`docker compose config`)
 
-   All four must pass cleanly. If one fails, fix the underlying issue rather than skipping or
-   loosening the gate.
+   If `make` isn't available, run the four underlying commands individually in that order as a
+   fallback. All four must pass cleanly either way. If one fails, fix the underlying issue rather
+   than skipping or loosening the gate.
 
 ## Function Documentation
 
