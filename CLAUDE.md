@@ -94,6 +94,21 @@ def get_settings() -> Settings:
   This keeps dependencies minimal and behavior fully visible/testable via mocked `httpx`
   transports instead of SDK-specific mocking.
 
+## Database Testing Style
+
+- **Do not add SQLite/`aiosqlite` for testing database-touching code.** The project targets
+  Postgres, and code that depends on Postgres-specific semantics (e.g.
+  `with_for_update(skip_locked=True)` row locking) is not correctly represented by SQLite even
+  when SQLite accepts the same SQLAlchemy call — it silently behaves differently.
+- **Use a fake session/repository double instead.** Tests for code that reads/writes via
+  `AsyncSession` (e.g. `tests/test_document_upload.py`, `tests/test_ingestion_worker.py`) use a
+  small in-memory fake implementing only the methods the code under test actually calls
+  (`add`, `execute` returning a fake scalar result, `get`, `commit`), faithfully simulating the
+  real query's filter/ordering logic in plain Python rather than executing real SQL.
+- **Reach for a real Postgres integration test only if the project already supports one
+  cleanly** (e.g. via the `postgres` Docker Compose service) — don't add a new, separate test-DB
+  backend to avoid that friction.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`

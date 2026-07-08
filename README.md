@@ -183,8 +183,27 @@ This saves the file under `storage/documents/` (with a generated, filesystem-saf
 filename — never the raw original name), creates a `Document` row (with the original filename
 preserved exactly, Hebrew/Unicode included), and creates an `IngestionJob` row with
 `status=pending`. **Nothing is parsed, chunked, embedded, or upserted into Qdrant inside the
-request** — no worker exists yet to pick up and process a pending job. An empty (zero-byte) file
-is rejected with `400` before any row is created.
+request.** An empty (zero-byte) file is rejected with `400` before any row is created.
+
+### Ingestion worker
+
+`IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — no public API —
+that claims and resolves one `pending` `IngestionJob` at a time:
+
+```python
+from app.services.ingestion_worker import IngestionWorker
+
+worker = IngestionWorker()
+job = await worker.process_next_job(session)  # None if there's nothing pending
+```
+
+It claims the oldest pending job with Postgres row-level locking
+(`SELECT ... FOR UPDATE SKIP LOCKED`), flips it to `processing`, runs a processing step (still a
+placeholder — no PDF parsing, chunking, embedding, or Qdrant upsert yet), then resolves it to
+`completed` on success or `failed` (with the error message stored) on any exception. It's
+idempotent: a job that's already `completed` or `failed` is never selected again by the claim
+query, so calling `process_next_job()` repeatedly never re-processes it. The worker never calls
+`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
 
 ## Verification
 
@@ -272,7 +291,10 @@ retrieval, going direct to the LLM, needing clarification, or being out of scope
 routing, no LLM call involved. `POST /api/v1/documents` accepts a file upload (Hebrew/Unicode
 filenames included), stores it locally under a generated safe filename, and creates `Document` +
 `pending` `IngestionJob` rows — returning `202` without parsing, chunking, embedding, or
-upserting anything. PDF parsing, chunking, embedding generation for uploads, Qdrant upsert, a
-public chat/query endpoint, and any pipeline wiring the decision layer, providers, vector store,
-and ingestion jobs together into a full RAG flow are not yet implemented — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
+upserting anything. `IngestionWorker` claims and resolves those pending jobs (Postgres row-level
+locking, idempotent by construction) — but its processing step is still a placeholder, so a
+claimed job always resolves to `completed` without real PDF parsing, chunking, embedding
+generation, or Qdrant upsert. A public chat/query endpoint and any pipeline wiring the decision
+layer, providers, vector store, and ingestion worker together into a full RAG flow are not yet
+implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
+deferred.
