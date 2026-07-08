@@ -60,6 +60,10 @@ curl http://localhost:8000/api/v1/providers/ollama/health
 Returns `200` when Ollama is reachable and both models are available, or `503` (with the same
 JSON body showing which check failed) otherwise.
 
+`OllamaEmbeddingProvider` (`app/rag/providers/ollama_embedding_provider.py`) embeds text via
+Ollama's `POST /api/embeddings` with `OLLAMA_EMBEDDING_MODEL`. It's an internal provider only —
+no API endpoint exposes it yet, and it doesn't call Ollama's generation endpoint or touch Qdrant.
+
 ## Test commands
 
 ```bash
@@ -122,8 +126,9 @@ Explicit exclusions, Next recommended milestone) are defined in [CLAUDE.md](CLAU
 
 Infrastructure scaffold complete and verified: FastAPI app, Docker Compose topology (app,
 postgres, redis, qdrant, ollama), configuration, async DB wiring, Alembic scaffold, and abstract
-provider interfaces. On top of that, Ollama reachability and model-availability checks are now
-implemented (`GET /api/v1/providers/ollama/health`), covered by tests with a mocked Ollama
-transport. Document ingestion, embedding pipelines, vector search, chat/RAG orchestration, and
-actual Ollama generate/embeddings calls are not yet implemented — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
+provider interfaces. On top of that, Ollama reachability and model-availability checks are
+implemented (`GET /api/v1/providers/ollama/health`), and a concrete `OllamaEmbeddingProvider` can
+embed text via `/api/embeddings` — both covered by tests with a mocked Ollama transport. Document
+ingestion, chat/RAG orchestration, Ollama generation calls, and Qdrant indexing are not yet
+implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
+deferred.
