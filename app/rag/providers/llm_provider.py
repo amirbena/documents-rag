@@ -1,7 +1,6 @@
 """Abstract interface for chat/completion LLM providers.
 
-No concrete implementation yet — an Ollama-backed provider (llama3.1)
-will be added in a later milestone.
+See app/rag/providers/ollama_llm_provider.py for the Ollama-backed streaming implementation.
 """
 
 from abc import ABC, abstractmethod

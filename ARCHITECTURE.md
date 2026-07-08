@@ -6,10 +6,11 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus two vertical slices: a FastAPI app wired to Postgres, Redis,
-Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a concrete
-Ollama-backed embedding provider, and placeholder interfaces for the rest. No ingestion, chat
-generation, or Qdrant indexing logic exists yet.
+This milestone is infrastructure plus three vertical slices: a FastAPI app wired to Postgres,
+Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
+concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, and
+placeholder interfaces for the rest. No ingestion, public chat endpoint, or Qdrant indexing logic
+exists yet.
 
 ## Services
 
@@ -19,13 +20,15 @@ generation, or Qdrant indexing logic exists yet.
 | `postgres` | `postgres:16-alpine`     | Relational store, wired via async SQLAlchemy                     | Document/session/metadata storage |
 | `redis`    | `redis:7-alpine`         | Available on the network                                         | Caching, task queues |
 | `qdrant`   | `qdrant/qdrant:latest`   | Available on the network                                         | Vector storage/search for embeddings |
-| `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`nomic-embed-text`)              | Local chat (`llama3.1`) inference |
+| `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`nomic-embed-text`) + streaming generation (`llama3.1`) | Backing a future public chat endpoint |
 
 The app queries Ollama's `/api/tags` endpoint (via `app/services/ollama_client.py`) to check
-reachability and whether the configured models are pulled, and can call `/api/embeddings` (via
-`app/rag/providers/ollama_embedding_provider.py`) to embed text with `OLLAMA_EMBEDDING_MODEL`.
-It does not yet call `/api/generate`. Postgres, Redis, and Qdrant are still unused beyond
-connection configuration and abstract interfaces (`app/rag/providers/`).
+reachability and whether the configured models are pulled, calls `/api/embeddings` (via
+`app/rag/providers/ollama_embedding_provider.py`) to embed text with `OLLAMA_EMBEDDING_MODEL`,
+and calls `/api/generate` with `stream=true` (via `app/rag/providers/ollama_llm_provider.py`) to
+stream completions from `OLLAMA_CHAT_MODEL`. The LLM provider is internal-only — there is no
+public chat or SSE endpoint yet. Postgres, Redis, and Qdrant are still unused beyond connection
+configuration and abstract interfaces (`app/rag/providers/`).
 
 ## Docker Compose topology
 
@@ -60,7 +63,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed |
 | `QDRANT_URL`               | `http://qdrant:6333`                                                  | Not yet consumed |
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
-| `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability, not yet used to generate |
+| `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; used by `OllamaLLMProvider` to stream completions |
 | `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; used by `OllamaEmbeddingProvider` to embed |
 
 ## Current boundaries
@@ -74,21 +77,27 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`app/services/ollama_client.py`), a thin async HTTP client scoped strictly to reachability and
   model-availability checks — it intentionally does not call generation or embedding endpoints.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, plus
-  the first concrete implementation: `OllamaEmbeddingProvider`
-  (`app/rag/providers/ollama_embedding_provider.py`), which calls `POST /api/embeddings` for
-  `OLLAMA_EMBEDDING_MODEL` only — no generation calls, no ingestion, no Qdrant writes.
-  `LLMProvider` and `VectorStore` remain abstract-only. `OllamaClient` (health checks) is
-  deliberately kept separate from these interfaces so health checks don't get entangled with the
+  two concrete implementations:
+  - `OllamaEmbeddingProvider` (`app/rag/providers/ollama_embedding_provider.py`) — calls
+    `POST /api/embeddings` for `OLLAMA_EMBEDDING_MODEL` only.
+  - `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) — calls
+    `POST /api/generate` with `stream=true` for `OLLAMA_CHAT_MODEL`, exposing
+    `stream_generate(prompt) -> AsyncIterator[str]` (yields text chunks as Ollama streams them)
+    and `generate(prompt) -> str` (joins the streamed chunks, satisfying the abstract
+    `LLMProvider` contract). Internal-only — no ingestion, no Qdrant writes, no public chat/SSE
+    endpoint.
+
+  `VectorStore` remains abstract-only. `OllamaClient` (health checks) is deliberately kept
+  separate from these provider interfaces so health checks don't get entangled with the
   generation/embedding contracts.
 - `app/workers` — background job placeholders.
 
 ## What is intentionally not implemented yet
 
 - Document ingestion/upload endpoints
-- Chat/query endpoints
-- Ollama generation calls (`/api/generate`)
+- A public chat/query endpoint (including SSE streaming to clients)
 - A public API endpoint for embeddings (the provider is internal-only for now)
-- Concrete `LLMProvider`, `VectorStore` implementations (Ollama chat, Qdrant clients)
+- Concrete `VectorStore` implementation (Qdrant client)
 - Qdrant collection creation
 - Database models/migrations beyond the empty Alembic scaffold
 - Auth, rate limiting, observability/logging pipeline
