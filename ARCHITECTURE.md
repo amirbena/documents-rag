@@ -6,20 +6,20 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus five vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus six vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
-concrete Qdrant-backed vector store, and a rule-based RAG decision layer. No ingestion, document
-upload, chat endpoint, SSE endpoint, or full RAG flow exists yet — the vector store supports
-collection creation, upsert, and search only, and the decision layer only classifies a question;
-neither is wired into a pipeline by any caller.
+concrete Qdrant-backed vector store, a rule-based RAG decision layer, and a document upload +
+ingestion job skeleton. No PDF parsing, chunking, embedding generation, Qdrant upsert, or chat
+endpoint happens yet — uploading a document only stores the file and creates `pending`
+database rows; nothing processes them.
 
 ## Services
 
 | Service    | Image                    | Purpose (current)                                             | Purpose (future) |
 |------------|--------------------------|------------------------------------------------------------------|-------------------|
-| `app`      | built from `Dockerfile`  | FastAPI process: `/api/v1/health`, `/api/v1/providers/ollama/health` | RAG API: ingestion, retrieval, chat |
-| `postgres` | `postgres:16-alpine`     | Relational store, wired via async SQLAlchemy                     | Document/session/metadata storage |
+| `app`      | built from `Dockerfile`  | FastAPI process: `/api/v1/health`, `/api/v1/providers/ollama/health`, `POST /api/v1/documents` | RAG API: ingestion processing, retrieval, chat |
+| `postgres` | `postgres:16-alpine`     | Stores `documents`/`ingestion_jobs` rows via async SQLAlchemy     | Session/metadata storage |
 | `redis`    | `redis:7-alpine`         | Available on the network                                         | Caching, task queues |
 | `qdrant`   | `qdrant/qdrant:latest`   | Collection create/upsert/search via `QdrantVectorStore`           | Backing document retrieval in a future RAG flow |
 | `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`nomic-embed-text`) + streaming generation (`llama3.1`) | Backing a future public chat endpoint |
@@ -34,7 +34,9 @@ there is no public chat or SSE endpoint yet. The app also talks to Qdrant's HTTP
 `QDRANT_URL` (via `app/rag/providers/qdrant_vector_store.py`) to create collections, upsert
 vectors, and run similarity search — see "Vector store" below. Callers resolve all of these
 providers through `app/rag/providers/provider_factory.py` rather than importing Ollama/Qdrant
-classes directly — see "Provider factory" below. Postgres and Redis are still unused beyond
+classes directly — see "Provider factory" below. `POST /api/v1/documents` stores an uploaded
+file and creates `Document`/`IngestionJob` rows in Postgres — see "Document upload and ingestion
+job skeleton" below. Nothing yet processes an `IngestionJob`; Redis is still unused beyond
 connection configuration.
 
 ## Provider factory
@@ -123,6 +125,30 @@ with an LLM-based router, but the rule-based version exists first so the decisio
 (`RagDecision`/`DecisionResult`) is fixed and testable before anything calls out to a model for
 routing.
 
+## Document upload and ingestion job skeleton
+
+`POST /api/v1/documents` (`app/api/v1/routes/documents.py`) is the first public endpoint that
+touches the database. It accepts a multipart file upload and does exactly three things, all
+inside one request:
+
+1. Saves the file via `LocalFileStorage` (`app/services/local_file_storage.py`) under
+   `storage/documents/`, using a **generated, filesystem-safe stored filename** (a UUID plus a
+   sanitized extension) — never the raw original filename, which may contain Unicode, spaces, or
+   path-unsafe characters. No S3 or other remote backend exists yet.
+2. Inserts a `Document` row (`app/models/document.py`): `original_filename` (stored exactly as
+   received — Hebrew or any other Unicode text is preserved verbatim, since Postgres/SQLAlchemy
+   `String` columns are UTF-8 natively), `stored_filename`, `content_type`, `file_size`,
+   `stored_path`.
+3. Inserts an `IngestionJob` row (`app/models/ingestion_job.py`) with `status=PENDING`,
+   referencing the `Document` via `document_id`. `IngestionStatus` (a `StrEnum`): `PENDING`,
+   `PROCESSING`, `COMPLETED`, `FAILED` — stored in Postgres as their lowercase `.value`
+   (`pending`, `processing`, ...), not the enum member name.
+
+The endpoint returns `202 Accepted` with `{document_id, job_id, status}` — **it does not parse,
+chunk, embed, or index the document inside the request.** No later milestone's worker exists yet
+to pick up a `pending` job and actually process it; this milestone is the upload + bookkeeping
+skeleton only. An empty (zero-byte) upload is rejected with `400` before any row is created.
+
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -168,7 +194,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 |----------------------------|-----------------------------------------------------------------------|-------|
 | `APP_ENV`                 | `local`                                                                | Echoed by `/health` |
 | `LOG_LEVEL`                | `INFO`                                                                 | Not yet wired to a logger |
-| `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine |
+| `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine; stores `documents`/`ingestion_jobs` |
 | `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed |
 | `QDRANT_URL`               | `http://qdrant:6333`                                                  | Used by `QdrantVectorStore` for collection/upsert/search |
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
@@ -181,14 +207,18 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## Current boundaries
 
-- `app/api` — FastAPI routers: `/health` and `/providers/ollama/health`.
+- `app/api` — FastAPI routers: `/health`, `/providers/ollama/health`, and `POST /documents`
+  (see "Document upload and ingestion job skeleton" above).
 - `app/core` — configuration and cross-cutting concerns.
 - `app/db` — SQLAlchemy async engine/session setup.
-- `app/models` — ORM models (empty for now).
+- `app/models` — ORM models: `Document`, `IngestionJob`/`IngestionStatus` (see "Document upload
+  and ingestion job skeleton" above).
 - `app/schemas` — Pydantic request/response schemas.
-- `app/services` — business logic layer. Currently just `OllamaClient`
-  (`app/services/ollama_client.py`), a thin async HTTP client scoped strictly to reachability and
-  model-availability checks — it intentionally does not call generation or embedding endpoints.
+- `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
+  async HTTP client scoped strictly to reachability and model-availability checks — it
+  intentionally does not call generation or embedding endpoints; and `LocalFileStorage`
+  (`app/services/local_file_storage.py`), which saves uploaded files to local disk under a
+  generated safe filename (see "Document upload and ingestion job skeleton" above).
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -219,13 +249,18 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- Document ingestion/upload endpoints
+- PDF/document parsing
+- Document chunking
+- Embedding generation for uploaded documents (the embedding *provider* exists; nothing calls it
+  from the upload/ingestion path yet)
+- Upserting uploaded-document vectors into Qdrant (the vector *store* exists; nothing calls it
+  from the upload/ingestion path yet)
+- Anything that actually processes a `pending` `IngestionJob` (no worker picks it up yet)
 - A public chat/query endpoint (including SSE streaming to clients)
 - A public API endpoint for embeddings, vector store, or decision-layer operations (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
 - Any pipeline wiring the decision layer, embeddings, vector store, retrieval, and generation into
   a full RAG flow
-- Database models/migrations beyond the empty Alembic scaffold
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.

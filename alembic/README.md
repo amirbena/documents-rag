@@ -11,8 +11,7 @@ upgraded, and rolled back reproducibly across environments.
 - `alembic/env.py` — runtime configuration; wires Alembic to the app's `Settings` and async
   SQLAlchemy `Base` metadata.
 - `alembic/script.py.mako` — template used to generate new migration files.
-- `alembic/versions/` — individual migration scripts, one per revision. Currently empty — no
-  models or migrations exist yet.
+- `alembic/versions/` — individual migration scripts, one per revision.
 - `alembic.ini` (repo root) — Alembic CLI configuration (script location, logging).
 
 ## How migrations connect to the async SQLAlchemy setup
@@ -24,7 +23,10 @@ upgraded, and rolled back reproducibly across environments.
   always target the same database the app connects to (no separate migration DB config to keep
   in sync).
 - `Base.metadata` is passed as `target_metadata`, so `alembic revision --autogenerate` can diff
-  ORM models declared under `app/models/` against the live schema.
+  ORM models declared under `app/models/` against the live schema. `env.py` also imports
+  `app.models` directly (`import app.models  # noqa: F401`) so every model module actually runs
+  and registers its table on `Base.metadata` before the diff happens — a model that exists as a
+  file but is never imported anywhere is invisible to autogenerate.
 - Because the app uses an async engine (`asyncpg`), `env.py` runs migrations through an async
   connection (`create_async_engine` + `run_sync`) rather than Alembic's default sync path.
 
@@ -56,6 +58,9 @@ alembic upgrade head
 
 ## Current status
 
-This is scaffold-only: `app/models/` has no ORM models yet, so `alembic/versions/` is empty and
-there is nothing to autogenerate or apply. This will be populated once real models are added in a
-later milestone.
+`app/models/` has two ORM models — `Document` and `IngestionJob` (see
+[ARCHITECTURE.md](../ARCHITECTURE.md), "Document upload and ingestion job skeleton") — backed by
+one migration (`add documents and ingestion jobs tables`) that creates the `documents` and
+`ingestion_jobs` tables, including the `documents.id → ingestion_jobs.document_id` foreign key.
+Verified locally: `alembic upgrade head` and `alembic downgrade -1` both applied cleanly against
+a real Postgres container, and the resulting schema matches the models column-for-column.
