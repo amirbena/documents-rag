@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     ollama_chat_model: str = Field(default="llama3.1", alias="OLLAMA_CHAT_MODEL")
     ollama_embedding_model: str = Field(default="nomic-embed-text", alias="OLLAMA_EMBEDDING_MODEL")
 
+    llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
+    embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
+    vector_store_provider: str = Field(default="qdrant", alias="VECTOR_STORE_PROVIDER")
+
 
 @lru_cache
 def get_settings() -> Settings:

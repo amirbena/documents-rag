@@ -70,6 +70,21 @@ Ollama's `POST /api/generate` (`stream=true`) with `OLLAMA_CHAT_MODEL`, via
 `generate(prompt) -> str` (joins the streamed chunks). It's an internal provider only — there is
 no public chat endpoint or SSE endpoint yet, and it doesn't touch ingestion or Qdrant.
 
+Providers are resolved through `app/rag/providers/provider_factory.py` rather than importing
+Ollama classes directly:
+
+```python
+from app.rag.providers.provider_factory import get_embedding_provider, get_llm_provider
+
+embedding_provider = get_embedding_provider()   # reads EMBEDDING_PROVIDER
+llm_provider = get_llm_provider()               # reads LLM_PROVIDER
+```
+
+`LLM_PROVIDER`/`EMBEDDING_PROVIDER` default to `ollama` (the only implementation so far);
+`VECTOR_STORE_PROVIDER` defaults to `qdrant`, which is recognized but not yet implemented —
+`get_vector_store()` raises `NotImplementedError`. An unrecognized provider name raises
+`UnsupportedProviderError` with a clear message.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -143,6 +158,8 @@ postgres, redis, qdrant, ollama), configuration, async DB wiring, Alembic scaffo
 provider interfaces. On top of that, Ollama reachability and model-availability checks are
 implemented (`GET /api/v1/providers/ollama/health`), a concrete `OllamaEmbeddingProvider` can
 embed text via `/api/embeddings`, and a concrete `OllamaLLMProvider` can stream completions via
-`/api/generate` — all three covered by tests with a mocked Ollama transport. Document ingestion,
-a public chat/query endpoint, and Qdrant indexing are not yet implemented — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
+`/api/generate` — all resolved through a configuration-driven provider factory
+(`app/rag/providers/provider_factory.py`) instead of being hardcoded to Ollama — covered by tests
+with a mocked Ollama transport. Document ingestion, a public chat/query endpoint, and Qdrant
+indexing are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
+what's intentionally deferred.
