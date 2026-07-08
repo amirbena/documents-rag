@@ -8,11 +8,24 @@ module only selects and constructs, it never reimplements provider logic.
 """
 
 from app.core.config import Settings, get_settings
+from app.rag.providers.anthropic_provider import AnthropicProvider
 from app.rag.providers.embedding_provider import EmbeddingProvider
+from app.rag.providers.errors import ProviderNotImplementedError
+from app.rag.providers.gemini_provider import GeminiProvider
 from app.rag.providers.llm_provider import LLMProvider
+from app.rag.providers.llm_provider_stub import LLMProviderStub
 from app.rag.providers.ollama_embedding_provider import OllamaEmbeddingProvider
 from app.rag.providers.ollama_llm_provider import OllamaLLMProvider
+from app.rag.providers.openai_provider import OpenAIProvider
 from app.rag.providers.vector_store import VectorStore
+
+# Recognized LLM providers with no real implementation yet. Configuring one of these fails
+# explicitly via ProviderNotImplementedError — the backend never silently falls back to Ollama.
+_LLM_STUBS: dict[str, type[LLMProviderStub]] = {
+    "openai": OpenAIProvider,
+    "gemini": GeminiProvider,
+    "anthropic": AnthropicProvider,
+}
 
 
 class UnsupportedProviderError(ValueError):
@@ -40,7 +53,14 @@ def get_llm_provider(settings: Settings | None = None) -> LLMProvider:
     if provider == "ollama":
         return OllamaLLMProvider(settings=settings)
 
-    raise UnsupportedProviderError(f"Unsupported LLM_PROVIDER: {provider!r}. Supported providers: 'ollama'.")
+    if provider in _LLM_STUBS:
+        raise ProviderNotImplementedError(_LLM_STUBS[provider].NOT_IMPLEMENTED_MESSAGE)
+
+    raise UnsupportedProviderError(
+        f"Unsupported LLM_PROVIDER: {provider!r}. "
+        f"Supported providers: 'ollama'. Recognized but not implemented: "
+        f"{', '.join(sorted(_LLM_STUBS))}."
+    )
 
 
 def get_vector_store(settings: Settings | None = None) -> VectorStore:

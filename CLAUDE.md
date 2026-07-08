@@ -56,6 +56,21 @@ def get_settings() -> Settings:
     """Return the cached application settings."""
 ```
 
+## Provider Stubs
+
+- **Future provider stubs are allowed.** A placeholder class for a provider we intend to support
+  later (e.g. `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`) may be added ahead of its
+  real implementation, so the provider factory and config have a place for it to land.
+- **Stubs must not silently call external APIs.** No HTTP calls, no SDK calls, no reading external
+  API keys "just in case" — a stub does nothing except fail clearly.
+- **Stubs must fail explicitly until implemented.** Every method on a stub raises a clear,
+  named error (e.g. `ProviderNotImplementedError("<Provider> provider is not implemented yet.")`)
+  rather than returning empty/default data or silently no-op'ing.
+- **The backend must never silently fall back to Ollama when another provider is configured.**
+  If `LLM_PROVIDER`/`EMBEDDING_PROVIDER`/`VECTOR_STORE_PROVIDER` names a provider other than
+  Ollama, the factory must resolve to that provider (real or stub) or raise a clear configuration
+  error — it must never quietly substitute the Ollama implementation instead.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`

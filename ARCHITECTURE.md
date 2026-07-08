@@ -39,7 +39,9 @@ based on three config variables, so the rest of the codebase depends on the `Emb
 `LLMProvider` / `VectorStore` interfaces rather than being coupled to Ollama or Qdrant directly:
 
 - `get_embedding_provider()` — `EMBEDDING_PROVIDER` (`"ollama"` → `OllamaEmbeddingProvider`)
-- `get_llm_provider()` — `LLM_PROVIDER` (`"ollama"` → `OllamaLLMProvider`)
+- `get_llm_provider()` — `LLM_PROVIDER` (`"ollama"` → `OllamaLLMProvider`; `"openai"`, `"gemini"`,
+  `"anthropic"` are recognized but raise `ProviderNotImplementedError` — see "Future LLM provider
+  stubs" below)
 - `get_vector_store()` — `VECTOR_STORE_PROVIDER` (`"qdrant"` is recognized but raises
   `NotImplementedError` — no concrete `VectorStore` exists yet)
 
@@ -48,6 +50,25 @@ naming the offending value and the supported provider(s). All Ollama-specific lo
 error handling) stays inside the Ollama provider classes — the factory only selects and
 constructs; it never reimplements provider behavior, and business/service code should resolve
 providers through it rather than importing `OllamaEmbeddingProvider`/`OllamaLLMProvider` directly.
+The factory never falls back to Ollama for a misconfigured or unimplemented provider — every
+non-`ollama` value either resolves to its own explicit failure or a real alternative
+implementation.
+
+## Future LLM provider stubs
+
+`OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
+(`app/rag/providers/{openai,gemini,anthropic}_provider.py`) are explicit placeholders for
+providers with no real implementation yet. Each implements `LLMProvider` via a shared base,
+`LLMProviderStub` (`app/rag/providers/llm_provider_stub.py`), whose `generate()` always raises
+`ProviderNotImplementedError` (`app/rag/providers/errors.py`) with a message naming the provider
+— they make no HTTP calls and read no external API keys. `get_llm_provider()` raises the same
+error immediately when `LLM_PROVIDER` names one of these, before any provider object does
+anything, so a misconfigured provider fails loudly at resolution time rather than silently
+falling back to Ollama or failing later on first use.
+
+Adding a new stub for another future provider means: create a class inheriting
+`LLMProviderStub` with its own `NOT_IMPLEMENTED_MESSAGE`, and add it to `_LLM_STUBS` in
+`provider_factory.py`. See [CLAUDE.md](CLAUDE.md) for the standing rule on how stubs must behave.
 
 ## Docker Compose topology
 
@@ -84,7 +105,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
 | `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; used by `OllamaLLMProvider` to stream completions |
 | `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; used by `OllamaEmbeddingProvider` to embed |
-| `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation via the provider factory |
+| `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation; `openai`/`gemini`/`anthropic` are recognized stubs |
 | `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
 | `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Recognized but not yet implemented — `get_vector_store()` raises `NotImplementedError` |
 
@@ -109,6 +130,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     and `generate(prompt) -> str` (joins the streamed chunks, satisfying the abstract
     `LLMProvider` contract). Internal-only — no ingestion, no Qdrant writes, no public chat/SSE
     endpoint.
+
+  Three future-provider stubs also exist — `OpenAIProvider`, `GeminiProvider`,
+  `AnthropicProvider` (`app/rag/providers/{openai,gemini,anthropic}_provider.py`) — which
+  implement `LLMProvider` but always raise `ProviderNotImplementedError` (see "Future LLM
+  provider stubs" above).
 
   `VectorStore` remains abstract-only. `OllamaClient` (health checks) is deliberately kept
   separate from these provider interfaces so health checks don't get entangled with the
