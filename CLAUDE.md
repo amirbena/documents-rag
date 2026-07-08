@@ -66,6 +66,8 @@ def get_settings() -> Settings:
   cleanups bundled into an unrelated PR.
 - **Prefer small, focused PRs.** One milestone or one concern per PR, matching the "small
   incremental milestones" rule above.
+- **Use the repository PR template.** Fill in `.github/pull_request_template.md` — don't write a
+  free-form description instead of it.
 
 ### PR title style
 

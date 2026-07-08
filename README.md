@@ -109,10 +109,11 @@ gh auth status     # verify you're authenticated
 ```
 
 PRs should be small and focused (one milestone per PR) and their description should include
-verification results (test/lint/type-check output), not just a claim that checks passed. PR
-titles and the full description format (Summary, Why, Changes, Verification, Explicit
-exclusions, Next recommended milestone) are defined in [CLAUDE.md](CLAUDE.md) under
-"Pull Request Workflow" — follow that format for every PR.
+verification results (test/lint/type-check output), not just a claim that checks passed. Use the
+repository PR template ([.github/pull_request_template.md](.github/pull_request_template.md)) —
+`gh pr create` picks it up automatically. PR titles and the full description format (Summary,
+Why, Changes, Verification, Explicit exclusions, Next recommended milestone) are defined in
+[CLAUDE.md](CLAUDE.md) under "Pull Request Workflow" — follow that format for every PR.
 
 ## Current milestone status
 
