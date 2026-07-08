@@ -166,6 +166,26 @@ print(result.decision, result.reason, result.confidence)
 It's internal-only — no public API endpoint exposes it, and it doesn't perform retrieval,
 generation, ingestion, or document upload itself; it only decides what *should* happen next.
 
+### Document upload
+
+```bash
+curl -X POST http://localhost:8000/api/v1/documents \
+  -F "file=@/path/to/handbook.pdf;type=application/pdf"
+```
+
+Returns `202 Accepted`:
+
+```json
+{"document_id": "...", "job_id": "...", "status": "pending"}
+```
+
+This saves the file under `storage/documents/` (with a generated, filesystem-safe stored
+filename — never the raw original name), creates a `Document` row (with the original filename
+preserved exactly, Hebrew/Unicode included), and creates an `IngestionJob` row with
+`status=pending`. **Nothing is parsed, chunked, embedded, or upserted into Qdrant inside the
+request** — no worker exists yet to pick up and process a pending job. An empty (zero-byte) file
+is rejected with `400` before any row is created.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -249,7 +269,10 @@ of falling back to Ollama. `LLM_MODEL` selects the chat model independently of `
 (falling back to `OLLAMA_CHAT_MODEL`), while `OLLAMA_EMBEDDING_MODEL` stays fixed for embeddings.
 A rule-based RAG decision layer (`RuleBasedRagDecider`) can classify a question as needing
 retrieval, going direct to the LLM, needing clarification, or being out of scope — deterministic
-routing, no LLM call involved. Document ingestion, a public chat/query endpoint, and any pipeline
-wiring the decision layer, providers, and vector store together into a full RAG flow are not yet
-implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
-intentionally deferred.
+routing, no LLM call involved. `POST /api/v1/documents` accepts a file upload (Hebrew/Unicode
+filenames included), stores it locally under a generated safe filename, and creates `Document` +
+`pending` `IngestionJob` rows — returning `202` without parsing, chunking, embedding, or
+upserting anything. PDF parsing, chunking, embedding generation for uploads, Qdrant upsert, a
+public chat/query endpoint, and any pipeline wiring the decision layer, providers, vector store,
+and ingestion jobs together into a full RAG flow are not yet implemented — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.

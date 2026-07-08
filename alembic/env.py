@@ -6,6 +6,7 @@ from logging.config import fileConfig
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import app.models  # noqa: F401  # registers models on Base.metadata for autogenerate
 from alembic import context
 from app.core.config import get_settings
 from app.db.session import Base
