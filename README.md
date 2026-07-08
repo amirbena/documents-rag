@@ -152,6 +152,20 @@ but raises `ProviderNotImplementedError` immediately — these are explicit stub
 never silently fall back to Ollama. They exist so future provider support has a place to land
 without changing how the factory or callers behave.
 
+`RuleBasedRagDecider` (`app/rag/decision.py`) is a small internal decision layer that classifies
+a question — `NEEDS_RETRIEVAL`, `DIRECT_LLM`, `CLARIFICATION_NEEDED`, or `OUT_OF_SCOPE` — using
+deterministic keyword/pattern rules, with **no LLM call made to route**:
+
+```python
+from app.rag.decision import RuleBasedRagDecider
+
+result = RuleBasedRagDecider().decide("What does the uploaded document say about refunds?")
+print(result.decision, result.reason, result.confidence)
+```
+
+It's internal-only — no public API endpoint exposes it, and it doesn't perform retrieval,
+generation, ingestion, or document upload itself; it only decides what *should* happen next.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -233,7 +247,9 @@ against a real Qdrant container). Explicit future-provider stubs (`OpenAIProvide
 `GeminiProvider`, `AnthropicProvider`) exist so those `LLM_PROVIDER` values fail clearly instead
 of falling back to Ollama. `LLM_MODEL` selects the chat model independently of `LLM_PROVIDER`
 (falling back to `OLLAMA_CHAT_MODEL`), while `OLLAMA_EMBEDDING_MODEL` stays fixed for embeddings.
-Document ingestion, a public chat/query endpoint, and any pipeline wiring these providers
-together into a full RAG flow are not yet implemented — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+A rule-based RAG decision layer (`RuleBasedRagDecider`) can classify a question as needing
+retrieval, going direct to the LLM, needing clarification, or being out of scope — deterministic
+routing, no LLM call involved. Document ingestion, a public chat/query endpoint, and any pipeline
+wiring the decision layer, providers, and vector store together into a full RAG flow are not yet
+implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
 intentionally deferred.
