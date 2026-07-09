@@ -30,7 +30,8 @@ to run and test it.
    large bundled change. Do not implement future milestones early "while you're in there" — stick
    to what was asked.
 5. **Quality gates must pass before a change is considered done.** Run `make verify` before
-   finishing any implementation task — it runs, in order, stopping at the first failure:
+   finishing any implementation task, and always before pushing/opening a PR — it runs, in
+   order, stopping at the first failure:
    - `make test` (`pytest -q`)
    - `make lint` (`ruff check .`)
    - `make typecheck` (`mypy app`)
@@ -39,6 +40,12 @@ to run and test it.
    If `make` isn't available, run the four underlying commands individually in that order as a
    fallback. All four must pass cleanly either way. If one fails, fix the underlying issue rather
    than skipping or loosening the gate.
+
+   Installing the pre-commit hook (`./scripts/install-git-hooks.sh`) makes `make verify` run
+   automatically on every commit — this enforces the gate mechanically, but it does not replace
+   the responsibility above: run `make verify` explicitly before finishing a task or opening a
+   PR regardless of whether the hook is installed locally. Never bypass the hook (`--no-verify`)
+   or any other quality gate unless the user explicitly asks for it.
 
 ## Function Documentation
 
