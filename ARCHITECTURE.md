@@ -6,15 +6,17 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus eight vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus nine vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
 concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
-ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, and a
-document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`) that is now the worker's real
-first processing step. No chunking, embedding generation, Qdrant upsert, or chat endpoint
-happens yet — a claimed job's text is extracted and then discarded (nothing persists or chunks
-it yet); the job still resolves to `completed` purely based on whether extraction succeeded.
+ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, a
+document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`), and a document chunker that
+splits extracted text into fixed-size, overlapping, word-boundary-aware chunks — the worker's
+pipeline is now Document → extraction → chunking, and stops there. No embedding generation,
+Qdrant upsert, retrieval, or chat endpoint happens yet — a claimed job's chunks are produced and
+then discarded (nothing persists them yet); the job still resolves to `completed` purely based
+on whether extraction and chunking succeeded.
 
 ## Services
 
@@ -162,15 +164,16 @@ picks up and resolves the `pending` job it creates.
 2. Flips the claimed job to `PROCESSING` and **commits immediately** — a separate transaction
    boundary from the outcome below, so the claim is durable before any processing is attempted.
 3. Looks up the associated `Document` and calls the injected processing step (default:
-   `_default_process_document`, which calls `DocumentTextExtractor` — see "Document text
-   extraction" below) with `(document, job)`.
+   `_default_process_document`, which runs Document → extraction (`DocumentTextExtractor` —
+   see "Document text extraction" below) → chunking (`DocumentChunker` — see "Document
+   chunking" below), and stops there) with `(document, job)`.
 4. On success: `PROCESSING` → `COMPLETED`, committed.
    On any exception: `PROCESSING` → `FAILED`, `error_message` set to `str(exception)`, committed.
 
 The processing step is injected via the constructor (`IngestionWorker(process_document=...)`)
-specifically so a **later milestone can extend it** with chunking, embedding generation, and
-Qdrant upsert — without changing the claim/lock/transition logic. `IngestionWorker` never
-imports or calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or `provider_factory` itself.
+specifically so a **later milestone can extend it** with embedding generation and Qdrant upsert
+— without changing the claim/lock/transition logic. `IngestionWorker` never imports or calls
+`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or `provider_factory` itself.
 
 **Idempotent by construction**: once a job leaves `PENDING` (to `PROCESSING`, then `COMPLETED`
 or `FAILED`), the claim query's `WHERE status='pending'` filter can never select it again —
@@ -241,9 +244,44 @@ mismatched or corrupt file before wasting effort on the wrong parser (e.g. an `.
 MIME/magic-byte sniffing beyond the checks above, or scan file contents for malicious payloads —
 those remain future hardening if ever needed.
 
-The extracted result is currently discarded after extraction succeeds — there is no table or
-field yet that persists extracted text, since chunking/embedding (the next milestones) will
-decide how it's actually stored.
+The extracted result is passed directly into chunking (see "Document chunking" below) — nothing
+persists the raw extracted text itself.
+
+## Document chunking
+
+`DocumentChunker` (`app/services/document_chunker.py`) is the ingestion worker's second
+processing step: it takes the `ExtractedDocument` that `DocumentTextExtractor` produced and
+splits each page's text into fixed-size, overlapping chunks — **no embedding generation, no
+Qdrant upsert, no retrieval**.
+
+- Input: `ExtractedDocument` (one `ExtractedDocument` covering all of a document's pages/sheets).
+- Output: `list[DocumentChunk]`.
+- `DocumentChunk` — `document_id: str`, `chunk_id: str`, `text: str`, `chunk_index: int`,
+  `page_number: int | None`, `sheet_name: str | None`. `page_number`/`sheet_name` are copied
+  straight from the source `ExtractedPage` a chunk came from — `page_number` set for chunks from
+  a PDF page, `sheet_name` set for chunks from an XLSX sheet, both `None` for `.txt`/`.md`/`.docx`
+  chunks (which have no natural pagination).
+
+Chunking rules:
+
+- **Fixed target size** (`chunk_size`, in characters) and **configurable overlap**
+  (`chunk_overlap`, in characters) — both configured via `CHUNK_SIZE`/`CHUNK_OVERLAP` (see
+  "Environment variables" below), and both also settable directly via
+  `DocumentChunker(chunk_size=..., chunk_overlap=...)`. The constructor raises `ValueError` if
+  `chunk_overlap >= chunk_size` or either value is non-positive/negative.
+- **Word-boundary-aware**: chunks are built by accumulating whole words up to `chunk_size`
+  characters — a chunk never ends or starts mid-word. Overlap is built from the trailing whole
+  words of the previous chunk, up to `chunk_overlap` characters.
+- **Empty chunks are ignored**: a page whose text is empty or whitespace-only (after
+  `str.split()`) produces zero chunks, not an empty-text chunk.
+- **Deterministic**: `chunk()` is a pure function of its input — the same `ExtractedDocument`
+  always produces the same chunks, in the same order, with the same `chunk_id`s
+  (`f"{document_id}-{chunk_index}"`, where `chunk_index` increments continuously across all
+  pages of the document, not reset per page).
+
+The chunker's output is currently discarded once produced — there is no table or field yet that
+persists chunks, since embedding (the next milestone) will decide how they're actually stored
+and referenced.
 
 ## Future LLM provider stubs
 
@@ -300,6 +338,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `LLM_MODEL`                | *(unset)*                                                              | Selects the model `OllamaLLMProvider` uses; falls back to `OLLAMA_CHAT_MODEL` if unset (see "LLM provider vs. model") |
 | `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
 | `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Selects the `VectorStore` implementation via the provider factory |
+| `CHUNK_SIZE`               | `1000`                                                                 | Target chunk size in characters, used by `DocumentChunker` |
+| `CHUNK_OVERLAP`            | `200`                                                                  | Overlap between consecutive chunks in characters, used by `DocumentChunker` |
 
 ## Current boundaries
 
@@ -319,7 +359,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls; and
   `DocumentTextExtractor` (`app/services/document_text_extractor.py`), which extracts text from
   a document's stored `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction"
-  above) — no chunking, embedding, or Qdrant upsert.
+  above); and `DocumentChunker` (`app/services/document_chunker.py`), which splits an
+  `ExtractedDocument` into `DocumentChunk`s (see "Document chunking" above) — no embedding or
+  Qdrant upsert anywhere in this layer.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -350,17 +392,18 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- Document chunking
-- Embedding generation for uploaded documents (the embedding *provider* exists; nothing calls it
+- Embedding generation for document chunks (the embedding *provider* exists; nothing calls it
   from the upload/ingestion path yet)
-- Upserting uploaded-document vectors into Qdrant (the vector *store* exists; nothing calls it
-  from the upload/ingestion path yet)
-- Persisting extracted text anywhere — `DocumentTextExtractor`'s result is discarded once the
-  worker's default processing step returns; there's no table or field for it yet
+- Upserting chunk vectors into Qdrant (the vector *store* exists; nothing calls it from the
+  upload/ingestion path yet)
+- Retrieval of any kind
+- Persisting extracted text or chunks anywhere — `DocumentChunker`'s output is discarded once
+  the worker's default processing step returns; there's no table or field for either yet
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings, vector store, or decision-layer operations (all internal-only)
+- A public API endpoint for embeddings, vector store, chunking, or decision-layer operations
+  (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
 - Any pipeline wiring the decision layer, embeddings, vector store, retrieval, and generation into
   a full RAG flow
