@@ -6,17 +6,18 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus nine vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus ten vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
 concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
 ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, a
-document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`), and a document chunker that
-splits extracted text into fixed-size, overlapping, word-boundary-aware chunks — the worker's
-pipeline is now Document → extraction → chunking, and stops there. No embedding generation,
-Qdrant upsert, retrieval, or chat endpoint happens yet — a claimed job's chunks are produced and
-then discarded (nothing persists them yet); the job still resolves to `completed` purely based
-on whether extraction and chunking succeeded.
+document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`), a document chunker that splits
+extracted text into fixed-size, overlapping, word-boundary-aware chunks, and chunk
+embedding/Qdrant indexing — the worker's pipeline is now Document → extraction → chunking →
+embedding → Qdrant upsert. No retrieval or chat endpoint happens yet — a claimed job's chunks
+are embedded and their vectors upserted into Qdrant, but nothing yet reads them back out for
+retrieval; the job resolves to `completed` only if extraction, chunking, embedding, and the
+Qdrant upsert all succeed.
 
 ## Services
 
@@ -85,7 +86,7 @@ would silently invalidate any previously-computed vectors. `OllamaEmbeddingProvi
 data types:
 
 - `VectorPoint` — one embedding vector to upsert, with `id`, `vector`, and payload metadata
-  (`document_id`, `chunk_id`, `text`, `source`, optional `page_number`).
+  (`document_id`, `chunk_id`, `text`, `source`, optional `page_number`, optional `sheet_name`).
 - `VectorSearchResult` — one nearest-neighbor match: `id`, `score`, plus the same payload fields.
 
 `VectorStore` methods: `create_collection_if_not_exists(collection_name, vector_size)`,
@@ -102,8 +103,8 @@ Qdrant SDK is used**, matching the same pattern as the Ollama providers. It call
   `VectorSearchResult` objects.
 
 `QdrantVectorStoreError` is raised on an unreachable server, a non-200 response, or a malformed
-response (e.g. missing payload fields). This provider is internal-only: no document
-ingestion/upload, no chat/SSE endpoint, and no caller wires it into a retrieval pipeline yet.
+response (e.g. missing payload fields). `IngestionWorker` is now a caller (see "Chunk embedding
+and Qdrant indexing" below) — no other caller wires it into a retrieval pipeline yet.
 
 ## RAG decision layer
 
@@ -166,14 +167,16 @@ picks up and resolves the `pending` job it creates.
 3. Looks up the associated `Document` and calls the injected processing step (default:
    `_default_process_document`, which runs Document → extraction (`DocumentTextExtractor` —
    see "Document text extraction" below) → chunking (`DocumentChunker` — see "Document
-   chunking" below), and stops there) with `(document, job)`.
+   chunking" below) → embedding → Qdrant upsert (see "Chunk embedding and Qdrant indexing"
+   below)) with `(document, job)`.
 4. On success: `PROCESSING` → `COMPLETED`, committed.
-   On any exception: `PROCESSING` → `FAILED`, `error_message` set to `str(exception)`, committed.
+   On any exception (extraction, chunking, embedding, or Qdrant upsert): `PROCESSING` → `FAILED`,
+   `error_message` set to `str(exception)`, committed.
 
-The processing step is injected via the constructor (`IngestionWorker(process_document=...)`)
-specifically so a **later milestone can extend it** with embedding generation and Qdrant upsert
-— without changing the claim/lock/transition logic. `IngestionWorker` never imports or calls
-`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or `provider_factory` itself.
+The processing step is injected via the constructor (`IngestionWorker(process_document=...)`) so
+tests can substitute a fake pipeline without changing the claim/lock/transition logic.
+`IngestionWorker` never imports or calls `LLMProvider` itself — ingestion embeds and indexes
+chunks, it never generates text.
 
 **Idempotent by construction**: once a job leaves `PENDING` (to `PROCESSING`, then `COMPLETED`
 or `FAILED`), the claim query's `WHERE status='pending'` filter can never select it again —
@@ -279,9 +282,36 @@ Chunking rules:
   (`f"{document_id}-{chunk_index}"`, where `chunk_index` increments continuously across all
   pages of the document, not reset per page).
 
-The chunker's output is currently discarded once produced — there is no table or field yet that
-persists chunks, since embedding (the next milestone) will decide how they're actually stored
-and referenced.
+The chunker's output feeds directly into embedding (see "Chunk embedding and Qdrant indexing"
+below) — there is still no table or field that persists chunk text itself in Postgres; Qdrant is
+the system of record for chunk vectors and their metadata.
+
+## Chunk embedding and Qdrant indexing
+
+The ingestion worker's third and fourth processing steps (`app/services/ingestion_worker.py`)
+turn each `DocumentChunk` into an indexed vector — **no retrieval, chat, or SSE endpoint reads
+these back out yet**:
+
+1. **Embed**: `get_embedding_provider()` (reads `EMBEDDING_PROVIDER`) embeds every chunk's text
+   in one call — `embedding_provider.embed([chunk.text for chunk in chunks])` — returning one
+   vector per chunk, in the same order.
+2. **Build `VectorPoint`s**: each chunk + its vector becomes a `VectorPoint` with `id` set to a
+   deterministic `uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)` (so re-processing a document
+   overwrites the same Qdrant points instead of duplicating them, and the id is always a
+   Qdrant-valid UUID regardless of `chunk_id`'s own format), and payload fields `document_id`,
+   `chunk_id`, `text`, `source` (the `Document.original_filename`), `page_number`, and
+   `sheet_name` carried straight over from the chunk.
+3. **Index**: `get_vector_store()` (reads `VECTOR_STORE_PROVIDER`) creates the collection named
+   `QDRANT_COLLECTION_NAME` with dimensionality `VECTOR_SIZE` if it doesn't already exist
+   (cheap no-op if it does), then upserts all points in one `upsert_vectors` call.
+
+A document that produces zero chunks (e.g. empty/whitespace-only extracted text) short-circuits
+before calling the embedding provider or vector store at all. A failure at either step
+(`EmbeddingProvider.embed` or `VectorStore.create_collection_if_not_exists`/`upsert_vectors`
+raising) propagates up through `_default_process_document` exactly like an extraction or
+chunking failure — `IngestionWorker` catches it and marks the job `FAILED` with
+`error_message = str(exception)`. `IngestionWorker` still never imports or calls `LLMProvider` —
+this pipeline embeds and indexes, it never generates text.
 
 ## Future LLM provider stubs
 
@@ -340,6 +370,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Selects the `VectorStore` implementation via the provider factory |
 | `CHUNK_SIZE`               | `1000`                                                                 | Target chunk size in characters, used by `DocumentChunker` |
 | `CHUNK_OVERLAP`            | `200`                                                                  | Overlap between consecutive chunks in characters, used by `DocumentChunker` |
+| `QDRANT_COLLECTION_NAME`   | `documents`                                                            | Collection `IngestionWorker` creates (if missing) and upserts chunk vectors into |
+| `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality passed to `create_collection_if_not_exists` — must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors) |
 
 ## Current boundaries
 
@@ -356,12 +388,13 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`app/services/local_file_storage.py`), which saves uploaded files to local disk under a
   generated safe filename (see "Document upload and ingestion job skeleton" above); and
   `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
-  ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls; and
-  `DocumentTextExtractor` (`app/services/document_text_extractor.py`), which extracts text from
-  a document's stored `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction"
-  above); and `DocumentChunker` (`app/services/document_chunker.py`), which splits an
-  `ExtractedDocument` into `DocumentChunk`s (see "Document chunking" above) — no embedding or
-  Qdrant upsert anywhere in this layer.
+  ingestion jobs (see "Ingestion worker" above) — no public API — and whose default pipeline now
+  calls the embedding/vector-store providers (see "Chunk embedding and Qdrant indexing" above),
+  the only place in this layer that does; `DocumentTextExtractor`
+  (`app/services/document_text_extractor.py`), which extracts text from a document's stored
+  `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction" above); and
+  `DocumentChunker` (`app/services/document_chunker.py`), which splits an `ExtractedDocument`
+  into `DocumentChunk`s (see "Document chunking" above).
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -376,7 +409,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     endpoint.
   - `QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) — calls Qdrant's HTTP API
     for collection create/upsert/search only (see "Vector store" above). Internal-only — no
-    ingestion, no document upload, no chat/SSE endpoint, no full RAG flow.
+    document upload, no chat/SSE endpoint, no full RAG flow; `IngestionWorker` is its only
+    caller so far.
 
   Three future-provider stubs also exist — `OpenAIProvider`, `GeminiProvider`,
   `AnthropicProvider` (`app/rag/providers/{openai,gemini,anthropic}_provider.py`) — which
@@ -392,21 +426,16 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- Embedding generation for document chunks (the embedding *provider* exists; nothing calls it
-  from the upload/ingestion path yet)
-- Upserting chunk vectors into Qdrant (the vector *store* exists; nothing calls it from the
-  upload/ingestion path yet)
-- Retrieval of any kind
-- Persisting extracted text or chunks anywhere — `DocumentChunker`'s output is discarded once
-  the worker's default processing step returns; there's no table or field for either yet
+- Retrieval of any kind — chunk vectors are indexed into Qdrant, but nothing queries them back out
+- Persisting extracted text or chunks in Postgres — `DocumentChunker`'s output is only persisted
+  as vectors in Qdrant (via the embedding/upsert step); there's no relational table for chunk text
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
 - A public API endpoint for embeddings, vector store, chunking, or decision-layer operations
   (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
-- Any pipeline wiring the decision layer, embeddings, vector store, retrieval, and generation into
-  a full RAG flow
+- Any pipeline wiring the decision layer, LLM generation, and retrieval into a full RAG flow
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.

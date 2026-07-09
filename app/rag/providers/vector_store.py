@@ -18,6 +18,7 @@ class VectorPoint:
     text: str
     source: str
     page_number: int | None = None
+    sheet_name: str | None = None
 
 
 @dataclass
@@ -31,6 +32,7 @@ class VectorSearchResult:
     text: str
     source: str
     page_number: int | None = None
+    sheet_name: str | None = None
 
 
 class VectorStore(ABC):

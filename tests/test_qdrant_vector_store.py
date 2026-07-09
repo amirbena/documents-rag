@@ -95,6 +95,31 @@ async def test_upsert_vectors_sends_expected_payload() -> None:
     }
 
 
+async def test_upsert_vectors_includes_sheet_name_when_present() -> None:
+    """A point with sheet_name should include it in the payload."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"result": {"status": "acknowledged"}, "status": "ok"})
+
+    store = _store(httpx.MockTransport(handler))
+    point = VectorPoint(
+        id="point-3",
+        vector=[0.7],
+        document_id="doc-3",
+        chunk_id="chunk-3",
+        text="row data",
+        source="report.xlsx",
+        sheet_name="Sheet1",
+    )
+
+    await store.upsert_vectors("docs", [point])
+
+    payload = captured["body"]["points"][0]["payload"]
+    assert payload["sheet_name"] == "Sheet1"
+
+
 async def test_upsert_vectors_omits_page_number_when_absent() -> None:
     """A point without page_number should omit it from the payload entirely."""
     captured: dict[str, object] = {}

@@ -18,7 +18,7 @@ class QdrantVectorStoreError(Exception):
 
 
 def _point_payload(point: VectorPoint) -> dict[str, Any]:
-    """Build the Qdrant payload dict (document_id, chunk_id, text, source, page_number)."""
+    """Build the Qdrant payload dict (document_id, chunk_id, text, source, page_number, sheet_name)."""
     payload: dict[str, Any] = {
         "document_id": point.document_id,
         "chunk_id": point.chunk_id,
@@ -27,6 +27,8 @@ def _point_payload(point: VectorPoint) -> dict[str, Any]:
     }
     if point.page_number is not None:
         payload["page_number"] = point.page_number
+    if point.sheet_name is not None:
+        payload["sheet_name"] = point.sheet_name
     return payload
 
 
@@ -42,6 +44,7 @@ def _parse_search_result(item: dict[str, Any]) -> VectorSearchResult:
             text=payload["text"],
             source=payload["source"],
             page_number=payload.get("page_number"),
+            sheet_name=payload.get("sheet_name"),
         )
     except KeyError as exc:
         raise QdrantVectorStoreError("Malformed search response from Qdrant") from exc

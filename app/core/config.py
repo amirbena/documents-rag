@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=1000, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=200, alias="CHUNK_OVERLAP")
 
+    qdrant_collection_name: str = Field(default="documents", alias="QDRANT_COLLECTION_NAME")
+    vector_size: int = Field(default=768, alias="VECTOR_SIZE")
+
     @property
     def resolved_llm_model(self) -> str:
         """Return LLM_MODEL if set, else OLLAMA_CHAT_MODEL for backward compatibility."""
