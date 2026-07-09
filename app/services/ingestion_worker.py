@@ -2,10 +2,10 @@
 
 Internal service only — no public API. Claims a job with a row-level lock, transitions
 pending -> processing -> completed/failed with clear transaction boundaries, and never
-re-processes a job that's already completed or failed. The default processing step extracts
-text from the document's stored file (see DocumentTextExtractor) — chunking, embedding
-generation, and Qdrant upsert are still placeholders for a later milestone. This worker never
-calls EmbeddingProvider, LLMProvider, or VectorStore itself.
+re-processes a job that's already completed or failed. The default processing step runs
+Document -> extraction -> chunking, and stops there — embedding generation and Qdrant upsert
+are still placeholders for a later milestone. This worker never calls EmbeddingProvider,
+LLMProvider, or VectorStore itself.
 """
 
 from collections.abc import Awaitable, Callable
@@ -13,19 +13,25 @@ from collections.abc import Awaitable, Callable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.document_chunker import DocumentChunker
 from app.services.document_text_extractor import DocumentTextExtractor
 
 ProcessDocumentFn = Callable[[Document | None, IngestionJob], Awaitable[None]]
 
 
 async def _default_process_document(document: Document | None, job: IngestionJob) -> None:
-    """Extract text from the document's stored file. No chunking, embedding, or Qdrant upsert yet."""
+    """Extract text, then split it into chunks. Stops there — no embedding or Qdrant upsert yet."""
     if document is None:
         raise ValueError(f"Document not found for job {job.id}")
 
-    await DocumentTextExtractor().extract(document)
+    extracted = await DocumentTextExtractor().extract(document)
+
+    settings = get_settings()
+    chunker = DocumentChunker(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+    chunker.chunk(extracted)
 
 
 class IngestionWorker:

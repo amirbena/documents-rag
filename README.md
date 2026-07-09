@@ -199,11 +199,12 @@ job = await worker.process_next_job(session)  # None if there's nothing pending
 
 It claims the oldest pending job with Postgres row-level locking
 (`SELECT ... FOR UPDATE SKIP LOCKED`), flips it to `processing`, runs a processing step (its
-default: `DocumentTextExtractor` — see below; still no chunking, embedding, or Qdrant upsert),
-then resolves it to `completed` on success or `failed` (with the error message stored) on any
-exception. It's idempotent: a job that's already `completed` or `failed` is never selected again
-by the claim query, so calling `process_next_job()` repeatedly never re-processes it. The worker
-never calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
+default: Document → `DocumentTextExtractor` → `DocumentChunker`, stopping there — see below;
+still no embedding or Qdrant upsert), then resolves it to `completed` on success or `failed`
+(with the error message stored) on any exception. It's idempotent: a job that's already
+`completed` or `failed` is never selected again by the claim query, so calling
+`process_next_job()` repeatedly never re-processes it. The worker never calls
+`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
 
 ### Document text extraction
 
@@ -234,9 +235,34 @@ for page in extracted.pages:
 Raises `DocumentTextExtractionError` for a missing stored file, an unsupported extension, or
 empty/whitespace-only extracted text — `IngestionWorker` catches this and marks the job
 `failed` with the error message stored. UTF-8/Unicode content (Hebrew included) is preserved
-exactly across all five file types. This is the ingestion worker's real first processing step,
-but the extracted text isn't stored anywhere yet — chunking and persistence come in a later
-milestone.
+exactly across all five file types. This is the ingestion worker's real first processing step;
+its output feeds directly into chunking below.
+
+### Document chunking
+
+`DocumentChunker` (`app/services/document_chunker.py`) takes an `ExtractedDocument` and splits
+it into fixed-size, overlapping, word-boundary-aware chunks — no embedding, no Qdrant upsert, no
+retrieval:
+
+```python
+from app.services.document_chunker import DocumentChunker
+
+chunker = DocumentChunker(chunk_size=1000, chunk_overlap=200)  # or read from Settings
+chunks = chunker.chunk(extracted)  # list[DocumentChunk]
+for chunk in chunks:
+    print(chunk.chunk_id, chunk.page_number, chunk.sheet_name, chunk.text)
+```
+
+`chunk_size`/`chunk_overlap` default to the `CHUNK_SIZE`/`CHUNK_OVERLAP` settings (1000/200
+characters). Chunks never split inside a word, overlap is built from whole trailing words of the
+previous chunk, empty/whitespace-only pages produce zero chunks, and `chunk_id`s
+(`f"{document_id}-{chunk_index}"`) are deterministic — the same document always produces the
+same chunks in the same order. `page_number`/`sheet_name` are carried over from the source page
+(PDF/XLSX respectively; `None` for `.txt`/`.md`/`.docx`).
+
+This is the ingestion worker's second processing step, and where the pipeline currently stops —
+chunks aren't persisted anywhere yet, and nothing calls `EmbeddingProvider`/`VectorStore` on
+them.
 
 ## Verification
 
@@ -328,10 +354,11 @@ upserting anything. `IngestionWorker` claims and resolves those pending jobs (Po
 locking, idempotent by construction), and its real first processing step,
 `DocumentTextExtractor`, extracts text from `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` files
 (page-by-page with page numbers for PDFs, sheet-by-sheet with sheet names for XLSX,
-Hebrew/Unicode preserved throughout) — marking the job `completed` on success or `failed` with
-the error stored on failure. Chunking, embedding generation, and Qdrant upsert are not yet
-wired in — extracted text is discarded once the step returns. A public chat/query endpoint and
-any pipeline wiring the decision layer, providers, vector store, and ingestion worker together
-into a full RAG flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the
-full list of what's intentionally
+Hebrew/Unicode preserved throughout), and its second step, `DocumentChunker`, splits that text
+into fixed-size, overlapping, word-boundary-aware, deterministic chunks (`CHUNK_SIZE`/
+`CHUNK_OVERLAP`) — marking the job `completed` on success or `failed` with the error stored on
+failure. Embedding generation and Qdrant upsert are not yet wired in — chunks are discarded once
+the step returns. A public chat/query endpoint and any pipeline wiring the decision layer,
+providers, vector store, and ingestion worker together into a full RAG flow are not yet
+implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
 deferred.

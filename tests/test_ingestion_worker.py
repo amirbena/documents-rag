@@ -12,6 +12,7 @@ from typing import Any
 
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.document_chunker import DocumentChunker
 from app.services.ingestion_worker import IngestionWorker
 
 
@@ -221,3 +222,29 @@ async def test_worker_marks_failed_when_extraction_fails(tmp_path: Path) -> None
     assert result.status == IngestionStatus.FAILED
     assert result.error_message is not None
     assert "not found" in result.error_message.lower()
+
+
+async def test_worker_default_pipeline_extracts_then_chunks(tmp_path: Path, monkeypatch) -> None:
+    """The real default processing step should extract text, then hand it to DocumentChunker."""
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world " * 100, encoding="utf-8")
+
+    chunk_calls = []
+    original_chunk = DocumentChunker.chunk
+
+    def _spying_chunk(self, extracted):
+        chunk_calls.append(extracted)
+        return original_chunk(self, extracted)
+
+    monkeypatch.setattr(DocumentChunker, "chunk", _spying_chunk)
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    assert len(chunk_calls) == 1
+    assert chunk_calls[0].full_text.strip() != ""

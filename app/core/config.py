@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
     vector_store_provider: str = Field(default="qdrant", alias="VECTOR_STORE_PROVIDER")
 
+    chunk_size: int = Field(default=1000, alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=200, alias="CHUNK_OVERLAP")
+
     @property
     def resolved_llm_model(self) -> str:
         """Return LLM_MODEL if set, else OLLAMA_CHAT_MODEL for backward compatibility."""
