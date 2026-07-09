@@ -1,7 +1,9 @@
-"""Extracts text from a stored document file: .txt, .md, and .pdf only.
+"""Extracts text from a stored document file: .txt, .md, .pdf, .docx, and .xlsx only.
 
 No chunking, embedding, or Qdrant upsert here — this is purely the "load the file and get raw
-text out of it" step. PDF text is extracted page by page via pypdf, preserving page numbers;
+text out of it" step. Routing is by file extension only, no content sniffing. PDF text is
+extracted page by page via pypdf, preserving page numbers; XLSX is extracted sheet by sheet via
+openpyxl, preserving sheet names; DOCX is extracted as plain paragraph text via python-docx;
 plain text/Markdown files are treated as a single unnumbered page.
 """
 
@@ -9,6 +11,8 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+import docx
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from app.models.document import Document
@@ -22,10 +26,15 @@ class DocumentTextExtractionError(Exception):
 
 @dataclass
 class ExtractedPage:
-    """One page's extracted text; page_number is set for PDFs, None for plain text/Markdown."""
+    """One page's extracted text.
+
+    `page_number` is set for PDFs, `sheet_name` for XLSX sheets — both None for plain
+    text/Markdown/DOCX, which have no natural pagination.
+    """
 
     text: str
     page_number: int | None = None
+    sheet_name: str | None = None
 
 
 @dataclass
@@ -58,6 +67,10 @@ class DocumentTextExtractor:
             pages = [self._extract_plain_text(path)]
         elif suffix == ".pdf":
             pages = self._extract_pdf(path)
+        elif suffix == ".docx":
+            pages = [self._extract_docx(path)]
+        elif suffix == ".xlsx":
+            pages = self._extract_xlsx(path)
         else:
             raise DocumentTextExtractionError(f"Unsupported file type: {suffix or '(no extension)'}")
 
@@ -80,3 +93,24 @@ class DocumentTextExtractor:
             ExtractedPage(text=page.extract_text() or "", page_number=index + 1)
             for index, page in enumerate(reader.pages)
         ]
+
+    @staticmethod
+    def _extract_docx(path: Path) -> ExtractedPage:
+        """Extract plain paragraph text from a DOCX (no tables, headers/footers, or pagination)."""
+        document = docx.Document(str(path))
+        text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        return ExtractedPage(text=text)
+
+    @staticmethod
+    def _extract_xlsx(path: Path) -> list[ExtractedPage]:
+        """Extract text sheet by sheet from an XLSX, preserving each sheet's name."""
+        workbook = load_workbook(str(path), read_only=True, data_only=True)
+        pages = []
+        for sheet in workbook.worksheets:
+            rows_text = [
+                "\t".join(str(cell) for cell in row if cell is not None)
+                for row in sheet.iter_rows(values_only=True)
+                if any(cell is not None for cell in row)
+            ]
+            pages.append(ExtractedPage(text="\n".join(rows_text), sheet_name=sheet.title))
+        return pages

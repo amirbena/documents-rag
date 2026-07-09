@@ -1,10 +1,12 @@
-"""Tests for DocumentTextExtractor: .txt/.md/.pdf extraction, errors, and Hebrew/Unicode text."""
+"""Tests for DocumentTextExtractor: .txt/.md/.pdf/.docx/.xlsx extraction, errors, Unicode text."""
 
 import io
 import uuid
 from pathlib import Path
 
+import docx
 import pytest
+from openpyxl import Workbook
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject
 from pypdf.generic import StreamObject as _StreamObject
@@ -140,3 +142,95 @@ async def test_hebrew_text_extraction(tmp_path: Path) -> None:
     result = await DocumentTextExtractor().extract(document)
 
     assert result.pages[0].text == hebrew_text
+
+
+async def test_docx_extraction(tmp_path: Path) -> None:
+    """A .docx file should extract as a single unnumbered page of plain paragraph text."""
+    path = tmp_path / "letter.docx"
+    document_file = docx.Document()
+    document_file.add_paragraph("First paragraph.")
+    document_file.add_paragraph("Second paragraph.")
+    document_file.save(str(path))
+    document = _make_document(
+        path, content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+    result = await DocumentTextExtractor().extract(document)
+
+    assert len(result.pages) == 1
+    assert result.pages[0].page_number is None
+    assert result.pages[0].sheet_name is None
+    assert "First paragraph." in result.pages[0].text
+    assert "Second paragraph." in result.pages[0].text
+
+
+async def test_docx_hebrew_extraction(tmp_path: Path) -> None:
+    """A .docx file with Hebrew content should extract correctly, preserved exactly."""
+    path = tmp_path / "מכתב.docx"
+    hebrew_text = "שלום עולם, זהו מסמך וורד לדוגמה."
+    document_file = docx.Document()
+    document_file.add_paragraph(hebrew_text)
+    document_file.save(str(path))
+    document = _make_document(path)
+
+    result = await DocumentTextExtractor().extract(document)
+
+    assert hebrew_text in result.pages[0].text
+
+
+async def test_xlsx_extraction(tmp_path: Path) -> None:
+    """An .xlsx file should extract as one page per sheet, preserving the sheet name."""
+    path = tmp_path / "budget.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Summary"
+    sheet.append(["Item", "Amount"])
+    sheet.append(["Rent", 1000])
+    workbook.save(str(path))
+    document = _make_document(
+        path, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    result = await DocumentTextExtractor().extract(document)
+
+    assert len(result.pages) == 1
+    assert result.pages[0].sheet_name == "Summary"
+    assert result.pages[0].page_number is None
+    assert "Item" in result.pages[0].text
+    assert "Rent" in result.pages[0].text
+
+
+async def test_xlsx_multiple_sheets(tmp_path: Path) -> None:
+    """An .xlsx file with multiple sheets should extract one page per sheet, in order."""
+    path = tmp_path / "report.xlsx"
+    workbook = Workbook()
+    first_sheet = workbook.active
+    first_sheet.title = "Q1"
+    first_sheet.append(["Revenue", 100])
+    second_sheet = workbook.create_sheet("Q2")
+    second_sheet.append(["Revenue", 200])
+    workbook.save(str(path))
+    document = _make_document(path)
+
+    result = await DocumentTextExtractor().extract(document)
+
+    assert len(result.pages) == 2
+    assert result.pages[0].sheet_name == "Q1"
+    assert "100" in result.pages[0].text
+    assert result.pages[1].sheet_name == "Q2"
+    assert "200" in result.pages[1].text
+
+
+async def test_xlsx_hebrew_extraction(tmp_path: Path) -> None:
+    """An .xlsx file with Hebrew cell content should extract correctly, preserved exactly."""
+    path = tmp_path / "תקציב.xlsx"
+    hebrew_value = "שכירות"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([hebrew_value, 1000])
+    workbook.save(str(path))
+    document = _make_document(path)
+
+    result = await DocumentTextExtractor().extract(document)
+
+    assert hebrew_value in result.pages[0].text

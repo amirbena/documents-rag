@@ -11,10 +11,10 @@ Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availa
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
 concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
 ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, and a
-document text extractor (`.txt`/`.md`/`.pdf`) that is now the worker's real first processing
-step. No chunking, embedding generation, Qdrant upsert, or chat endpoint happens yet — a claimed
-job's text is extracted and then discarded (nothing persists or chunks it yet); the job still
-resolves to `completed` purely based on whether extraction succeeded.
+document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`) that is now the worker's real
+first processing step. No chunking, embedding generation, Qdrant upsert, or chat endpoint
+happens yet — a claimed job's text is extracted and then discarded (nothing persists or chunks
+it yet); the job still resolves to `completed` purely based on whether extraction succeeded.
 
 ## Services
 
@@ -185,17 +185,29 @@ double that faithfully simulates the pending-job filter and `Document` lookup in
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
 default processing step: it loads a `Document`'s `stored_path` file and extracts its raw text —
-**no chunking, embedding, or Qdrant upsert**. Supports exactly three file types by extension:
+**no chunking, embedding, or Qdrant upsert**. Routing is by file extension only (no content
+sniffing); it supports exactly five file types:
 
 - `.txt` / `.md` — read as UTF-8 text and returned as a single `ExtractedPage` with
-  `page_number=None`. Hebrew and other non-ASCII Unicode content is preserved exactly.
+  `page_number=None`, `sheet_name=None`. Hebrew and other non-ASCII Unicode content is preserved
+  exactly.
 - `.pdf` — extracted page by page via `pypdf` (`PdfReader`), producing one `ExtractedPage` per
   page with a 1-indexed `page_number`, so downstream chunking/citation can reference the
   original page a piece of text came from.
+- `.docx` — extracted via `python-docx`: all paragraph text joined into a single `ExtractedPage`
+  (`page_number=None`, `sheet_name=None`) — plain text only, no tables, headers/footers, or
+  pagination.
+- `.xlsx` — extracted sheet by sheet via `openpyxl` (`load_workbook(..., read_only=True,
+  data_only=True)`), producing one `ExtractedPage` per worksheet with `sheet_name` set to the
+  worksheet's title and `page_number=None`; each row's non-empty cell values are tab-joined.
+
+Any other extension raises `DocumentTextExtractionError("Unsupported file type: ...")` — there
+is no fallback or content-based detection.
 
 Data types:
 
-- `ExtractedPage` — `text: str`, `page_number: int | None`.
+- `ExtractedPage` — `text: str`, `page_number: int | None` (PDF only), `sheet_name: str | None`
+  (XLSX only) — both `None` for `.txt`/`.md`/`.docx`, which have no natural pagination.
 - `ExtractedDocument` — `document_id: str`, `pages: list[ExtractedPage]`, plus a `full_text`
   property that joins all pages' text.
 
@@ -283,8 +295,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
   ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls; and
   `DocumentTextExtractor` (`app/services/document_text_extractor.py`), which extracts text from
-  a document's stored `.txt`/`.md`/`.pdf` file (see "Document text extraction" above) — no
-  chunking, embedding, or Qdrant upsert.
+  a document's stored `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction"
+  above) — no chunking, embedding, or Qdrant upsert.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
