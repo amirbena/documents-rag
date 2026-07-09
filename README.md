@@ -208,22 +208,35 @@ never calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider f
 ### Document text extraction
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) loads a document's stored
-file and extracts its raw text — `.txt` and `.md` as a single page, `.pdf` page by page (via
-`pypdf`) with 1-indexed page numbers preserved:
+file and extracts its raw text. **It routes by file extension and validates each file's basic
+structure/content before extraction** — a mismatched or corrupt file fails clearly instead of
+being handed to the wrong parser:
+
+| Extension | Handler | Validated before parsing |
+|-----------|---------|----------------------------|
+| `.txt`    | UTF-8 plain text | Readable as UTF-8 |
+| `.md`     | UTF-8 markdown/plain text (no Markdown parsing) | Readable as UTF-8 |
+| `.pdf`    | `pypdf`, page by page, 1-indexed `page_number` preserved | File starts with the `%PDF` header |
+| `.docx`   | `python-docx`, plain paragraph text, a single page | Valid ZIP archive containing `word/document.xml` |
+| `.xlsx`   | `openpyxl`, sheet by sheet, each sheet's name in `sheet_name` | Valid ZIP archive containing `xl/workbook.xml` |
+
+This is lightweight structural validation, not deep content sanitization — it doesn't check the
+upload's `content_type` header or scan for malicious payloads.
 
 ```python
 from app.services.document_text_extractor import DocumentTextExtractor
 
 extracted = await DocumentTextExtractor().extract(document)
 for page in extracted.pages:
-    print(page.page_number, page.text)
+    print(page.page_number, page.sheet_name, page.text)
 ```
 
 Raises `DocumentTextExtractionError` for a missing stored file, an unsupported extension, or
 empty/whitespace-only extracted text — `IngestionWorker` catches this and marks the job
-`failed` with the error message stored. UTF-8 content (Hebrew and other Unicode text included)
-is preserved exactly. This is the ingestion worker's real first processing step, but the
-extracted text isn't stored anywhere yet — chunking and persistence come in a later milestone.
+`failed` with the error message stored. UTF-8/Unicode content (Hebrew included) is preserved
+exactly across all five file types. This is the ingestion worker's real first processing step,
+but the extracted text isn't stored anywhere yet — chunking and persistence come in a later
+milestone.
 
 ## Verification
 
@@ -313,9 +326,10 @@ filenames included), stores it locally under a generated safe filename, and crea
 `pending` `IngestionJob` rows — returning `202` without parsing, chunking, embedding, or
 upserting anything. `IngestionWorker` claims and resolves those pending jobs (Postgres row-level
 locking, idempotent by construction), and its real first processing step,
-`DocumentTextExtractor`, extracts text from `.txt`/`.md`/`.pdf` files (page-by-page with page
-numbers for PDFs, Hebrew/Unicode preserved) — marking the job `completed` on success or `failed`
-with the error stored on failure. Chunking, embedding generation, and Qdrant upsert are not yet
+`DocumentTextExtractor`, extracts text from `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` files
+(page-by-page with page numbers for PDFs, sheet-by-sheet with sheet names for XLSX,
+Hebrew/Unicode preserved throughout) — marking the job `completed` on success or `failed` with
+the error stored on failure. Chunking, embedding generation, and Qdrant upsert are not yet
 wired in — extracted text is discarded once the step returns. A public chat/query endpoint and
 any pipeline wiring the decision layer, providers, vector store, and ingestion worker together
 into a full RAG flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the

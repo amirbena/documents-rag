@@ -11,10 +11,10 @@ Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availa
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
 concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
 ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, and a
-document text extractor (`.txt`/`.md`/`.pdf`) that is now the worker's real first processing
-step. No chunking, embedding generation, Qdrant upsert, or chat endpoint happens yet — a claimed
-job's text is extracted and then discarded (nothing persists or chunks it yet); the job still
-resolves to `completed` purely based on whether extraction succeeded.
+document text extractor (`.txt`/`.md`/`.pdf`/`.docx`/`.xlsx`) that is now the worker's real
+first processing step. No chunking, embedding generation, Qdrant upsert, or chat endpoint
+happens yet — a claimed job's text is extracted and then discarded (nothing persists or chunks
+it yet); the job still resolves to `completed` purely based on whether extraction succeeded.
 
 ## Services
 
@@ -185,17 +185,30 @@ double that faithfully simulates the pending-job filter and `Document` lookup in
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
 default processing step: it loads a `Document`'s `stored_path` file and extracts its raw text —
-**no chunking, embedding, or Qdrant upsert**. Supports exactly three file types by extension:
+**no chunking, embedding, or Qdrant upsert**. It routes by file extension, then validates the
+file's basic structure/content against what that extension claims before attempting to parse it
+(see "Routing and validation" below). It supports exactly five file types:
 
 - `.txt` / `.md` — read as UTF-8 text and returned as a single `ExtractedPage` with
-  `page_number=None`. Hebrew and other non-ASCII Unicode content is preserved exactly.
+  `page_number=None`, `sheet_name=None`. Hebrew and other non-ASCII Unicode content is preserved
+  exactly.
 - `.pdf` — extracted page by page via `pypdf` (`PdfReader`), producing one `ExtractedPage` per
   page with a 1-indexed `page_number`, so downstream chunking/citation can reference the
   original page a piece of text came from.
+- `.docx` — extracted via `python-docx`: all paragraph text joined into a single `ExtractedPage`
+  (`page_number=None`, `sheet_name=None`) — plain text only, no tables, headers/footers, or
+  pagination.
+- `.xlsx` — extracted sheet by sheet via `openpyxl` (`load_workbook(..., read_only=True,
+  data_only=True)`), producing one `ExtractedPage` per worksheet with `sheet_name` set to the
+  worksheet's title and `page_number=None`; each row's non-empty cell values are tab-joined.
+
+Any other extension raises `DocumentTextExtractionError("Unsupported file type: ...")` — there
+is no fallback or content-based detection.
 
 Data types:
 
-- `ExtractedPage` — `text: str`, `page_number: int | None`.
+- `ExtractedPage` — `text: str`, `page_number: int | None` (PDF only), `sheet_name: str | None`
+  (XLSX only) — both `None` for `.txt`/`.md`/`.docx`, which have no natural pagination.
 - `ExtractedDocument` — `document_id: str`, `pages: list[ExtractedPage]`, plus a `full_text`
   property that joins all pages' text.
 
@@ -205,6 +218,28 @@ a missing `stored_path` file, an unsupported extension, or a file whose extracte
 or whitespace-only. Any of these propagate up through `IngestionWorker.process_next_job()` and
 resolve the job to `failed` with the error message stored — extraction never crashes the worker
 process itself.
+
+### Routing and validation
+
+`DocumentTextExtractor` decides how to parse a file from `Path(stored_path).suffix`, then
+validates the file's basic structure/content against what that extension claims **before**
+handing it to the corresponding parser (`_validate_file_type`, called from `_extract_sync`
+ahead of any extraction call):
+
+| Extension | Handler | Validation before parsing |
+|-----------|---------|----------------------------|
+| `.txt`    | UTF-8 plain text (`path.read_text(encoding="utf-8")`) | Readable as UTF-8 (a `UnicodeDecodeError` is caught and re-raised as `DocumentTextExtractionError`) |
+| `.md`     | UTF-8 markdown/plain text (same as `.txt` — no Markdown parsing) | Same as `.txt` |
+| `.pdf`    | `pypdf` (`PdfReader`), page by page | First 4 bytes equal the PDF header `%PDF` |
+| `.docx`   | `python-docx` (`docx.Document`), paragraph text | Valid ZIP archive (`zipfile.is_zipfile`) containing `word/document.xml` |
+| `.xlsx`   | `openpyxl` (`load_workbook`), sheet by sheet | Valid ZIP archive containing `xl/workbook.xml` |
+
+This is still lightweight, structural validation, not full content sanitization — it catches a
+mismatched or corrupt file before wasting effort on the wrong parser (e.g. an `.xlsx` renamed to
+`.pdf`, or arbitrary bytes given a document extension), each raising a specific
+`DocumentTextExtractionError`. It does not validate the upload's `content_type` header, do deep
+MIME/magic-byte sniffing beyond the checks above, or scan file contents for malicious payloads —
+those remain future hardening if ever needed.
 
 The extracted result is currently discarded after extraction succeeds — there is no table or
 field yet that persists extracted text, since chunking/embedding (the next milestones) will
@@ -283,8 +318,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
   ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls; and
   `DocumentTextExtractor` (`app/services/document_text_extractor.py`), which extracts text from
-  a document's stored `.txt`/`.md`/`.pdf` file (see "Document text extraction" above) — no
-  chunking, embedding, or Qdrant upsert.
+  a document's stored `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction"
+  above) — no chunking, embedding, or Qdrant upsert.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
