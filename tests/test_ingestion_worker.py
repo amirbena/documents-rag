@@ -7,6 +7,7 @@ the WHERE status='pending' ... LIMIT 1 filter and Document lookup, without any r
 """
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from app.models.document import Document
@@ -54,7 +55,9 @@ class _FakeAsyncSession:
 
 
 def _add_document_and_job(
-    session: _FakeAsyncSession, status: IngestionStatus = IngestionStatus.PENDING
+    session: _FakeAsyncSession,
+    status: IngestionStatus = IngestionStatus.PENDING,
+    stored_path: str = "storage/documents/x.pdf",
 ) -> IngestionJob:
     document = Document(
         id=str(uuid.uuid4()),
@@ -62,7 +65,7 @@ def _add_document_and_job(
         stored_filename=f"{uuid.uuid4().hex}.pdf",
         content_type="application/pdf",
         file_size=123,
-        stored_path="storage/documents/x.pdf",
+        stored_path=stored_path,
     )
     session.add(document)
     job = IngestionJob(id=str(uuid.uuid4()), document_id=document.id, status=status)
@@ -72,9 +75,13 @@ def _add_document_and_job(
 
 async def test_pending_job_transitions_to_completed() -> None:
     """A pending job should be processed and end up completed."""
+
+    async def _noop(document: Document | None, job: IngestionJob) -> None:
+        return None
+
     session = _FakeAsyncSession()
     job = _add_document_and_job(session)
-    worker = IngestionWorker()
+    worker = IngestionWorker(process_document=_noop)
 
     result = await worker.process_next_job(session)
 
@@ -182,3 +189,35 @@ async def test_worker_never_imports_embedding_llm_or_vector_store_providers() ->
     module_names = vars(worker_module)
     for forbidden in ("EmbeddingProvider", "LLMProvider", "VectorStore", "provider_factory"):
         assert forbidden not in module_names
+
+
+async def test_worker_marks_completed_when_extraction_succeeds(tmp_path: Path) -> None:
+    """The real default processing step (text extraction) should complete the job on success."""
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    assert result.error_message is None
+
+
+async def test_worker_marks_failed_when_extraction_fails(tmp_path: Path) -> None:
+    """The real default processing step should fail the job when the stored file is missing."""
+    missing_path = tmp_path / "does_not_exist.txt"
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(missing_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.FAILED
+    assert result.error_message is not None
+    assert "not found" in result.error_message.lower()

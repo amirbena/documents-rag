@@ -2,9 +2,10 @@
 
 Internal service only — no public API. Claims a job with a row-level lock, transitions
 pending -> processing -> completed/failed with clear transaction boundaries, and never
-re-processes a job that's already completed or failed. The processing step itself is a
-placeholder for now: it will later become PDF extraction, chunking, embedding generation, and
-Qdrant upsert. This worker never calls EmbeddingProvider, LLMProvider, or VectorStore itself.
+re-processes a job that's already completed or failed. The default processing step extracts
+text from the document's stored file (see DocumentTextExtractor) — chunking, embedding
+generation, and Qdrant upsert are still placeholders for a later milestone. This worker never
+calls EmbeddingProvider, LLMProvider, or VectorStore itself.
 """
 
 from collections.abc import Awaitable, Callable
@@ -14,12 +15,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.document_text_extractor import DocumentTextExtractor
 
 ProcessDocumentFn = Callable[[Document | None, IngestionJob], Awaitable[None]]
 
 
 async def _default_process_document(document: Document | None, job: IngestionJob) -> None:
-    """Placeholder for PDF extraction, chunking, embedding generation, and Qdrant upsert."""
+    """Extract text from the document's stored file. No chunking, embedding, or Qdrant upsert yet."""
+    if document is None:
+        raise ValueError(f"Document not found for job {job.id}")
+
+    await DocumentTextExtractor().extract(document)
 
 
 class IngestionWorker:

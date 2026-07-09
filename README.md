@@ -198,12 +198,32 @@ job = await worker.process_next_job(session)  # None if there's nothing pending
 ```
 
 It claims the oldest pending job with Postgres row-level locking
-(`SELECT ... FOR UPDATE SKIP LOCKED`), flips it to `processing`, runs a processing step (still a
-placeholder — no PDF parsing, chunking, embedding, or Qdrant upsert yet), then resolves it to
-`completed` on success or `failed` (with the error message stored) on any exception. It's
-idempotent: a job that's already `completed` or `failed` is never selected again by the claim
-query, so calling `process_next_job()` repeatedly never re-processes it. The worker never calls
-`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
+(`SELECT ... FOR UPDATE SKIP LOCKED`), flips it to `processing`, runs a processing step (its
+default: `DocumentTextExtractor` — see below; still no chunking, embedding, or Qdrant upsert),
+then resolves it to `completed` on success or `failed` (with the error message stored) on any
+exception. It's idempotent: a job that's already `completed` or `failed` is never selected again
+by the claim query, so calling `process_next_job()` repeatedly never re-processes it. The worker
+never calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
+
+### Document text extraction
+
+`DocumentTextExtractor` (`app/services/document_text_extractor.py`) loads a document's stored
+file and extracts its raw text — `.txt` and `.md` as a single page, `.pdf` page by page (via
+`pypdf`) with 1-indexed page numbers preserved:
+
+```python
+from app.services.document_text_extractor import DocumentTextExtractor
+
+extracted = await DocumentTextExtractor().extract(document)
+for page in extracted.pages:
+    print(page.page_number, page.text)
+```
+
+Raises `DocumentTextExtractionError` for a missing stored file, an unsupported extension, or
+empty/whitespace-only extracted text — `IngestionWorker` catches this and marks the job
+`failed` with the error message stored. UTF-8 content (Hebrew and other Unicode text included)
+is preserved exactly. This is the ingestion worker's real first processing step, but the
+extracted text isn't stored anywhere yet — chunking and persistence come in a later milestone.
 
 ## Verification
 
@@ -292,9 +312,12 @@ routing, no LLM call involved. `POST /api/v1/documents` accepts a file upload (H
 filenames included), stores it locally under a generated safe filename, and creates `Document` +
 `pending` `IngestionJob` rows — returning `202` without parsing, chunking, embedding, or
 upserting anything. `IngestionWorker` claims and resolves those pending jobs (Postgres row-level
-locking, idempotent by construction) — but its processing step is still a placeholder, so a
-claimed job always resolves to `completed` without real PDF parsing, chunking, embedding
-generation, or Qdrant upsert. A public chat/query endpoint and any pipeline wiring the decision
-layer, providers, vector store, and ingestion worker together into a full RAG flow are not yet
-implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
+locking, idempotent by construction), and its real first processing step,
+`DocumentTextExtractor`, extracts text from `.txt`/`.md`/`.pdf` files (page-by-page with page
+numbers for PDFs, Hebrew/Unicode preserved) — marking the job `completed` on success or `failed`
+with the error stored on failure. Chunking, embedding generation, and Qdrant upsert are not yet
+wired in — extracted text is discarded once the step returns. A public chat/query endpoint and
+any pipeline wiring the decision layer, providers, vector store, and ingestion worker together
+into a full RAG flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the
+full list of what's intentionally
 deferred.
