@@ -10,10 +10,56 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import app.services.ingestion_worker as ingestion_worker_module
+from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunker
 from app.services.ingestion_worker import IngestionWorker
+
+
+class _FakeEmbeddingProvider:
+    """Records the texts it's asked to embed and returns one fixed-length vector per text."""
+
+    def __init__(self, vector: list[float] | None = None) -> None:
+        self.vector = vector or [0.1, 0.2, 0.3]
+        self.embed_calls: list[list[str]] = []
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embed_calls.append(texts)
+        return [self.vector for _ in texts]
+
+
+class _FailingEmbeddingProvider:
+    """Always raises, simulating an embedding provider failure."""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embedding provider unavailable")
+
+
+class _FakeVectorStore:
+    """Records collection creation and upserted points instead of calling real Qdrant."""
+
+    def __init__(self) -> None:
+        self.created_collections: list[tuple[str, int]] = []
+        self.upserted_points: list[VectorPoint] = []
+
+    async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
+        self.created_collections.append((collection_name, vector_size))
+
+    async def upsert_vectors(self, collection_name: str, points: list[VectorPoint]) -> None:
+        self.upserted_points.extend(points)
+
+
+class _FailingVectorStore:
+    """create_collection_if_not_exists succeeds; upsert_vectors always raises."""
+
+    async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
+        return None
+
+    async def upsert_vectors(self, collection_name: str, points: list[VectorPoint]) -> None:
+        raise RuntimeError("vector store unavailable")
 
 
 class _FakeScalarResult:
@@ -183,17 +229,24 @@ async def test_placeholder_processing_called_exactly_once_with_document_and_job(
     assert document.id == job.document_id
 
 
-async def test_worker_never_imports_embedding_llm_or_vector_store_providers() -> None:
-    """The worker module must not import EmbeddingProvider, LLMProvider, or VectorStore."""
-    import app.services.ingestion_worker as worker_module
-
-    module_names = vars(worker_module)
-    for forbidden in ("EmbeddingProvider", "LLMProvider", "VectorStore", "provider_factory"):
-        assert forbidden not in module_names
+async def test_worker_never_imports_llm_provider() -> None:
+    """The worker module must not import LLMProvider — no chat/generation calls from ingestion."""
+    module_names = vars(ingestion_worker_module)
+    assert "LLMProvider" not in module_names
+    assert "get_llm_provider" not in module_names
 
 
-async def test_worker_marks_completed_when_extraction_succeeds(tmp_path: Path) -> None:
-    """The real default processing step (text extraction) should complete the job on success."""
+async def test_worker_marks_completed_when_extraction_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The real default processing step should complete the job on success."""
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FakeEmbeddingProvider()
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FakeVectorStore()
+    )
+
     file_path = tmp_path / "notes.txt"
     file_path.write_text("hello world", encoding="utf-8")
 
@@ -226,6 +279,13 @@ async def test_worker_marks_failed_when_extraction_fails(tmp_path: Path) -> None
 
 async def test_worker_default_pipeline_extracts_then_chunks(tmp_path: Path, monkeypatch) -> None:
     """The real default processing step should extract text, then hand it to DocumentChunker."""
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FakeEmbeddingProvider()
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FakeVectorStore()
+    )
+
     file_path = tmp_path / "notes.txt"
     file_path.write_text("hello world " * 100, encoding="utf-8")
 
@@ -248,3 +308,140 @@ async def test_worker_default_pipeline_extracts_then_chunks(tmp_path: Path, monk
     assert result.status == IngestionStatus.COMPLETED
     assert len(chunk_calls) == 1
     assert chunk_calls[0].full_text.strip() != ""
+
+
+async def test_worker_embeds_each_chunk(tmp_path: Path, monkeypatch) -> None:
+    """The default pipeline should call the embedding provider with every chunk's text."""
+    embedding_provider = _FakeEmbeddingProvider()
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: embedding_provider
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FakeVectorStore()
+    )
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world " * 300, encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    assert len(embedding_provider.embed_calls) == 1
+    embedded_texts = embedding_provider.embed_calls[0]
+    assert len(embedded_texts) > 1
+    assert all(text.strip() for text in embedded_texts)
+
+
+async def test_worker_upserts_vectors_preserving_metadata(tmp_path: Path, monkeypatch) -> None:
+    """Upserted VectorPoints should preserve document_id, chunk_id, text, source, page_number."""
+    monkeypatch.setattr(
+        ingestion_worker_module,
+        "get_embedding_provider",
+        lambda settings: _FakeEmbeddingProvider(vector=[1.0, 2.0]),
+    )
+    vector_store = _FakeVectorStore()
+    monkeypatch.setattr(ingestion_worker_module, "get_vector_store", lambda settings: vector_store)
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    job = _add_document_and_job(session, stored_path=str(file_path))
+    document = session._documents[job.document_id]
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    assert vector_store.created_collections == [
+        (get_settings().qdrant_collection_name, get_settings().vector_size)
+    ]
+    assert len(vector_store.upserted_points) == 1
+    point = vector_store.upserted_points[0]
+    assert point.vector == [1.0, 2.0]
+    assert point.document_id == document.id
+    assert point.chunk_id == f"{document.id}-0"
+    assert point.text == "hello world"
+    assert point.source == document.original_filename
+    assert point.page_number is None
+
+
+async def test_worker_marks_failed_when_embedding_fails(tmp_path: Path, monkeypatch) -> None:
+    """A failure inside the embedding provider should mark the job failed with the error stored."""
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FailingEmbeddingProvider()
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FakeVectorStore()
+    )
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.FAILED
+    assert result.error_message == "embedding provider unavailable"
+
+
+async def test_worker_marks_failed_when_vector_store_fails(tmp_path: Path, monkeypatch) -> None:
+    """A failure inside the vector store upsert should mark the job failed with the error stored."""
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FakeEmbeddingProvider()
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FailingVectorStore()
+    )
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.FAILED
+    assert result.error_message == "vector store unavailable"
+
+
+async def test_worker_never_calls_llm_provider_during_ingestion(tmp_path: Path, monkeypatch) -> None:
+    """The default pipeline must never invoke an LLM — ingestion only embeds and indexes."""
+
+    def _fail_if_called(settings=None):
+        raise AssertionError("get_llm_provider must never be called during ingestion")
+
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FakeEmbeddingProvider()
+    )
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_vector_store", lambda settings: _FakeVectorStore()
+    )
+    monkeypatch.setattr(
+        "app.rag.providers.provider_factory.get_llm_provider", _fail_if_called
+    )
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    _add_document_and_job(session, stored_path=str(file_path))
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED

@@ -124,8 +124,9 @@ directly under `QDRANT_URL` (no official Qdrant SDK) via async `httpx`, supporti
 `create_collection_if_not_exists(collection_name, vector_size)`,
 `upsert_vectors(collection_name, points)`, and
 `search_similar(collection_name, query_vector, limit)`. Points and results carry payload
-metadata: `document_id`, `chunk_id`, `text`, `source`, and an optional `page_number`. It's an
-internal provider only — no document ingestion, upload, chat, or SSE endpoint touches it yet.
+metadata: `document_id`, `chunk_id`, `text`, `source`, and optional `page_number`/`sheet_name`.
+It's an internal provider only — no document upload, chat, or SSE endpoint touches it yet, but
+`IngestionWorker` now upserts into it (see "Ingestion worker" below).
 
 Providers are resolved through `app/rag/providers/provider_factory.py` rather than importing
 Ollama/Qdrant classes directly:
@@ -199,12 +200,12 @@ job = await worker.process_next_job(session)  # None if there's nothing pending
 
 It claims the oldest pending job with Postgres row-level locking
 (`SELECT ... FOR UPDATE SKIP LOCKED`), flips it to `processing`, runs a processing step (its
-default: Document → `DocumentTextExtractor` → `DocumentChunker`, stopping there — see below;
-still no embedding or Qdrant upsert), then resolves it to `completed` on success or `failed`
-(with the error message stored) on any exception. It's idempotent: a job that's already
-`completed` or `failed` is never selected again by the claim query, so calling
-`process_next_job()` repeatedly never re-processes it. The worker never calls
-`EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider factory.
+default: Document → `DocumentTextExtractor` → `DocumentChunker` → `EmbeddingProvider` →
+`VectorStore` upsert — see below), then resolves it to `completed` on success or `failed` (with
+the error message stored) on any exception. It's idempotent: a job that's already `completed` or
+`failed` is never selected again by the claim query, so calling `process_next_job()` repeatedly
+never re-processes it. The worker never calls `LLMProvider` — ingestion only embeds and indexes,
+it never generates text.
 
 ### Document text extraction
 
@@ -260,9 +261,37 @@ previous chunk, empty/whitespace-only pages produce zero chunks, and `chunk_id`s
 same chunks in the same order. `page_number`/`sheet_name` are carried over from the source page
 (PDF/XLSX respectively; `None` for `.txt`/`.md`/`.docx`).
 
-This is the ingestion worker's second processing step, and where the pipeline currently stops —
-chunks aren't persisted anywhere yet, and nothing calls `EmbeddingProvider`/`VectorStore` on
-them.
+This is the ingestion worker's second processing step; its output feeds directly into embedding
+below.
+
+### Chunk embedding and Qdrant indexing
+
+The ingestion worker's default pipeline continues past chunking: each `DocumentChunk`'s text is
+embedded via `get_embedding_provider().embed(...)`, and the resulting vectors are upserted into
+Qdrant via `get_vector_store()`:
+
+```python
+embedding_provider = get_embedding_provider()   # reads EMBEDDING_PROVIDER
+vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
+
+vector_store = get_vector_store()               # reads VECTOR_STORE_PROVIDER
+await vector_store.create_collection_if_not_exists(
+    settings.qdrant_collection_name, settings.vector_size
+)
+await vector_store.upsert_vectors(settings.qdrant_collection_name, points)
+```
+
+Each `VectorPoint`'s `id` is a deterministic UUIDv5 derived from the chunk's `chunk_id` (so
+re-processing a document overwrites the same points rather than duplicating them), and its
+payload preserves `document_id`, `chunk_id`, `text`, `source` (the document's
+`original_filename`), and optional `page_number`/`sheet_name` carried over from the chunk. The
+collection is created (if missing) with `QDRANT_COLLECTION_NAME`/`VECTOR_SIZE` before every
+upsert — cheap since Qdrant no-ops when the collection already exists. If embedding a chunk or
+upserting into Qdrant raises, `IngestionWorker` catches it and marks the job `failed` with the
+error message stored, same as an extraction or chunking failure. A document with zero chunks
+(e.g. empty/whitespace-only text) completes without calling the embedding provider or vector
+store at all. This is the ingestion worker's final processing step — there is still no retrieval,
+chat, or SSE endpoint that reads these vectors back out.
 
 ## Verification
 
@@ -383,9 +412,12 @@ locking, idempotent by construction), and its real first processing step,
 (page-by-page with page numbers for PDFs, sheet-by-sheet with sheet names for XLSX,
 Hebrew/Unicode preserved throughout), and its second step, `DocumentChunker`, splits that text
 into fixed-size, overlapping, word-boundary-aware, deterministic chunks (`CHUNK_SIZE`/
-`CHUNK_OVERLAP`) — marking the job `completed` on success or `failed` with the error stored on
-failure. Embedding generation and Qdrant upsert are not yet wired in — chunks are discarded once
-the step returns. A public chat/query endpoint and any pipeline wiring the decision layer,
-providers, vector store, and ingestion worker together into a full RAG flow are not yet
+`CHUNK_OVERLAP`). Its third and fourth steps now embed each chunk via `get_embedding_provider()`
+and upsert the resulting vectors into Qdrant via `get_vector_store()`
+(`QDRANT_COLLECTION_NAME`/`VECTOR_SIZE`, created if missing), preserving `document_id`,
+`chunk_id`, `text`, `source`, and `page_number`/`sheet_name` as payload metadata — marking the
+job `completed` on success or `failed` with the error stored on failure at any step (extraction,
+chunking, embedding, or upsert). A public retrieval/chat/query endpoint and any pipeline wiring
+the decision layer, LLM provider, and ingestion worker together into a full RAG flow are not yet
 implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
 deferred.
