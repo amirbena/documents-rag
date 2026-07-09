@@ -6,14 +6,15 @@
 the user's machine via Docker Compose, with Ollama providing local LLM and embedding inference —
 no external API calls or cloud dependencies.
 
-This milestone is infrastructure plus seven vertical slices: a FastAPI app wired to Postgres,
+This milestone is infrastructure plus eight vertical slices: a FastAPI app wired to Postgres,
 Redis, Qdrant, and Ollama, with a health endpoint, an Ollama health/model-availability check, a
 concrete Ollama-backed embedding provider, a concrete streaming Ollama-backed LLM provider, a
 concrete Qdrant-backed vector store, a rule-based RAG decision layer, a document upload +
-ingestion job skeleton, and an async ingestion worker that claims and resolves those jobs. No
-PDF parsing, chunking, embedding generation, Qdrant upsert, or chat endpoint happens yet — the
-worker's processing step is still a placeholder, so a claimed job goes straight from
-`processing` to `completed` without any real document processing occurring.
+ingestion job skeleton, an async ingestion worker that claims and resolves those jobs, and a
+document text extractor (`.txt`/`.md`/`.pdf`) that is now the worker's real first processing
+step. No chunking, embedding generation, Qdrant upsert, or chat endpoint happens yet — a claimed
+job's text is extracted and then discarded (nothing persists or chunks it yet); the job still
+resolves to `completed` purely based on whether extraction succeeded.
 
 ## Services
 
@@ -160,16 +161,16 @@ picks up and resolves the `pending` job it creates.
    Returns `None` if there is no pending job.
 2. Flips the claimed job to `PROCESSING` and **commits immediately** — a separate transaction
    boundary from the outcome below, so the claim is durable before any processing is attempted.
-3. Looks up the associated `Document` and calls the injected processing step (default: a no-op
-   placeholder, `_default_process_document`) with `(document, job)`.
+3. Looks up the associated `Document` and calls the injected processing step (default:
+   `_default_process_document`, which calls `DocumentTextExtractor` — see "Document text
+   extraction" below) with `(document, job)`.
 4. On success: `PROCESSING` → `COMPLETED`, committed.
    On any exception: `PROCESSING` → `FAILED`, `error_message` set to `str(exception)`, committed.
 
 The processing step is injected via the constructor (`IngestionWorker(process_document=...)`)
-specifically so a **later milestone can replace the placeholder** with real PDF extraction,
-chunking, embedding generation, and Qdrant upsert — without changing the claim/lock/transition
-logic. `IngestionWorker` never imports or calls `EmbeddingProvider`, `LLMProvider`,
-`VectorStore`, or `provider_factory` itself.
+specifically so a **later milestone can extend it** with chunking, embedding generation, and
+Qdrant upsert — without changing the claim/lock/transition logic. `IngestionWorker` never
+imports or calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or `provider_factory` itself.
 
 **Idempotent by construction**: once a job leaves `PENDING` (to `PROCESSING`, then `COMPLETED`
 or `FAILED`), the claim query's `WHERE status='pending'` filter can never select it again —
@@ -179,6 +180,35 @@ calling `process_next_job()` repeatedly does not require any separate "already p
 represent it correctly even if it accepts the same SQLAlchemy call, so this project deliberately
 does not add SQLite/`aiosqlite` for testing this worker. Its tests use a fake `AsyncSession`
 double that faithfully simulates the pending-job filter and `Document` lookup instead.
+
+## Document text extraction
+
+`DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
+default processing step: it loads a `Document`'s `stored_path` file and extracts its raw text —
+**no chunking, embedding, or Qdrant upsert**. Supports exactly three file types by extension:
+
+- `.txt` / `.md` — read as UTF-8 text and returned as a single `ExtractedPage` with
+  `page_number=None`. Hebrew and other non-ASCII Unicode content is preserved exactly.
+- `.pdf` — extracted page by page via `pypdf` (`PdfReader`), producing one `ExtractedPage` per
+  page with a 1-indexed `page_number`, so downstream chunking/citation can reference the
+  original page a piece of text came from.
+
+Data types:
+
+- `ExtractedPage` — `text: str`, `page_number: int | None`.
+- `ExtractedDocument` — `document_id: str`, `pages: list[ExtractedPage]`, plus a `full_text`
+  property that joins all pages' text.
+
+`extract(document)` runs the actual file I/O and PDF parsing off the event loop via
+`asyncio.to_thread` (both are blocking operations). `DocumentTextExtractionError` is raised for:
+a missing `stored_path` file, an unsupported extension, or a file whose extracted text is empty
+or whitespace-only. Any of these propagate up through `IngestionWorker.process_next_job()` and
+resolve the job to `failed` with the error message stored — extraction never crashes the worker
+process itself.
+
+The extracted result is currently discarded after extraction succeeds — there is no table or
+field yet that persists extracted text, since chunking/embedding (the next milestones) will
+decide how it's actually stored.
 
 ## Future LLM provider stubs
 
@@ -251,7 +281,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`app/services/local_file_storage.py`), which saves uploaded files to local disk under a
   generated safe filename (see "Document upload and ingestion job skeleton" above); and
   `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
-  ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls.
+  ingestion jobs (see "Ingestion worker" above) — no public API, no provider calls; and
+  `DocumentTextExtractor` (`app/services/document_text_extractor.py`), which extracts text from
+  a document's stored `.txt`/`.md`/`.pdf` file (see "Document text extraction" above) — no
+  chunking, embedding, or Qdrant upsert.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -282,14 +315,13 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- PDF/document parsing
 - Document chunking
 - Embedding generation for uploaded documents (the embedding *provider* exists; nothing calls it
   from the upload/ingestion path yet)
 - Upserting uploaded-document vectors into Qdrant (the vector *store* exists; nothing calls it
   from the upload/ingestion path yet)
-- Real processing inside `IngestionWorker` — its processing step is still the placeholder
-  `_default_process_document`, so a claimed job always resolves straight to `completed`
+- Persisting extracted text anywhere — `DocumentTextExtractor`'s result is discarded once the
+  worker's default processing step returns; there's no table or field for it yet
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
