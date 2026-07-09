@@ -290,6 +290,33 @@ docker compose config
 All four gates (`pytest`, `ruff check .`, `mypy app`, `docker compose config`) must pass cleanly
 before committing.
 
+Run `make help` any time for a quick summary of these commands.
+
+## Pre-commit verification
+
+Install a git hook that runs `make verify` automatically before every commit, so a broken
+build/test/lint/type-check can never be committed by accident — and so this doesn't depend on
+remembering to run checks manually (including when Claude Code is making the change):
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+This copies `.githooks/pre-commit` into `.git/hooks/pre-commit` (git hooks live outside version
+control, so they must be installed locally — this script is the one-time setup step). Once
+installed, every `git commit` runs `make verify` first and **blocks the commit if it fails**. The
+hook only checks — it never auto-fixes files (e.g. it runs `ruff check .`, not
+`ruff check --fix .`) and never stages or commits anything on its own.
+
+You can always run the same check manually, without committing:
+
+```bash
+make verify
+```
+
+If you ever need to skip the hook in an emergency, `git commit --no-verify` bypasses it — but
+prefer fixing the underlying issue over skipping the check.
+
 ## Troubleshooting
 
 - **`app` fails to start / connection refused to postgres|redis|qdrant|ollama**: those services
