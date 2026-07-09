@@ -218,6 +218,30 @@ or whitespace-only. Any of these propagate up through `IngestionWorker.process_n
 resolve the job to `failed` with the error message stored — extraction never crashes the worker
 process itself.
 
+### Routing is currently by file extension only (MVP)
+
+`DocumentTextExtractor` decides how to parse a file **purely from `Path(stored_path).suffix`** —
+this is deliberate MVP behavior, not a placeholder oversight:
+
+| Extension | Handler |
+|-----------|---------|
+| `.txt`    | UTF-8 plain text (`path.read_text(encoding="utf-8")`) |
+| `.md`     | UTF-8 markdown/plain text (same as `.txt` — no Markdown parsing) |
+| `.pdf`    | `pypdf` (`PdfReader`), page by page |
+| `.docx`   | `python-docx` (`docx.Document`), paragraph text |
+| `.xlsx`   | `openpyxl` (`load_workbook`), sheet by sheet |
+
+There is **no `content_type`/MIME validation and no content sniffing** — a file named
+`report.pdf` that isn't actually a valid PDF will fail inside `pypdf` (surfacing as a generic
+extraction error), not be caught earlier as a "this isn't really a PDF" mismatch. A file
+uploaded with a misleading extension (e.g. an `.xlsx` renamed to `.txt`) will be parsed as
+whatever its extension claims, not what it actually is.
+
+**Future hardening** (not yet implemented): validating the upload's `content_type` against its
+extension, real MIME sniffing (e.g. via file signature/magic-byte inspection) instead of
+trusting the extension, detecting and rejecting extension/content mismatches before attempting
+extraction, and generally safer file validation ahead of parsing untrusted input.
+
 The extracted result is currently discarded after extraction succeeds — there is no table or
 field yet that persists extracted text, since chunking/embedding (the next milestones) will
 decide how it's actually stored.

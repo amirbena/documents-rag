@@ -208,12 +208,21 @@ never calls `EmbeddingProvider`, `LLMProvider`, `VectorStore`, or the provider f
 ### Document text extraction
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) loads a document's stored
-file and extracts its raw text, routed by file extension only (no content sniffing):
+file and extracts its raw text. **Routing is currently by file extension only — this is MVP
+behavior, not final validation:**
 
-- `.txt` / `.md` — a single page.
-- `.pdf` — page by page (via `pypdf`), with 1-indexed `page_number` preserved.
-- `.docx` — plain paragraph text (via `python-docx`), a single page.
-- `.xlsx` — sheet by sheet (via `openpyxl`), with each sheet's name in `sheet_name`.
+| Extension | Handler |
+|-----------|---------|
+| `.txt`    | UTF-8 plain text |
+| `.md`     | UTF-8 markdown/plain text (no Markdown parsing) |
+| `.pdf`    | `pypdf`, page by page, 1-indexed `page_number` preserved |
+| `.docx`   | `python-docx`, plain paragraph text, a single page |
+| `.xlsx`   | `openpyxl`, sheet by sheet, each sheet's name in `sheet_name` |
+
+There's no `content_type`/MIME validation and no content sniffing yet — a mismatched extension
+(e.g. an `.xlsx` renamed to `.txt`) is parsed as whatever the extension claims. **Future
+hardening**: `content_type` validation, real MIME sniffing, extension/content mismatch
+detection, and generally safer file validation ahead of parsing untrusted uploads.
 
 ```python
 from app.services.document_text_extractor import DocumentTextExtractor
