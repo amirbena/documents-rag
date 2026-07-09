@@ -185,8 +185,9 @@ double that faithfully simulates the pending-job filter and `Document` lookup in
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
 default processing step: it loads a `Document`'s `stored_path` file and extracts its raw text —
-**no chunking, embedding, or Qdrant upsert**. Routing is by file extension only (no content
-sniffing); it supports exactly five file types:
+**no chunking, embedding, or Qdrant upsert**. It routes by file extension, then validates the
+file's basic structure/content against what that extension claims before attempting to parse it
+(see "Routing and validation" below). It supports exactly five file types:
 
 - `.txt` / `.md` — read as UTF-8 text and returned as a single `ExtractedPage` with
   `page_number=None`, `sheet_name=None`. Hebrew and other non-ASCII Unicode content is preserved
@@ -218,29 +219,27 @@ or whitespace-only. Any of these propagate up through `IngestionWorker.process_n
 resolve the job to `failed` with the error message stored — extraction never crashes the worker
 process itself.
 
-### Routing is currently by file extension only (MVP)
+### Routing and validation
 
-`DocumentTextExtractor` decides how to parse a file **purely from `Path(stored_path).suffix`** —
-this is deliberate MVP behavior, not a placeholder oversight:
+`DocumentTextExtractor` decides how to parse a file from `Path(stored_path).suffix`, then
+validates the file's basic structure/content against what that extension claims **before**
+handing it to the corresponding parser (`_validate_file_type`, called from `_extract_sync`
+ahead of any extraction call):
 
-| Extension | Handler |
-|-----------|---------|
-| `.txt`    | UTF-8 plain text (`path.read_text(encoding="utf-8")`) |
-| `.md`     | UTF-8 markdown/plain text (same as `.txt` — no Markdown parsing) |
-| `.pdf`    | `pypdf` (`PdfReader`), page by page |
-| `.docx`   | `python-docx` (`docx.Document`), paragraph text |
-| `.xlsx`   | `openpyxl` (`load_workbook`), sheet by sheet |
+| Extension | Handler | Validation before parsing |
+|-----------|---------|----------------------------|
+| `.txt`    | UTF-8 plain text (`path.read_text(encoding="utf-8")`) | Readable as UTF-8 (a `UnicodeDecodeError` is caught and re-raised as `DocumentTextExtractionError`) |
+| `.md`     | UTF-8 markdown/plain text (same as `.txt` — no Markdown parsing) | Same as `.txt` |
+| `.pdf`    | `pypdf` (`PdfReader`), page by page | First 4 bytes equal the PDF header `%PDF` |
+| `.docx`   | `python-docx` (`docx.Document`), paragraph text | Valid ZIP archive (`zipfile.is_zipfile`) containing `word/document.xml` |
+| `.xlsx`   | `openpyxl` (`load_workbook`), sheet by sheet | Valid ZIP archive containing `xl/workbook.xml` |
 
-There is **no `content_type`/MIME validation and no content sniffing** — a file named
-`report.pdf` that isn't actually a valid PDF will fail inside `pypdf` (surfacing as a generic
-extraction error), not be caught earlier as a "this isn't really a PDF" mismatch. A file
-uploaded with a misleading extension (e.g. an `.xlsx` renamed to `.txt`) will be parsed as
-whatever its extension claims, not what it actually is.
-
-**Future hardening** (not yet implemented): validating the upload's `content_type` against its
-extension, real MIME sniffing (e.g. via file signature/magic-byte inspection) instead of
-trusting the extension, detecting and rejecting extension/content mismatches before attempting
-extraction, and generally safer file validation ahead of parsing untrusted input.
+This is still lightweight, structural validation, not full content sanitization — it catches a
+mismatched or corrupt file before wasting effort on the wrong parser (e.g. an `.xlsx` renamed to
+`.pdf`, or arbitrary bytes given a document extension), each raising a specific
+`DocumentTextExtractionError`. It does not validate the upload's `content_type` header, do deep
+MIME/magic-byte sniffing beyond the checks above, or scan file contents for malicious payloads —
+those remain future hardening if ever needed.
 
 The extracted result is currently discarded after extraction succeeds — there is no table or
 field yet that persists extracted text, since chunking/embedding (the next milestones) will

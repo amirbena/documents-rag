@@ -2,6 +2,7 @@
 
 import io
 import uuid
+import zipfile
 from pathlib import Path
 
 import docx
@@ -234,3 +235,48 @@ async def test_xlsx_hebrew_extraction(tmp_path: Path) -> None:
     result = await DocumentTextExtractor().extract(document)
 
     assert hebrew_value in result.pages[0].text
+
+
+async def test_fake_pdf_with_non_pdf_bytes_fails(tmp_path: Path) -> None:
+    """A .pdf file whose bytes don't start with the %PDF header should fail validation."""
+    path = tmp_path / "fake.pdf"
+    path.write_bytes(b"this is not actually a pdf, just plain bytes")
+    document = _make_document(path, content_type="application/pdf")
+
+    with pytest.raises(DocumentTextExtractionError):
+        await DocumentTextExtractor().extract(document)
+
+
+async def test_fake_docx_with_non_docx_bytes_fails(tmp_path: Path) -> None:
+    """A .docx file whose bytes aren't a valid OOXML zip should fail validation."""
+    path = tmp_path / "fake.docx"
+    path.write_bytes(b"this is not a real docx, just plain bytes")
+    document = _make_document(
+        path, content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+    with pytest.raises(DocumentTextExtractionError):
+        await DocumentTextExtractor().extract(document)
+
+
+async def test_fake_xlsx_with_non_xlsx_bytes_fails(tmp_path: Path) -> None:
+    """An .xlsx file whose bytes aren't a valid OOXML zip should fail validation."""
+    path = tmp_path / "fake.xlsx"
+    path.write_bytes(b"this is not a real xlsx, just plain bytes")
+    document = _make_document(
+        path, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    with pytest.raises(DocumentTextExtractionError):
+        await DocumentTextExtractor().extract(document)
+
+
+async def test_zip_without_docx_structure_fails_as_docx(tmp_path: Path) -> None:
+    """A valid zip file that isn't a real DOCX (missing word/document.xml) should still fail."""
+    path = tmp_path / "fake.docx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("not_a_docx_entry.txt", "hello")
+    document = _make_document(path)
+
+    with pytest.raises(DocumentTextExtractionError):
+        await DocumentTextExtractor().extract(document)
