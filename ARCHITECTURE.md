@@ -375,6 +375,45 @@ never imports or calls `LLMProvider` or `RetrievalService` itself — it only sh
 results into prompt text, leaving the actual retrieval call to whoever composes it with
 `RetrievalService`.
 
+## RAG orchestrator
+
+`RagOrchestrator` (`app/rag/orchestrator.py`) is the single component that composes
+`RuleBasedRagDecider`, `RetrievalService`, `RagPromptBuilder`, and `LLMProvider` (via
+`get_llm_provider()`) into one call — **no public endpoint yet, no conversation memory, and no
+silent fallback between decisions or providers**.
+
+`stream_answer(question: str) -> AsyncIterator[OrchestratorMetadata | OrchestratorToken]`:
+
+1. **Decide**: `RuleBasedRagDecider.decide(question)` runs first, exactly as it does standalone
+   (see "RAG decision layer" above) — no LLM call is made to route.
+2. **`CLARIFICATION_NEEDED` / `OUT_OF_SCOPE`**: yields one `OrchestratorMetadata`
+   (`retrieval_used=False`, `sources=[]`) then a single fixed `OrchestratorToken` — neither
+   `RetrievalService` nor any `LLMProvider` method is called on this path.
+3. **`NEEDS_RETRIEVAL`**: calls `RetrievalService.retrieve(question)`, passes the results to
+   `RagPromptBuilder.build(question, results)`, yields one `OrchestratorMetadata`
+   (`retrieval_used=True`, `sources` from the built prompt), then streams
+   `LLMProvider.stream_generate(f"{system_prompt}\n\n{user_prompt}")` chunk by chunk as
+   `OrchestratorToken`s.
+4. **`DIRECT_LLM`**: yields one `OrchestratorMetadata` (`retrieval_used=False`, `sources=[]`),
+   then streams `LLMProvider.stream_generate(...)` directly from a fixed system prompt plus the
+   question — no retrieval call.
+
+`OrchestratorMetadata` (`decision`, `reason`, `retrieval_used`, `sources: list[PromptSource]`) is
+always the first event of a `stream_answer()` run; every subsequent event is an
+`OrchestratorToken(text: str)`, in the exact order the LLM (or the fixed message) produced them.
+A failure raised by `RetrievalService.retrieve()` or `LLMProvider.stream_generate()` propagates
+unchanged out of the async generator — `RagOrchestrator` does not catch it to substitute a
+direct-LLM answer for a failed retrieval, and does not catch a provider failure to retry with a
+different provider; `get_llm_provider()`'s existing no-silent-fallback guarantee (see "Provider
+factory" above) is preserved end-to-end.
+
+This required extending `LLMProvider`'s abstract contract with `stream_generate(prompt) ->
+AsyncIterator[str]` alongside the existing `generate(prompt) -> str` (previously only
+`OllamaLLMProvider` exposed streaming). `LLMProviderStub` — the shared base for
+`OpenAIProvider`/`GeminiProvider`/`AnthropicProvider` — now raises
+`ProviderNotImplementedError` from `stream_generate()` too, keeping the "stub never calls out"
+guarantee for both methods.
+
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -474,26 +513,33 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     `POST /api/embeddings` for `OLLAMA_EMBEDDING_MODEL` only.
   - `OllamaLLMProvider` (`app/rag/providers/ollama_llm_provider.py`) — calls
     `POST /api/generate` with `stream=true` for `Settings.resolved_llm_model`
-    (`LLM_MODEL`, falling back to `OLLAMA_CHAT_MODEL`), exposing
-    `stream_generate(prompt) -> AsyncIterator[str]` (yields text chunks as Ollama streams them)
-    and `generate(prompt) -> str` (joins the streamed chunks, satisfying the abstract
-    `LLMProvider` contract). Internal-only — no ingestion, no Qdrant writes, no public chat/SSE
-    endpoint.
+    (`LLM_MODEL`, falling back to `OLLAMA_CHAT_MODEL`), implementing both abstract `LLMProvider`
+    methods: `stream_generate(prompt) -> AsyncIterator[str]` (yields text chunks as Ollama
+    streams them) and `generate(prompt) -> str` (joins the streamed chunks). Internal-only — no
+    ingestion, no Qdrant writes, no public chat/SSE endpoint.
   - `QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) — calls Qdrant's HTTP API
     for collection create/upsert/search only (see "Vector store" above). Internal-only — no
     document upload, no chat/SSE endpoint, no full RAG flow; `IngestionWorker` (write side) and
     `RetrievalService` (read side) are its only callers so far.
 
+  `LLMProvider` (`app/rag/providers/llm_provider.py`) declares both `generate(prompt) -> str` and
+  `stream_generate(prompt) -> AsyncIterator[str]` as abstract methods — every implementation,
+  including the future-provider stubs, must implement both.
+
   Three future-provider stubs also exist — `OpenAIProvider`, `GeminiProvider`,
   `AnthropicProvider` (`app/rag/providers/{openai,gemini,anthropic}_provider.py`) — which
-  implement `LLMProvider` but always raise `ProviderNotImplementedError` (see "Future LLM
-  provider stubs" above).
+  implement `LLMProvider` but always raise `ProviderNotImplementedError` from both `generate()`
+  and `stream_generate()` (see "Future LLM provider stubs" above).
 
   `OllamaClient` (health checks) is deliberately kept separate from these provider interfaces so
   health checks don't get entangled with the generation/embedding/storage contracts.
 - `app/rag/decision.py` — the RAG decision layer (see "RAG decision layer" above): `RagDecision`,
   `DecisionResult`, `RuleBasedRagDecider`. Separate from `app/rag/providers` since it doesn't call
   any provider itself — it only classifies a question.
+- `app/rag/orchestrator.py` — `RagOrchestrator`, `OrchestratorMetadata`, `OrchestratorToken` (see
+  "RAG orchestrator" above). The only component that composes the decision layer, retrieval
+  service, prompt builder, and LLM provider together — no other module in `app/rag` calls more
+  than one of them.
 - `app/workers` — background job placeholders.
 
 ## What is intentionally not implemented yet
@@ -504,14 +550,12 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   as vectors in Qdrant (via the embedding/upsert step); there's no relational table for chunk text
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
-- A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings, vector store, chunking, retrieval, prompt-building, or
-  decision-layer operations (all internal-only)
+- A public chat/query endpoint (including SSE streaming to clients) — `RagOrchestrator` composes
+  the full pipeline internally, but nothing exposes `stream_answer()` over the API yet
+- A public API endpoint for embeddings, vector store, chunking, retrieval, prompt-building,
+  decision-layer, or orchestration operations (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
-- Any actual LLM call using a `BuiltRagPrompt` — `RagPromptBuilder` only shapes the prompt text
-- Conversation memory / multi-turn context in prompt building
-- Any pipeline wiring the decision layer, LLM generation, retrieval, and prompt building into a
-  full RAG flow
+- Conversation memory / multi-turn context (in prompt building or the orchestrator)
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.
