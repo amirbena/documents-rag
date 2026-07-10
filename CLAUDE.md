@@ -151,6 +151,56 @@ def get_settings() -> Settings:
   see the guard fixture in `tests/integration/conftest.py` — rather than silently running against
   whatever `DATABASE_URL`/`QDRANT_URL` happens to be set.
 
+## Operational Endpoints
+
+- **Operational endpoints remain unversioned.** `GET /health`, `/health/live`, `/health/ready`,
+  and `/health/dependencies` (`app/api/routes/health.py`) are registered on `app` with no
+  `/api/v1` (or any future `/api/vN`) prefix, and must stay that way. Business API versioning
+  changes what request/response shapes a client of the RAG features sees; it must never affect
+  where infrastructure (Kubernetes probes, load balancers, ArgoCD, monitoring) finds the
+  operational health contract.
+- **Liveness must not depend on external services.** `GET /health/live` (and `GET /health`) must
+  never call Postgres, Redis, Qdrant, Ollama, or any other external service — if it did, a
+  temporary dependency outage would make Kubernetes restart an otherwise-healthy process. Only
+  `GET /health/ready` and `GET /health/dependencies` may perform dependency I/O.
+- **Readiness must reflect required runtime dependencies.** `GET /health/ready` returns `503` if
+  any dependency marked `required=True` in `app/services/platform_health.py` fails its check.
+  Whether a given dependency is `required` must track whether the codebase actually depends on it
+  today (e.g. `redis` is currently `required=False` because nothing reads or writes it yet) — flip
+  it to `True` the same PR that starts actually using it, not before and not long after.
+- **Health responses must never expose secrets or internal connection details.** No check result
+  (`DependencyCheckResult.detail`, or any `/health/*` response) may include a raw exception
+  message, a connection string, a credential, a stack trace, or a provider's raw response body —
+  use a fixed, generic message per failure mode instead (see the existing checks in
+  `app/services/platform_health.py` for the pattern).
+- **Future API version changes must not move these endpoints under `/api/vN`.** If the business
+  API is ever versioned to `/api/v2`, `/health*` stays exactly where it is — this is the whole
+  point of keeping it unversioned in the first place.
+
+## Route Layer Style
+
+- **Keep FastAPI route handlers thin.** A route function should do only: request
+  validation/parsing (via the Pydantic request schema), dependency injection (`Depends(...)`),
+  one call into a service function, applying whatever HTTP status the service already decided,
+  and returning the response body/model the service already built. No business logic, no
+  aggregation (filtering, counting, computing an overall status, building an error summary), and
+  no direct provider/database calls belong in a route module.
+- **Business/aggregation logic lives in the service layer**, as small, well-named, independently
+  unit-testable functions — prefer pure, synchronous functions for pure computation (e.g.
+  `build_readiness_result(checks)`) separate from the async I/O-performing orchestration around
+  them (e.g. `get_readiness_result(settings)`), so aggregation logic can be tested without
+  mocking any I/O at all.
+- **Prefer a typed result object over route-side status-code logic** when a service needs to
+  communicate both a response body and an HTTP status back to a route — see
+  `platform_health.ReadinessResult` (`response` + `status_code`) for the pattern. The route
+  should only ever copy `result.status_code` onto the response, never re-derive it.
+- **Established examples**: `POST /api/v1/chat` (`app/api/v1/routes/chat.py`) delegates entirely
+  to `RagOrchestrator`; `GET /health/ready`/`GET /health/dependencies`
+  (`app/api/routes/health.py`) delegate entirely to `app/services/platform_health.py`. When
+  adding a new route with any nontrivial logic, follow the same split — and if a review finds
+  aggregation/business logic creeping into a route module, that's a bug to fix, not a style
+  nitpick to defer.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`

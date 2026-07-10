@@ -510,6 +510,96 @@ pipeline against real Postgres and real Qdrant, but with `get_embedding_provider
 to a small fixed-vector fake — real Ollama stays entirely outside the default integration run,
 reserved for the future real-AI smoke suite described above.
 
+## Operational Health Contract
+
+`app/api/routes/health.py` exposes four **unversioned** endpoints — `GET /health`,
+`/health/live`, `/health/ready`, `/health/dependencies` — registered on `app` with **no
+`/api/v1` prefix**. This is deliberate: business API versioning (`/api/v1`, and any future
+`/api/v2`) is about the shape of request/response contracts for clients of the RAG features;
+operational health is a different, version-independent contract consumed by infrastructure —
+Kubernetes probes, load balancers, ArgoCD, monitoring/alerting — that must never need to change
+just because the business API moved to a new version. Moving these endpoints under a versioned
+prefix later would break every external prober pointed at them; see the standing rule in
+[CLAUDE.md](CLAUDE.md).
+
+**Why four separate endpoints, not one**: each answers a different operational question and is
+polled at different rates by different consumers.
+
+- **`GET /health`** — "is the process up." A static, zero-dependency summary
+  (`status`/`service`/`version`), for a human or a very cheap uptime check.
+- **`GET /health/live`** (liveness) — "is the process alive and not deadlocked." Never calls
+  Postgres, Redis, Qdrant, or Ollama. This is what a Kubernetes `livenessProbe` should point at:
+  if it ever returns non-200 or times out, the pod should be restarted — but a downstream
+  dependency being temporarily down is *not* a reason to restart this process, so liveness must
+  stay independent of every external service.
+- **`GET /health/ready`** (readiness) — "can this instance actually serve traffic right now."
+  Calls `app/services/platform_health.get_readiness_result()`, which runs every check and
+  returns `200` only if every **required** check passes, else `503`. This is what a Kubernetes
+  `readinessProbe` and a load balancer's health check should point at: `503` here means "stop
+  routing traffic to this instance," not "restart it" — `live` can (and often will) stay `200`
+  while `ready` is `503` (e.g. Qdrant is temporarily unreachable but the process itself is fine).
+- **`GET /health/dependencies`** — the same checks as readiness, but always returns `200` with
+  the full per-dependency detail in the body (`status` per check, `required` per check, a safe
+  `detail` string on failure). Intended for monitoring/alerting dashboards and human debugging,
+  not for gating traffic — that's what `/health/ready`'s HTTP status code is for.
+
+**Dependency/readiness semantics** — `app/services/platform_health.py`:
+
+| Check | Method | Required for readiness? |
+|---|---|---|
+| `postgres` | `SELECT 1` via a short-lived async engine | Yes |
+| `redis` | `PING` via `redis.asyncio` | No — no application code path reads/writes Redis yet |
+| `qdrant` | `GET /collections` (same reachability check `create_collection_if_not_exists` uses) | Yes |
+| `ollama` | Reuses `OllamaClient.check_health()` (reachability) | Yes |
+| `ollama_chat_model` | Same call, `chat_model_available` | Yes |
+| `ollama_embedding_model` | Same call, `embedding_model_available` | Yes |
+
+Every check runs concurrently (`asyncio.gather`) with its own `CHECK_TIMEOUT_SECONDS` (3s)
+timeout, wrapping `asyncio.timeout(...)` around the actual I/O — no automatic retries beyond
+that timeout, and no check ever mutates or restarts the dependency it's probing (a `SELECT 1`, a
+`PING`, a `GET`, nothing else). A failed check is never silently dropped: `run_all_checks()`
+always returns one `DependencyCheckResult` per check, and both `/health/ready` and
+`/health/dependencies` surface every result. `redis` is checked and reported everywhere (so
+observability doesn't lose it) but is `required=False`, so a down Redis alone can never flip
+readiness to `503` — reflecting that nothing in this codebase actually depends on it yet (see the
+environment variable table below); this is a deliberate, documented choice, not an oversight, and
+should be revisited the moment any code path starts using `REDIS_URL`.
+
+Every `DependencyCheckResult`'s `detail` is a fixed, generic string per failure mode (e.g.
+`"Postgres is unreachable."`) — none of the checks ever return a raw exception message, a
+connection string, a credential, or a provider's raw response body to the client.
+
+**Thin-controller route, aggregation in the service layer**: `app/api/routes/health.py`'s
+`readiness`/`dependencies` handlers do only three things — resolve `Settings` via `Depends`, call
+one function in `app/services/platform_health.py`, and apply the status code / return the body
+that function already produced. All required-check filtering, failed-check calculation, overall
+status calculation, and safe error-summary construction live in the service module as pure,
+synchronous, directly-unit-testable functions:
+
+- `build_readiness_result(checks) -> ReadinessResult` — `ReadinessResult` is a small dataclass
+  (`response: ReadinessResponse`, `status_code: int`) so the route never computes `200`/`503`
+  itself, it only copies a value the service already decided.
+- `build_dependencies_response(checks) -> DependenciesResponse`
+- `get_readiness_result(settings)`/`get_dependencies_response(settings)` — thin async wrappers
+  that call `run_all_checks(settings)` then delegate to the two functions above; these are what
+  the route actually calls.
+
+This mirrors how `POST /api/v1/chat` (see "Streaming chat endpoint" above) stays a thin route
+over `RagOrchestrator` — routes handle HTTP concerns (validation, dependency injection, status
+codes, response shape) and delegate everything else to a service; see the standing rule in
+[CLAUDE.md](CLAUDE.md).
+
+**Future DevOps consumers** this contract is designed for (none wired up yet in this repository):
+Kubernetes liveness/readiness probes, load balancer health checks, ArgoCD rollout health checks
+(a rollout can gate on `/health/ready` before shifting traffic to a new revision),
+monitoring/alerting systems polling `/health/dependencies` for per-dependency status, and a
+future backend E2E suite's own startup check (poll `/health/ready` before running E2E tests
+against a freshly started stack, instead of a fixed sleep).
+
+**Legacy**: `GET /api/v1/health` (`app/api/v1/routes/health.py`, `HealthResponse`) is unchanged
+and still works — kept for backward compatibility with any existing client — but is superseded by
+`GET /health` for anything operational going forward.
+
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -553,12 +643,12 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 | Variable                  | Default                                                              | Notes |
 |----------------------------|-----------------------------------------------------------------------|-------|
-| `APP_ENV`                 | `local`                                                                | Echoed by `/health` |
+| `APP_ENV`                 | `local`                                                                | Echoed by the legacy `GET /api/v1/health`'s `environment` field |
 | `LOG_LEVEL`                | `INFO`                                                                 | Not yet wired to a logger |
-| `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine; stores `documents`/`ingestion_jobs` |
-| `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed |
-| `QDRANT_URL`               | `http://qdrant:6333`                                                  | Used by `QdrantVectorStore` for collection/upsert/search |
-| `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks |
+| `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine; stores `documents`/`ingestion_jobs`; also `SELECT 1`-checked by `GET /health/ready`/`/health/dependencies` |
+| `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed by any business code path; `PING`-checked (not required) by `GET /health/ready`/`/health/dependencies` |
+| `QDRANT_URL`               | `http://qdrant:6333`                                                  | Used by `QdrantVectorStore` for collection/upsert/search; also checked by `GET /health/ready`/`/health/dependencies` |
+| `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks (also reused by `GET /health/ready`/`/health/dependencies`) |
 | `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; backward-compatible fallback for `LLM_MODEL` if unset |
 | `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; always used by `OllamaEmbeddingProvider` — fixed, not selectable via `LLM_MODEL` |
 | `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation; `openai`/`gemini`/`anthropic` are recognized stubs |
@@ -574,10 +664,16 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## Current boundaries
 
-- `app/api` — FastAPI routers: `/health`, `/providers/ollama/health`, `POST /documents` (see
-  "Document upload and ingestion job skeleton" above), and `POST /chat` (see "Streaming chat
-  endpoint" above) — the only router that depends on `app/rag`.
-- `app/core` — configuration and cross-cutting concerns.
+- `app/api/routes` — **unversioned** operational routes: `GET /health`, `/health/live`,
+  `/health/ready`, `/health/dependencies` (see "Operational Health Contract" above). Registered
+  on `app` with no prefix — never move these under `app/api/v1`.
+- `app/api/v1/routes` — versioned business API routers: `GET /health` (legacy, see "Operational
+  Health Contract" above), `GET /providers/ollama/health`, `POST /documents` (see "Document
+  upload and ingestion job skeleton" above), and `POST /chat` (see "Streaming chat endpoint"
+  above) — the only router that depends on `app/rag`.
+- `app/core` — configuration and cross-cutting concerns, plus `version.py` (`SERVICE_NAME`/
+  `SERVICE_VERSION` — the single source of truth for both the FastAPI app's own metadata and the
+  unversioned platform health responses).
 - `app/db` — SQLAlchemy async engine/session setup.
 - `app/models` — ORM models: `Document`, `IngestionJob`/`IngestionStatus` (see "Document upload
   and ingestion job skeleton" above).
@@ -594,7 +690,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`app/services/document_text_extractor.py`), which extracts text from a document's stored
   `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction" above); and
   `DocumentChunker` (`app/services/document_chunker.py`), which splits an `ExtractedDocument`
-  into `DocumentChunk`s (see "Document chunking" above).
+  into `DocumentChunk`s (see "Document chunking" above); and `platform_health.py`, the dependency
+  checks backing `GET /health/ready`/`/health/dependencies` (see "Operational Health Contract"
+  above) — reuses `OllamaClient` for the Ollama check rather than duplicating it.
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
@@ -664,6 +762,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - Backend E2E tests (full upload-to-chat flow) and frontend E2E tests — no frontend exists yet
 - A real-Ollama smoke suite — deliberately kept separate/manual/nightly, not part of the default
   integration run (see "Test architecture" above)
-- Auth, rate limiting, observability/logging pipeline
+- Kubernetes manifests, Helm charts, ArgoCD Application/Rollout resources, or any
+  monitoring/alerting configuration that actually consumes the new `/health/*` endpoints — this
+  milestone only establishes the operational health *contract* those future consumers would use
+- Auth, rate limiting, an observability/logging pipeline, and Redis actually being used for
+  anything (it is only `PING`-checked, not read from or written to, by any code path)
 
 These land in later milestones once the infrastructure is confirmed stable.
