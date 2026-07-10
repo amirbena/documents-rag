@@ -378,7 +378,7 @@ chat, or SSE endpoint that reads these vectors back out.
 
 `RetrievalService` (`app/rag/retrieval_service.py`) is the internal read-side counterpart to the
 ingestion worker's embed/upsert steps: given a query, it embeds it and searches Qdrant for
-relevant chunks — no LLM call, no public retrieval/chat/SSE endpoint, no RAG prompt assembly yet.
+relevant chunks — no LLM call, no public retrieval/chat/SSE endpoint, no RAG prompt assembly.
 
 ```python
 results = await RetrievalService().retrieve("what is the refund policy?")
@@ -394,6 +394,34 @@ unset, no score filtering happens. Each `VectorSearchResult` preserves `document
 `text`, `source`, `page_number`, `sheet_name`, and `score`. An embedding or vector-store failure
 propagates as-is rather than being swallowed, and no matches simply means an empty list — nothing
 is fabricated.
+
+### RAG prompt builder
+
+`RagPromptBuilder` (`app/rag/prompt_builder.py`) turns a user question and ranked
+`VectorSearchResult`s (from `RetrievalService`) into a deterministic, structured prompt — no LLM
+call, no public chat/SSE endpoint, no conversation memory, and it never changes retrieval
+behavior itself:
+
+```python
+from app.rag.prompt_builder import RagPromptBuilder
+
+results = await RetrievalService().retrieve("what is the refund policy?")
+built = RagPromptBuilder().build("what is the refund policy?", results)
+# built: BuiltRagPrompt(system_prompt, user_prompt, context, sources)
+```
+
+`build(question, results)` filters out any result with empty/whitespace-only `text`, then, for
+each remaining result **in the given (already-ranked) order**, assigns a stable label —
+`[S1]`, `[S2]`, ... — and formats a context block with that label, the result's `source`
+filename, `page N` when `page_number` is set, `sheet <name>` when `sheet_name` is set, and the
+chunk text itself. `system_prompt` instructs the model to answer only from the supplied context,
+never invent missing information, and say explicitly when the answer isn't present. Each context
+block has a matching `PromptSource` (`document_id`, `chunk_id`, `source`, `score`,
+`page_number`, `sheet_name`) in `sources`, in the same order as the context. If no result has
+non-empty text, `context` states plainly that no relevant context was found — no fallback content
+is fabricated — and `sources` is an empty list; this no-results path is exactly as deterministic
+as the normal path. `RagPromptBuilder` is pure and synchronous: it doesn't mutate the
+`VectorSearchResult`s it's given and never imports or calls `LLMProvider`.
 
 ## Verification
 
@@ -519,11 +547,15 @@ and upsert the resulting vectors into Qdrant via `get_vector_store()`
 (`QDRANT_COLLECTION_NAME`/`VECTOR_SIZE`, created if missing), preserving `document_id`,
 `chunk_id`, `text`, `source`, and `page_number`/`sheet_name` as payload metadata — marking the
 job `completed` on success or `failed` with the error stored on failure at any step (extraction,
-chunking, embedding, or upsert). An internal `RetrievalService` now closes the read side of the
-same loop — given a query, it embeds it via `get_embedding_provider()` and searches
+chunking, embedding, or upsert). An internal `RetrievalService` closes the read side of the same
+loop — given a query, it embeds it via `get_embedding_provider()` and searches
 `QDRANT_COLLECTION_NAME` via `get_vector_store()`, returning ranked `VectorSearchResult`s
-(`RETRIEVAL_TOP_K`/`RETRIEVAL_SCORE_THRESHOLD`) — but it is not wired to any public endpoint yet,
-makes no LLM call, and assembles no RAG prompt. A public retrieval/chat/query endpoint and any
-pipeline wiring the decision layer, LLM provider, and ingestion worker together into a full RAG
-flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
-intentionally deferred.
+(`RETRIEVAL_TOP_K`/`RETRIEVAL_SCORE_THRESHOLD`). On top of that, an internal `RagPromptBuilder`
+turns a question and those ranked results into a deterministic `BuiltRagPrompt`
+(`system_prompt`/`user_prompt`/`context`/`sources`) with stable `[S1]`/`[S2]`/... source labels,
+filename/page/sheet attribution, and instructions to answer only from context and say when the
+answer isn't present — but it is not wired to any public endpoint yet, and neither it nor
+`RetrievalService` makes an LLM call. A public retrieval/chat/query endpoint and any pipeline
+wiring the decision layer, LLM provider, ingestion worker, and prompt builder together into a
+full RAG flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list
+of what's intentionally deferred.

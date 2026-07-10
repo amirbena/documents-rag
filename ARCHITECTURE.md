@@ -317,8 +317,7 @@ this pipeline embeds and indexes, it never generates text.
 
 `RetrievalService` (`app/rag/retrieval_service.py`) is the internal read-side counterpart to
 chunk embedding/indexing: given a query, it embeds it and searches Qdrant for relevant chunks —
-**no public retrieval/chat/SSE endpoint exists yet, no LLM call is made, and no RAG prompt is
-assembled**.
+**no public retrieval/chat/SSE endpoint exists yet, and no LLM call is made**.
 
 `retrieve(query: str, limit: int | None = None) -> list[VectorSearchResult]`:
 
@@ -339,6 +338,42 @@ Each returned `VectorSearchResult` preserves `document_id`, `chunk_id`, `text`, 
 vector store propagates unchanged — `RetrievalService` does not catch or wrap it — and zero
 matching results (or all filtered out by the threshold) simply return an empty list rather than
 fabricating context. `RetrievalService` never imports or calls `LLMProvider`.
+
+## RAG prompt builder
+
+`RagPromptBuilder` (`app/rag/prompt_builder.py`) is a pure, synchronous, deterministic function
+of its inputs: given a question and a list of `VectorSearchResult`s (from `RetrievalService`), it
+builds a `BuiltRagPrompt` — **no LLM call, no public chat/SSE endpoint, no retrieval of its own,
+no conversation memory**.
+
+`build(question: str, results: list[VectorSearchResult]) -> BuiltRagPrompt`:
+
+1. **Filter**: results with empty/whitespace-only `text` are dropped before anything else — they
+   never appear in the context or in `sources`.
+2. **No-results path**: if nothing remains after filtering, `context` is set to a fixed sentence
+   stating no relevant context was found, `sources` is `[]`, and `user_prompt` is built from that
+   same fixed context — deterministic, and no fallback content is fabricated.
+3. **Label and format**: otherwise, each remaining result is processed **in the order given**
+   (the caller's retrieval rank is preserved, never re-sorted) and assigned a stable label —
+   `[S1]`, `[S2]`, ... — used as both the context block's marker and the implicit index into
+   `sources`. Each context block is `"{label} {source}[ page {page_number}][ sheet
+   {sheet_name}]\n{text}"`, joined with blank lines.
+4. **Attribution**: each context block has a matching `PromptSource` (`document_id`, `chunk_id`,
+   `source`, `score`, `page_number`, `sheet_name`) appended to `sources` in the same order.
+
+`BuiltRagPrompt` fields:
+
+| Field | Type | Contents |
+|---|---|---|
+| `system_prompt` | `str` | Fixed instruction: answer only from the supplied context, never invent missing information, say explicitly when the answer isn't present |
+| `user_prompt` | `str` | The question plus the formatted `context`, with a closing reminder to answer only from context |
+| `context` | `str` | The joined, labeled context blocks (or the fixed no-results sentence) |
+| `sources` | `list[PromptSource]` | Attribution metadata per context block, in context order |
+
+`RagPromptBuilder` never mutates the `VectorSearchResult`s or the list passed to `build()`, and
+never imports or calls `LLMProvider` or `RetrievalService` itself — it only shapes already-ranked
+results into prompt text, leaving the actual retrieval call to whoever composes it with
+`RetrievalService`.
 
 ## Future LLM provider stubs
 
@@ -428,6 +463,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
   `LLMProvider`.
+- `app/rag/prompt_builder.py` — `RagPromptBuilder`, `BuiltRagPrompt`, `PromptSource` (see "RAG
+  prompt builder" above). Pure and synchronous — it calls no provider at all (not even
+  `get_embedding_provider()`/`get_vector_store()`), consuming only the `VectorSearchResult`s a
+  caller already obtained from `RetrievalService`.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -466,10 +505,13 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings, vector store, chunking, retrieval, or decision-layer
-  operations (all internal-only)
+- A public API endpoint for embeddings, vector store, chunking, retrieval, prompt-building, or
+  decision-layer operations (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
-- Any pipeline wiring the decision layer, LLM generation, and retrieval into a full RAG flow
+- Any actual LLM call using a `BuiltRagPrompt` — `RagPromptBuilder` only shapes the prompt text
+- Conversation memory / multi-turn context in prompt building
+- Any pipeline wiring the decision layer, LLM generation, retrieval, and prompt building into a
+  full RAG flow
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.
