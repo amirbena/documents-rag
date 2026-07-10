@@ -107,14 +107,49 @@ def get_settings() -> Settings:
   Postgres, and code that depends on Postgres-specific semantics (e.g.
   `with_for_update(skip_locked=True)` row locking) is not correctly represented by SQLite even
   when SQLite accepts the same SQLAlchemy call — it silently behaves differently.
-- **Use a fake session/repository double instead.** Tests for code that reads/writes via
+- **Use a fake session/repository double for unit tests.** Tests for code that reads/writes via
   `AsyncSession` (e.g. `tests/test_document_upload.py`, `tests/test_ingestion_worker.py`) use a
   small in-memory fake implementing only the methods the code under test actually calls
   (`add`, `execute` returning a fake scalar result, `get`, `commit`), faithfully simulating the
   real query's filter/ordering logic in plain Python rather than executing real SQL.
-- **Reach for a real Postgres integration test only if the project already supports one
-  cleanly** (e.g. via the `postgres` Docker Compose service) — don't add a new, separate test-DB
-  backend to avoid that friction.
+- **Use a real Postgres integration test — via Testcontainers — for behavior a fake session
+  cannot faithfully represent** (row-level locking, `FOR UPDATE SKIP LOCKED`, real constraint
+  enforcement, real Alembic migrations). See "Integration Testing Style" below.
+
+## Integration Testing Style
+
+- **Use Testcontainers for Python, not the main `docker-compose.yml`, for integration tests.**
+  `tests/integration/` starts its own ephemeral Postgres/Qdrant containers via Testcontainers on
+  dynamically assigned ports — never the repository's `docker-compose.yml` stack, and never a
+  fixed host port or a persistent Compose volume. Local development continues to use
+  `docker-compose.yml` exactly as before; that workflow and the integration suite must stay
+  independent of each other.
+- **Never use SQLite to simulate Postgres locking/transaction behavior** (this generalizes the
+  "Database Testing Style" rule above to the integration tier too). Use a real Postgres container
+  for any test asserting `FOR UPDATE SKIP LOCKED`, isolation-level, or constraint-enforcement
+  behavior — a fake session or a different database engine cannot be trusted to match Postgres
+  here, even when the same SQLAlchemy call superficially "works" against it.
+- **Use a real Qdrant container for HTTP/data-contract integration tests** — verifying
+  `QdrantVectorStore`'s actual request/response shape, ranking, and error behavior against a
+  mocked `httpx` transport only proves the mock was self-consistent, not that it still matches
+  real Qdrant.
+- **Keep real Ollama outside the default integration suite.** No integration test in
+  `tests/integration/` may start a real Ollama container or pull a real model — use a small,
+  fixed-vector fake embedding provider (or an equivalent fake for LLM output) wherever the
+  pipeline needs one. Real-Ollama verification belongs in a separate, future manual/nightly smoke
+  suite, not the suite that runs on every `make test-integration`.
+- **Do not add slow integration tests to the pre-commit hook without explicit approval.** The
+  pre-commit hook runs `make verify`, which must stay fast and Docker-independent (beyond
+  `docker compose config`, which starts nothing) — `make test-integration`/
+  `make verify-integration` are separate, manually-invoked targets and stay that way unless the
+  user explicitly asks to change that.
+- **Integration tests must use dynamic ports and fully ephemeral state.** Never hardcode a host
+  port for a Testcontainers-managed service, and never write state that outlives the test
+  session — containers, their data, and any temp files must be gone once the run ends.
+- **Never let a test connect to a production service.** Integration fixtures must fail loudly
+  (before starting any container or test) if the ambient environment looks like production —
+  see the guard fixture in `tests/integration/conftest.py` — rather than silently running against
+  whatever `DATABASE_URL`/`QDRANT_URL` happens to be set.
 
 ## Pull Request Workflow
 
