@@ -58,9 +58,11 @@ First-time onboarding, in order — later sections below go into more detail on 
    ```
 7. **Verify app health**:
    ```bash
-   curl http://localhost:8000/api/v1/health
-   # {"status":"ok","environment":"local"}
+   curl http://localhost:8000/health
+   # {"status":"ok","service":"documents-rag","version":"0.1.0"}
    ```
+   (see "Platform health and readiness" below for the full unversioned health/liveness/readiness
+   contract, and "legacy" note on `/api/v1/health`)
 8. **Pull the required Ollama models** (see "Running with Docker Compose" below):
    ```bash
    docker compose exec ollama ollama pull llama3.1
@@ -222,6 +224,53 @@ print(result.decision, result.reason, result.confidence)
 
 It's internal-only — no public API endpoint exposes it, and it doesn't perform retrieval,
 generation, ingestion, or document upload itself; it only decides what *should* happen next.
+
+## Platform health and readiness
+
+Four **unversioned** endpoints (`app/api/routes/health.py`, registered without an `/api/v1`
+prefix) give load balancers, Kubernetes, and monitoring a stable operational contract that
+never moves when the business API's version changes:
+
+| Endpoint | Purpose | Calls dependencies? | Status codes |
+|---|---|---|---|
+| `GET /health` | Lightweight platform summary — "is the process up at all" | No | Always `200` |
+| `GET /health/live` | **Liveness** probe | No | Always `200` while the process is alive |
+| `GET /health/ready` | **Readiness** probe | Yes | `200` if every *required* dependency check passes, else `503` |
+| `GET /health/dependencies` | Detailed diagnostics for every checked dependency | Yes | Always `200` (status is in the body, not the HTTP code) |
+
+**Liveness vs. readiness**: liveness only answers "is this process alive and not deadlocked" —
+it never touches Postgres/Redis/Qdrant/Ollama, so it can't go `503` just because a downstream
+dependency is having a bad day (which would cause Kubernetes to needlessly kill and restart a
+perfectly healthy process). Readiness answers a different question — "can this instance actually
+serve traffic right now" — and can legitimately be `503` while liveness stays `200`, telling a
+load balancer/Kubernetes to stop routing traffic here *without* restarting the pod.
+
+`GET /health/ready` checks `postgres`, `qdrant`, `ollama`, and the two configured Ollama models
+(`ollama_chat_model`, `ollama_embedding_model`) as **required** — any one of these failing makes
+readiness `503`. `redis` is checked too but is **not required** for readiness today, since no
+application code path reads or writes it yet (see `REDIS_URL` in
+[ARCHITECTURE.md](ARCHITECTURE.md)'s environment variable table) — marking it required would make
+Kubernetes pull traffic away from a perfectly capable instance over an unused dependency.
+`GET /health/dependencies` reports all six checks regardless, each with `required: true/false`,
+for full visibility.
+
+Every check is a small, timeout-bounded probe (`SELECT 1` for Postgres, `PING` for Redis, a
+lightweight `GET /collections` for Qdrant, the existing `OllamaClient.check_health()` reachability
++ model-availability check for Ollama) — none of them mutate or restart anything, and none retry
+beyond their own timeout. Response bodies never include credentials, connection strings, stack
+traces, or raw provider response bodies — only a fixed, generic `detail` message per failure mode.
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/health/live
+curl http://localhost:8000/health/ready
+curl http://localhost:8000/health/dependencies
+```
+
+**Legacy**: `GET /api/v1/health` (`{"status": "ok", "environment": "..."}`) still exists and
+still works exactly as before — nothing about it changed — but it's superseded by the endpoints
+above for anything operational (probes, load balancers, monitoring). Prefer `GET /health` for new
+integrations; `/api/v1/health` is kept only for backward compatibility with existing clients.
 
 ## Database migrations
 
@@ -541,9 +590,11 @@ fast unit suite never needs Docker beyond `docker compose config`.
   ports, no shared/persistent Compose volumes, no reuse of local Compose state. Each test session
   gets its own fresh containers, started and torn down entirely by Testcontainers.
 - **Real Postgres/Qdrant, fake deterministic AI providers**: migrations, `IngestionWorker`
-  transaction/locking behavior, and Qdrant's actual HTTP contract are all exercised against real
-  services, but embeddings come from a small fake, deterministic provider — **no real Ollama
-  container runs and no model is pulled** as part of this first suite.
+  transaction/locking behavior, Qdrant's actual HTTP contract, and platform readiness
+  (`GET /health/ready` against real Postgres/Qdrant, with Redis/Ollama checks faked
+  deterministically) are all exercised against real services, but embeddings come from a small
+  fake, deterministic provider — **no real Ollama container runs and no model is pulled** as
+  part of this first suite.
 - **MinIO and a real-Ollama smoke suite are not part of this first suite** — real-Ollama
   verification is left for a future manual/nightly smoke suite, not the everyday integration run.
 - **Containers and all state are removed after the test session** — nothing persists between
@@ -666,10 +717,15 @@ token (for `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` it streams a fixed message with
 no LLM call) — with no silent fallback between decisions or providers on failure. `POST
 /api/v1/chat` now exposes it publicly as Server-Sent Events (`metadata`/`token`/`done`/`error`),
 via a thin route with no orchestration logic of its own — see "Streaming chat endpoint" above.
-Conversation memory/multi-turn context and a model-override parameter are not implemented. A new
-Testcontainers-based integration suite (`tests/integration/`, `make test-integration`) now backs
+Conversation memory/multi-turn context and a model-override parameter are not implemented. A
+Testcontainers-based integration suite (`tests/integration/`, `make test-integration`) backs
 migrations, `IngestionWorker`'s real Postgres locking behavior, and `QdrantVectorStore`'s real
 HTTP contract with genuine ephemeral containers — separate from the fast unit suite and from
 `docker-compose.yml` — while still using fake, deterministic AI providers instead of a real
-Ollama model — see "Integration tests" above and "Test architecture" in
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
+Ollama model. On top of the business API, four **unversioned** platform endpoints (`GET /health`,
+`/health/live`, `/health/ready`, `/health/dependencies`) now give Kubernetes/load
+balancers/monitoring a stable operational contract independent of API versioning — readiness
+checks Postgres, Qdrant, Ollama, and its two configured models for real, with a short timeout and
+no secrets/connection details ever in the response — see "Platform health and readiness" above,
+"Integration tests" above, and "Test architecture" in [ARCHITECTURE.md](ARCHITECTURE.md) for the
+full list of what's intentionally deferred.
