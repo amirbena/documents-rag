@@ -293,6 +293,27 @@ error message stored, same as an extraction or chunking failure. A document with
 store at all. This is the ingestion worker's final processing step — there is still no retrieval,
 chat, or SSE endpoint that reads these vectors back out.
 
+### Retrieval service
+
+`RetrievalService` (`app/rag/retrieval_service.py`) is the internal read-side counterpart to the
+ingestion worker's embed/upsert steps: given a query, it embeds it and searches Qdrant for
+relevant chunks — no LLM call, no public retrieval/chat/SSE endpoint, no RAG prompt assembly yet.
+
+```python
+results = await RetrievalService().retrieve("what is the refund policy?")
+# results: list[VectorSearchResult], ranked by Qdrant score
+```
+
+`retrieve(query, limit=None)` rejects an empty/whitespace-only `query` with `EmptyQueryError`
+before calling any provider, embeds the query via `get_embedding_provider()`, and searches
+`QDRANT_COLLECTION_NAME` via `get_vector_store().search_similar(...)` with `limit` (falling back
+to `RETRIEVAL_TOP_K` when omitted). Results come back already ranked by Qdrant's own score
+ordering. If `RETRIEVAL_SCORE_THRESHOLD` is set, results scoring below it are filtered out; left
+unset, no score filtering happens. Each `VectorSearchResult` preserves `document_id`, `chunk_id`,
+`text`, `source`, `page_number`, `sheet_name`, and `score`. An embedding or vector-store failure
+propagates as-is rather than being swallowed, and no matches simply means an empty list — nothing
+is fabricated.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -417,7 +438,11 @@ and upsert the resulting vectors into Qdrant via `get_vector_store()`
 (`QDRANT_COLLECTION_NAME`/`VECTOR_SIZE`, created if missing), preserving `document_id`,
 `chunk_id`, `text`, `source`, and `page_number`/`sheet_name` as payload metadata — marking the
 job `completed` on success or `failed` with the error stored on failure at any step (extraction,
-chunking, embedding, or upsert). A public retrieval/chat/query endpoint and any pipeline wiring
-the decision layer, LLM provider, and ingestion worker together into a full RAG flow are not yet
-implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally
-deferred.
+chunking, embedding, or upsert). An internal `RetrievalService` now closes the read side of the
+same loop — given a query, it embeds it via `get_embedding_provider()` and searches
+`QDRANT_COLLECTION_NAME` via `get_vector_store()`, returning ranked `VectorSearchResult`s
+(`RETRIEVAL_TOP_K`/`RETRIEVAL_SCORE_THRESHOLD`) — but it is not wired to any public endpoint yet,
+makes no LLM call, and assembles no RAG prompt. A public retrieval/chat/query endpoint and any
+pipeline wiring the decision layer, LLM provider, and ingestion worker together into a full RAG
+flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+intentionally deferred.
