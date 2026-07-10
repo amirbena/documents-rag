@@ -426,8 +426,9 @@ as the normal path. `RagPromptBuilder` is pure and synchronous: it doesn't mutat
 ### RAG orchestrator
 
 `RagOrchestrator` (`app/rag/orchestrator.py`) composes the decision layer, retrieval service,
-prompt builder, and streaming LLM provider into a single call — **no public endpoint yet, no
-conversation memory, and no silent fallback between decisions or providers**:
+prompt builder, and streaming LLM provider into a single call — **no conversation memory, and no
+silent fallback between decisions or providers**. It's exposed publicly via `POST /api/v1/chat`
+(see "Streaming chat endpoint" below):
 
 ```python
 from app.rag.orchestrator import RagOrchestrator
@@ -455,6 +456,47 @@ async for event in RagOrchestrator().stream_answer("what is the refund policy?")
 A failure in `RetrievalService` or the LLM provider (`get_llm_provider()`, reads `LLM_PROVIDER`)
 propagates to the caller unchanged — `RagOrchestrator` never catches it to fall back from
 retrieval to a direct answer, and never silently switches providers.
+
+### Streaming chat endpoint
+
+`POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is a thin route that streams
+`RagOrchestrator.stream_answer(question)` back as Server-Sent Events — no decision, retrieval,
+or prompt-building logic in the route itself, and no direct provider calls:
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What does the uploaded document say?"}'
+```
+
+Request body: `{"question": "..."}` — a Pydantic validator rejects an empty/whitespace-only
+`question` with `422` before the route is even reached. There is no `model` field: the
+orchestrator/LLM provider interface doesn't support a validated per-request model override yet,
+and the embedding model is never client-selectable (fixed via `OLLAMA_EMBEDDING_MODEL`, same as
+everywhere else in this project).
+
+Response: `Content-Type: text/event-stream`, one event per line-pair, each followed by a blank
+line:
+
+```
+event: <event-name>
+data: <JSON>
+
+```
+
+Four deterministic event types, always in this shape:
+
+| Event | Emitted when | JSON body |
+|---|---|---|
+| `metadata` | Always first, once, from the run's `OrchestratorMetadata` | `decision`, `reason`, `retrieval_used`, `sources` (each: `document_id`, `chunk_id`, `source`, `score`, plus `page_number`/`sheet_name` when present) |
+| `token` | Once per `OrchestratorToken`, in generation order | `text` |
+| `done` | Exactly once, after the last token, only on normal completion | `status: "completed"` |
+| `error` | At most once, if `RagOrchestrator.stream_answer(...)` raises after streaming has started | `message` (a fixed, safe string — never a stack trace, prompt, secret, credential, internal URL, or provider response body), `status: "failed"` |
+
+An `error` event ends the stream — no `done` event follows it. The route does not buffer the
+full answer: each `OrchestratorToken` is written to the response as soon as the orchestrator
+yields it, so `curl -N` (no-buffer mode, shown above) prints tokens as they arrive rather than
+all at once at the end.
 
 ## Verification
 
@@ -587,11 +629,12 @@ loop — given a query, it embeds it via `get_embedding_provider()` and searches
 turns a question and those ranked results into a deterministic `BuiltRagPrompt`
 (`system_prompt`/`user_prompt`/`context`/`sources`) with stable `[S1]`/`[S2]`/... source labels,
 filename/page/sheet attribution, and instructions to answer only from context and say when the
-answer isn't present. An internal `RagOrchestrator` now wires the decision layer, retrieval
-service, prompt builder, and streaming `LLMProvider` together: `stream_answer(question)` routes
-via `RuleBasedRagDecider`, and for `NEEDS_RETRIEVAL`/`DIRECT_LLM` streams the LLM's answer token
-by token (for `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` it streams a fixed message with no retrieval
-and no LLM call) — with no silent fallback between decisions or providers on failure. It is not
-wired to any public endpoint yet. A public chat/query endpoint (including SSE streaming to
-clients) is not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
-what's intentionally deferred.
+answer isn't present. An internal `RagOrchestrator` wires the decision layer, retrieval service,
+prompt builder, and streaming `LLMProvider` together: `stream_answer(question)` routes via
+`RuleBasedRagDecider`, and for `NEEDS_RETRIEVAL`/`DIRECT_LLM` streams the LLM's answer token by
+token (for `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` it streams a fixed message with no retrieval and
+no LLM call) — with no silent fallback between decisions or providers on failure. `POST
+/api/v1/chat` now exposes it publicly as Server-Sent Events (`metadata`/`token`/`done`/`error`),
+via a thin route with no orchestration logic of its own — see "Streaming chat endpoint" above.
+Conversation memory/multi-turn context and a model-override parameter are not implemented — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.

@@ -379,8 +379,9 @@ results into prompt text, leaving the actual retrieval call to whoever composes 
 
 `RagOrchestrator` (`app/rag/orchestrator.py`) is the single component that composes
 `RuleBasedRagDecider`, `RetrievalService`, `RagPromptBuilder`, and `LLMProvider` (via
-`get_llm_provider()`) into one call — **no public endpoint yet, no conversation memory, and no
-silent fallback between decisions or providers**.
+`get_llm_provider()`) into one call — **no conversation memory, and no silent fallback between
+decisions or providers**. It's exposed publicly via `POST /api/v1/chat` (see "Streaming chat
+endpoint" below).
 
 `stream_answer(question: str) -> AsyncIterator[OrchestratorMetadata | OrchestratorToken]`:
 
@@ -413,6 +414,56 @@ AsyncIterator[str]` alongside the existing `generate(prompt) -> str` (previously
 `OpenAIProvider`/`GeminiProvider`/`AnthropicProvider` — now raises
 `ProviderNotImplementedError` from `stream_generate()` too, keeping the "stub never calls out"
 guarantee for both methods.
+
+## Streaming chat endpoint
+
+`POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is the first public endpoint that produces an
+end-to-end RAG answer. It is deliberately a **thin route**: it validates the request, resolves a
+`RagOrchestrator` via a FastAPI dependency, and formats `stream_answer()`'s output as
+Server-Sent Events — it contains no decision, retrieval, or prompt-building logic, and makes no
+direct call to any provider factory (`get_embedding_provider()`/`get_vector_store()`/
+`get_llm_provider()`) or to `RuleBasedRagDecider`/`RetrievalService`/`RagPromptBuilder` — those
+all live inside `RagOrchestrator`, which the route only consumes.
+
+- **Request**: `ChatRequest` (`app/schemas/chat.py`) — `{"question": str}` only. A
+  `field_validator` rejects an empty/whitespace-only `question`, which FastAPI turns into a
+  standard `422` response before the route body ever runs. There is no `model` field: neither
+  `RagOrchestrator.stream_answer()` nor `LLMProvider` currently accepts a validated per-request
+  model override, so none is exposed — adding one is future work, not a silent gap. The embedding
+  model is never client-selectable, matching the existing `OLLAMA_EMBEDDING_MODEL`-is-fixed rule
+  (see "LLM provider vs. model" above).
+- **Response**: `StreamingResponse(..., media_type="text/event-stream")`, wrapping an async
+  generator (`_stream_chat_events`) that iterates `RagOrchestrator.stream_answer(question)` and
+  yields each event already SSE-formatted (`event: <name>\ndata: <JSON>\n\n`) — tokens are
+  written to the response as the orchestrator produces them, never buffered into one full-text
+  response first.
+- **Event mapping**: `OrchestratorMetadata` → `metadata` (`decision.value`, `reason`,
+  `retrieval_used`, `sources` — each `PromptSource` becomes `document_id`, `chunk_id`, `source`,
+  `score`, plus `page_number`/`sheet_name` only when not `None`); `OrchestratorToken` → `token`
+  (`text`); normal generator completion → `done` (`status: "completed"`), emitted exactly once
+  and only after every token; an exception raised while consuming `stream_answer()` → `error`
+  (`message` — a single fixed string, `status: "failed"`), and the stream ends there with no
+  `done` event.
+- **Error safety**: the `error` event's `message` is always the fixed string `"Failed to
+  generate a response."` — the route never serializes an exception's `str()`, so no stack trace,
+  prompt text, secret, credential, internal URL (e.g. `OLLAMA_BASE_URL`, `QDRANT_URL`), or raw
+  provider response body can leak into a client-visible event.
+- **No silent fallback**: because the route does not catch exceptions from individual pipeline
+  stages separately — only from the orchestrator's combined stream — a `RetrievalService`
+  failure can never be swallowed and silently answered via `DIRECT_LLM`, and a provider failure
+  can never be silently retried against a different provider; both simply become the one
+  `error` event.
+- **Cancellation**: the route catches `Exception`, not `BaseException`, so
+  `asyncio.CancelledError` (raised into the generator when a client disconnects mid-stream) is
+  never caught as a normal failure — it propagates and lets the ASGI server clean up the
+  connection normally, instead of the route trying to write an `error` event to an already-closed
+  socket.
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What does the uploaded document say?"}'
+```
 
 ## Future LLM provider stubs
 
@@ -478,8 +529,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## Current boundaries
 
-- `app/api` — FastAPI routers: `/health`, `/providers/ollama/health`, and `POST /documents`
-  (see "Document upload and ingestion job skeleton" above).
+- `app/api` — FastAPI routers: `/health`, `/providers/ollama/health`, `POST /documents` (see
+  "Document upload and ingestion job skeleton" above), and `POST /chat` (see "Streaming chat
+  endpoint" above) — the only router that depends on `app/rag`.
 - `app/core` — configuration and cross-cutting concerns.
 - `app/db` — SQLAlchemy async engine/session setup.
 - `app/models` — ORM models: `Document`, `IngestionJob`/`IngestionStatus` (see "Document upload
@@ -544,18 +596,19 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- A public retrieval endpoint — `RetrievalService` can embed a query and search Qdrant
-  internally, but nothing exposes it over the API yet
+- A standalone public retrieval endpoint — `RetrievalService` is only reachable indirectly, via
+  `POST /api/v1/chat`'s `NEEDS_RETRIEVAL` path; there's no endpoint that returns raw
+  `VectorSearchResult`s on their own
 - Persisting extracted text or chunks in Postgres — `DocumentChunker`'s output is only persisted
   as vectors in Qdrant (via the embedding/upsert step); there's no relational table for chunk text
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
-- A public chat/query endpoint (including SSE streaming to clients) — `RagOrchestrator` composes
-  the full pipeline internally, but nothing exposes `stream_answer()` over the API yet
-- A public API endpoint for embeddings, vector store, chunking, retrieval, prompt-building,
-  decision-layer, or orchestration operations (all internal-only)
+- A public API endpoint for embeddings, vector store, chunking, prompt-building, or
+  decision-layer operations on their own (all internal-only; only reachable indirectly through
+  `POST /api/v1/chat`)
 - An LLM-based (as opposed to rule-based) question router
 - Conversation memory / multi-turn context (in prompt building or the orchestrator)
+- A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.
