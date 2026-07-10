@@ -465,6 +465,51 @@ curl -N -X POST http://localhost:8000/api/v1/chat \
   -d '{"question":"What does the uploaded document say?"}'
 ```
 
+## Test architecture
+
+Tests are split into tiers by what they need to run, each with a different speed/fidelity
+trade-off:
+
+- **Unit tests** (`tests/*.py`, unmarked/default) — fakes and mocks only (fake sessions, fake
+  providers, mocked `httpx` transports); no real database, no real Qdrant, no real network, no
+  Docker. Fast (the whole suite runs in well under a second) and always run by `make test`/
+  `make verify`.
+- **Integration tests** (`tests/integration/*.py`, `@pytest.mark.integration`, auto-applied by
+  `tests/integration/conftest.py`) — real, ephemeral Postgres and Qdrant containers started via
+  [Testcontainers for Python](https://testcontainers-python.readthedocs.io/), never the
+  repository's `docker-compose.yml`, on dynamically assigned ports with no persistent volumes.
+  Covers behavior a mock/fake cannot faithfully represent: Alembic migrations against a real
+  schema, `IngestionWorker`'s `SELECT ... FOR UPDATE SKIP LOCKED` claim semantics under genuine
+  Postgres transaction locking, and Qdrant's actual HTTP request/response contract. AI providers
+  stay fake and deterministic even here — no real Ollama container, no model pulled — see
+  "AI-provider policy" below. Run via `make test-integration`/`make verify-integration`, never as
+  part of `make test`/`make verify`.
+- **Backend E2E tests** — future milestone. Would exercise the full HTTP surface (upload → real
+  ingestion → real retrieval → real chat stream) end-to-end, likely still against Testcontainers
+  services plus a real Ollama container, as a slower/nightlier tier than the integration suite.
+- **Frontend E2E tests** — future milestone; no frontend exists yet in this repository.
+- **Real-AI smoke tests** — future milestone, kept deliberately separate from both the unit and
+  integration suites: a small, manual/nightly suite that runs against a real Ollama container
+  with real models pulled, to catch drift in actual model behavior/output shape without paying
+  that cost (container pull time, model pull time, non-determinism) on every commit.
+
+**Local development** (running the app, trying it end-to-end by hand) continues to use
+`docker-compose.yml` exactly as before — nothing about that workflow changes. Tests, in either
+tier, must never depend on `docker-compose.yml` being up or on any state it created; the
+integration suite's fixtures (`tests/integration/conftest.py`) start their own containers from
+scratch every session and guard against ever pointing at a production `APP_ENV`/`DATABASE_URL`/
+`QDRANT_URL`.
+
+### AI-provider policy in tests
+
+Neither tier pulls or calls a real LLM/embedding model. Unit tests use hand-written fake
+provider doubles (see e.g. `tests/test_retrieval_service.py`, `tests/test_rag_orchestrator.py`).
+The integration suite's one end-to-end pipeline test
+(`tests/integration/test_ingestion_worker_postgres.py`) runs the real `IngestionWorker` default
+pipeline against real Postgres and real Qdrant, but with `get_embedding_provider` monkeypatched
+to a small fixed-vector fake — real Ollama stays entirely outside the default integration run,
+reserved for the future real-AI smoke suite described above.
+
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -593,6 +638,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   service, prompt builder, and LLM provider together — no other module in `app/rag` calls more
   than one of them.
 - `app/workers` — background job placeholders.
+- `tests/integration/` — the Testcontainers-based integration suite (see "Test architecture"
+  above): `conftest.py` (ephemeral Postgres/Qdrant fixtures, the production-environment guard,
+  the Alembic-migration helpers), `test_alembic_migrations.py`, `test_ingestion_worker_postgres.py`,
+  `test_qdrant_vector_store_integration.py`. Entirely separate from `tests/*.py` (unit tests);
+  auto-marked `@pytest.mark.integration` and excluded from `make test`/`make verify`.
 
 ## What is intentionally not implemented yet
 
@@ -609,6 +659,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - An LLM-based (as opposed to rule-based) question router
 - Conversation memory / multi-turn context (in prompt building or the orchestrator)
 - A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
+- MinIO / any S3-compatible object storage, and a `FileStorage` provider factory —
+  `LocalFileStorage` remains the only implementation
+- Backend E2E tests (full upload-to-chat flow) and frontend E2E tests — no frontend exists yet
+- A real-Ollama smoke suite — deliberately kept separate/manual/nightly, not part of the default
+  integration run (see "Test architecture" above)
 - Auth, rate limiting, observability/logging pipeline
 
 These land in later milestones once the infrastructure is confirmed stable.

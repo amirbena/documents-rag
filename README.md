@@ -503,18 +503,20 @@ all at once at the end.
 A `Makefile` wraps all quality gates behind one command:
 
 ```bash
-make test        # pytest -q
+make test        # pytest -m "not integration and not e2e and not slow" -q (the fast unit suite)
+make test-unit    # alias for 'make test'
 make lint         # ruff check .
 make typecheck    # mypy app
 make compose      # docker compose config
 make verify       # runs test, lint, typecheck, compose, in order — stops at the first failure
 ```
 
-`make verify` is the standard pre-commit/pre-PR check. If `make` isn't available, run the
-underlying commands directly:
+`make verify` is the standard pre-commit/pre-PR check, and stays fast and Docker-independent
+(beyond `docker compose config`, which only validates the compose file — it starts nothing). If
+`make` isn't available, run the underlying commands directly:
 
 ```bash
-pytest -q
+pytest -m "not integration and not e2e and not slow" -q
 ruff check .
 ruff check --fix .    # lint + autofix
 mypy app
@@ -522,9 +524,37 @@ docker compose config
 ```
 
 All four gates (`pytest`, `ruff check .`, `mypy app`, `docker compose config`) must pass cleanly
-before committing.
+before committing. `make verify` never runs the Testcontainers-based integration suite — see
+"Integration tests" below for that.
 
 Run `make help` any time for a quick summary of these commands.
+
+## Integration tests
+
+A separate, Testcontainers-based integration suite lives under `tests/integration/` (marked
+`@pytest.mark.integration`) — it is **not** part of `make test`/`make verify`, so the normal
+fast unit suite never needs Docker beyond `docker compose config`.
+
+- **Docker is required** to run this suite — Testcontainers for Python starts real, isolated,
+  temporary Postgres and Qdrant containers on ephemeral (dynamically assigned) ports.
+- **The repository's main `docker-compose.yml` is not used for integration tests** — no fixed
+  ports, no shared/persistent Compose volumes, no reuse of local Compose state. Each test session
+  gets its own fresh containers, started and torn down entirely by Testcontainers.
+- **Real Postgres/Qdrant, fake deterministic AI providers**: migrations, `IngestionWorker`
+  transaction/locking behavior, and Qdrant's actual HTTP contract are all exercised against real
+  services, but embeddings come from a small fake, deterministic provider — **no real Ollama
+  container runs and no model is pulled** as part of this first suite.
+- **MinIO and a real-Ollama smoke suite are not part of this first suite** — real-Ollama
+  verification is left for a future manual/nightly smoke suite, not the everyday integration run.
+- **Containers and all state are removed after the test session** — nothing persists between
+  runs, and nothing is written outside the ephemeral containers themselves.
+
+Run it with:
+
+```bash
+make test-integration     # pytest -m integration -q
+make verify-integration   # runs the integration suite (room for future integration-specific checks)
+```
 
 ## Pre-commit verification
 
@@ -636,5 +666,10 @@ token (for `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` it streams a fixed message with
 no LLM call) — with no silent fallback between decisions or providers on failure. `POST
 /api/v1/chat` now exposes it publicly as Server-Sent Events (`metadata`/`token`/`done`/`error`),
 via a thin route with no orchestration logic of its own — see "Streaming chat endpoint" above.
-Conversation memory/multi-turn context and a model-override parameter are not implemented — see
+Conversation memory/multi-turn context and a model-override parameter are not implemented. A new
+Testcontainers-based integration suite (`tests/integration/`, `make test-integration`) now backs
+migrations, `IngestionWorker`'s real Postgres locking behavior, and `QdrantVectorStore`'s real
+HTTP contract with genuine ephemeral containers — separate from the fast unit suite and from
+`docker-compose.yml` — while still using fake, deterministic AI providers instead of a real
+Ollama model — see "Integration tests" above and "Test architecture" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
