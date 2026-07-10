@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     qdrant_collection_name: str = Field(default="documents", alias="QDRANT_COLLECTION_NAME")
     vector_size: int = Field(default=768, alias="VECTOR_SIZE")
 
+    retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K")
+    retrieval_score_threshold: float | None = Field(
+        default=None, alias="RETRIEVAL_SCORE_THRESHOLD"
+    )
+
     @property
     def resolved_llm_model(self) -> str:
         """Return LLM_MODEL if set, else OLLAMA_CHAT_MODEL for backward compatibility."""

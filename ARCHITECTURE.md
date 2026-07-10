@@ -313,6 +313,33 @@ chunking failure — `IngestionWorker` catches it and marks the job `FAILED` wit
 `error_message = str(exception)`. `IngestionWorker` still never imports or calls `LLMProvider` —
 this pipeline embeds and indexes, it never generates text.
 
+## Retrieval service
+
+`RetrievalService` (`app/rag/retrieval_service.py`) is the internal read-side counterpart to
+chunk embedding/indexing: given a query, it embeds it and searches Qdrant for relevant chunks —
+**no public retrieval/chat/SSE endpoint exists yet, no LLM call is made, and no RAG prompt is
+assembled**.
+
+`retrieve(query: str, limit: int | None = None) -> list[VectorSearchResult]`:
+
+1. **Validate**: an empty/whitespace-only `query` raises `EmptyQueryError` before any provider is
+   called.
+2. **Embed**: `get_embedding_provider()` (reads `EMBEDDING_PROVIDER`) embeds the query text —
+   `embedding_provider.embed([query])[0]` — using the same fixed embedding model ingestion used,
+   so query and chunk vectors stay comparable.
+3. **Search**: `get_vector_store()` (reads `VECTOR_STORE_PROVIDER`) runs
+   `search_similar(QDRANT_COLLECTION_NAME, query_vector, limit)`, where `limit` is the caller's
+   explicit `limit` if given, else `RETRIEVAL_TOP_K`. Qdrant returns results already ordered by
+   score, and `RetrievalService` preserves that order.
+4. **Threshold filter**: if `RETRIEVAL_SCORE_THRESHOLD` is set, results scoring below it are
+   dropped; left unset (`None`), no score filtering happens.
+
+Each returned `VectorSearchResult` preserves `document_id`, `chunk_id`, `text`, `source`,
+`page_number`, `sheet_name`, and `score`. A failure in either the embedding provider or the
+vector store propagates unchanged — `RetrievalService` does not catch or wrap it — and zero
+matching results (or all filtered out by the threshold) simply return an empty list rather than
+fabricating context. `RetrievalService` never imports or calls `LLMProvider`.
+
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -372,6 +399,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `CHUNK_OVERLAP`            | `200`                                                                  | Overlap between consecutive chunks in characters, used by `DocumentChunker` |
 | `QDRANT_COLLECTION_NAME`   | `documents`                                                            | Collection `IngestionWorker` creates (if missing) and upserts chunk vectors into |
 | `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality passed to `create_collection_if_not_exists` — must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors) |
+| `RETRIEVAL_TOP_K`          | `5`                                                                    | Default number of results `RetrievalService.retrieve()` asks Qdrant for, when no explicit `limit` is passed |
+| `RETRIEVAL_SCORE_THRESHOLD`| *(unset)*                                                              | Minimum Qdrant score a result must meet to be returned; unset/`null` disables score filtering |
 
 ## Current boundaries
 
@@ -395,6 +424,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction" above); and
   `DocumentChunker` (`app/services/document_chunker.py`), which splits an `ExtractedDocument`
   into `DocumentChunk`s (see "Document chunking" above).
+- `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
+  ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
+  `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
+  `LLMProvider`.
 - `app/rag/providers` — abstract interfaces for embedding, LLM, and vector store providers, a
   `provider_factory.py` that resolves the configured implementation for each (see "Provider
   factory" above), and three concrete implementations:
@@ -409,8 +442,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     endpoint.
   - `QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) — calls Qdrant's HTTP API
     for collection create/upsert/search only (see "Vector store" above). Internal-only — no
-    document upload, no chat/SSE endpoint, no full RAG flow; `IngestionWorker` is its only
-    caller so far.
+    document upload, no chat/SSE endpoint, no full RAG flow; `IngestionWorker` (write side) and
+    `RetrievalService` (read side) are its only callers so far.
 
   Three future-provider stubs also exist — `OpenAIProvider`, `GeminiProvider`,
   `AnthropicProvider` (`app/rag/providers/{openai,gemini,anthropic}_provider.py`) — which
@@ -426,14 +459,15 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 ## What is intentionally not implemented yet
 
-- Retrieval of any kind — chunk vectors are indexed into Qdrant, but nothing queries them back out
+- A public retrieval endpoint — `RetrievalService` can embed a query and search Qdrant
+  internally, but nothing exposes it over the API yet
 - Persisting extracted text or chunks in Postgres — `DocumentChunker`'s output is only persisted
   as vectors in Qdrant (via the embedding/upsert step); there's no relational table for chunk text
 - Anything that continuously runs `IngestionWorker.process_next_job()` in a loop (no scheduler
   or long-running process invokes it yet — it's called directly, one job at a time)
 - A public chat/query endpoint (including SSE streaming to clients)
-- A public API endpoint for embeddings, vector store, chunking, or decision-layer operations
-  (all internal-only)
+- A public API endpoint for embeddings, vector store, chunking, retrieval, or decision-layer
+  operations (all internal-only)
 - An LLM-based (as opposed to rule-based) question router
 - Any pipeline wiring the decision layer, LLM generation, and retrieval into a full RAG flow
 - Auth, rate limiting, observability/logging pipeline
