@@ -533,11 +533,11 @@ polled at different rates by different consumers.
   dependency being temporarily down is *not* a reason to restart this process, so liveness must
   stay independent of every external service.
 - **`GET /health/ready`** (readiness) — "can this instance actually serve traffic right now."
-  Runs `app/services/platform_health.run_all_checks()` and returns `200` only if every
-  **required** check passes, else `503`. This is what a Kubernetes `readinessProbe` and a load
-  balancer's health check should point at: `503` here means "stop routing traffic to this
-  instance," not "restart it" — `live` can (and often will) stay `200` while `ready` is `503`
-  (e.g. Qdrant is temporarily unreachable but the process itself is fine).
+  Calls `app/services/platform_health.get_readiness_result()`, which runs every check and
+  returns `200` only if every **required** check passes, else `503`. This is what a Kubernetes
+  `readinessProbe` and a load balancer's health check should point at: `503` here means "stop
+  routing traffic to this instance," not "restart it" — `live` can (and often will) stay `200`
+  while `ready` is `503` (e.g. Qdrant is temporarily unreachable but the process itself is fine).
 - **`GET /health/dependencies`** — the same checks as readiness, but always returns `200` with
   the full per-dependency detail in the body (`status` per check, `required` per check, a safe
   `detail` string on failure). Intended for monitoring/alerting dashboards and human debugging,
@@ -568,6 +568,26 @@ should be revisited the moment any code path starts using `REDIS_URL`.
 Every `DependencyCheckResult`'s `detail` is a fixed, generic string per failure mode (e.g.
 `"Postgres is unreachable."`) — none of the checks ever return a raw exception message, a
 connection string, a credential, or a provider's raw response body to the client.
+
+**Thin-controller route, aggregation in the service layer**: `app/api/routes/health.py`'s
+`readiness`/`dependencies` handlers do only three things — resolve `Settings` via `Depends`, call
+one function in `app/services/platform_health.py`, and apply the status code / return the body
+that function already produced. All required-check filtering, failed-check calculation, overall
+status calculation, and safe error-summary construction live in the service module as pure,
+synchronous, directly-unit-testable functions:
+
+- `build_readiness_result(checks) -> ReadinessResult` — `ReadinessResult` is a small dataclass
+  (`response: ReadinessResponse`, `status_code: int`) so the route never computes `200`/`503`
+  itself, it only copies a value the service already decided.
+- `build_dependencies_response(checks) -> DependenciesResponse`
+- `get_readiness_result(settings)`/`get_dependencies_response(settings)` — thin async wrappers
+  that call `run_all_checks(settings)` then delegate to the two functions above; these are what
+  the route actually calls.
+
+This mirrors how `POST /api/v1/chat` (see "Streaming chat endpoint" above) stays a thin route
+over `RagOrchestrator` — routes handle HTTP concerns (validation, dependency injection, status
+codes, response shape) and delegate everything else to a service; see the standing rule in
+[CLAUDE.md](CLAUDE.md).
 
 **Future DevOps consumers** this contract is designed for (none wired up yet in this repository):
 Kubernetes liveness/readiness probes, load balancer health checks, ArgoCD rollout health checks

@@ -177,6 +177,30 @@ def get_settings() -> Settings:
   API is ever versioned to `/api/v2`, `/health*` stays exactly where it is — this is the whole
   point of keeping it unversioned in the first place.
 
+## Route Layer Style
+
+- **Keep FastAPI route handlers thin.** A route function should do only: request
+  validation/parsing (via the Pydantic request schema), dependency injection (`Depends(...)`),
+  one call into a service function, applying whatever HTTP status the service already decided,
+  and returning the response body/model the service already built. No business logic, no
+  aggregation (filtering, counting, computing an overall status, building an error summary), and
+  no direct provider/database calls belong in a route module.
+- **Business/aggregation logic lives in the service layer**, as small, well-named, independently
+  unit-testable functions — prefer pure, synchronous functions for pure computation (e.g.
+  `build_readiness_result(checks)`) separate from the async I/O-performing orchestration around
+  them (e.g. `get_readiness_result(settings)`), so aggregation logic can be tested without
+  mocking any I/O at all.
+- **Prefer a typed result object over route-side status-code logic** when a service needs to
+  communicate both a response body and an HTTP status back to a route — see
+  `platform_health.ReadinessResult` (`response` + `status_code`) for the pattern. The route
+  should only ever copy `result.status_code` onto the response, never re-derive it.
+- **Established examples**: `POST /api/v1/chat` (`app/api/v1/routes/chat.py`) delegates entirely
+  to `RagOrchestrator`; `GET /health/ready`/`GET /health/dependencies`
+  (`app/api/routes/health.py`) delegate entirely to `app/services/platform_health.py`. When
+  adding a new route with any nontrivial logic, follow the same split — and if a review finds
+  aggregation/business logic creeping into a route module, that's a bug to fix, not a style
+  nitpick to defer.
+
 ## Pull Request Workflow
 
 - **Verify GitHub CLI before any GitHub operation.** Run `gh --version` and `gh auth status`
