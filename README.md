@@ -423,6 +423,39 @@ is fabricated — and `sources` is an empty list; this no-results path is exactl
 as the normal path. `RagPromptBuilder` is pure and synchronous: it doesn't mutate the
 `VectorSearchResult`s it's given and never imports or calls `LLMProvider`.
 
+### RAG orchestrator
+
+`RagOrchestrator` (`app/rag/orchestrator.py`) composes the decision layer, retrieval service,
+prompt builder, and streaming LLM provider into a single call — **no public endpoint yet, no
+conversation memory, and no silent fallback between decisions or providers**:
+
+```python
+from app.rag.orchestrator import RagOrchestrator
+
+async for event in RagOrchestrator().stream_answer("what is the refund policy?"):
+    print(event)
+# OrchestratorMetadata(decision=..., reason=..., retrieval_used=..., sources=[...])
+# OrchestratorToken(text="...")
+# OrchestratorToken(text="...")
+# ...
+```
+
+`stream_answer(question)` routes the question through `RuleBasedRagDecider.decide(...)` first:
+
+- **`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`**: streams one `OrchestratorMetadata`
+  (`retrieval_used=False`) followed by a single fixed `OrchestratorToken` message — no
+  `RetrievalService` call and no `LLMProvider` call at all.
+- **`NEEDS_RETRIEVAL`**: calls `RetrievalService.retrieve(question)`, builds a prompt via
+  `RagPromptBuilder`, streams one `OrchestratorMetadata` (`retrieval_used=True`, `sources` from
+  the built prompt), then streams `OrchestratorToken`s from `LLMProvider.stream_generate(...)`
+  as they arrive.
+- **`DIRECT_LLM`**: streams one `OrchestratorMetadata` (`retrieval_used=False`, no sources), then
+  streams `OrchestratorToken`s from the LLM directly, without calling retrieval.
+
+A failure in `RetrievalService` or the LLM provider (`get_llm_provider()`, reads `LLM_PROVIDER`)
+propagates to the caller unchanged — `RagOrchestrator` never catches it to fall back from
+retrieval to a direct answer, and never silently switches providers.
+
 ## Verification
 
 A `Makefile` wraps all quality gates behind one command:
@@ -554,8 +587,11 @@ loop — given a query, it embeds it via `get_embedding_provider()` and searches
 turns a question and those ranked results into a deterministic `BuiltRagPrompt`
 (`system_prompt`/`user_prompt`/`context`/`sources`) with stable `[S1]`/`[S2]`/... source labels,
 filename/page/sheet attribution, and instructions to answer only from context and say when the
-answer isn't present — but it is not wired to any public endpoint yet, and neither it nor
-`RetrievalService` makes an LLM call. A public retrieval/chat/query endpoint and any pipeline
-wiring the decision layer, LLM provider, ingestion worker, and prompt builder together into a
-full RAG flow are not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list
-of what's intentionally deferred.
+answer isn't present. An internal `RagOrchestrator` now wires the decision layer, retrieval
+service, prompt builder, and streaming `LLMProvider` together: `stream_answer(question)` routes
+via `RuleBasedRagDecider`, and for `NEEDS_RETRIEVAL`/`DIRECT_LLM` streams the LLM's answer token
+by token (for `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` it streams a fixed message with no retrieval
+and no LLM call) — with no silent fallback between decisions or providers on failure. It is not
+wired to any public endpoint yet. A public chat/query endpoint (including SSE streaming to
+clients) is not yet implemented — see [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
+what's intentionally deferred.
