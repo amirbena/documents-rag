@@ -18,14 +18,66 @@ environment variable reference.
 - Docker Compose
 - pytest, ruff, mypy
 
+## Prerequisites
+
+- Python 3.11+
+- Docker
+- Docker Compose (bundled with modern Docker Desktop/Docker Engine — check with
+  `docker compose version`)
+- Git
+- [GitHub CLI](https://cli.github.com/) (`gh`) — only needed for the repository/PR workflow
+  (opening/reviewing pull requests), not for running the app itself
+
 ## Local setup
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-```
+First-time onboarding, in order — later sections below go into more detail on each step:
+
+1. **Verify prerequisites**: `python3 --version`, `docker --version`, `docker compose version`,
+   `git --version` (and `gh --version` / `gh auth status` if you'll be opening PRs).
+2. **Create and activate a virtual environment**:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+3. **Install dependencies**:
+   ```bash
+   pip install -e ".[dev]"
+   ```
+4. **Copy the environment file**:
+   ```bash
+   cp .env.example .env
+   ```
+5. **Start Docker Compose** (see "Running with Docker Compose" below for the full walkthrough):
+   ```bash
+   docker compose up --build
+   ```
+6. **Run Alembic migrations** — Docker Compose starts Postgres but does not apply migrations
+   automatically (see "Database migrations" below):
+   ```bash
+   docker compose exec app alembic upgrade head
+   ```
+7. **Verify app health**:
+   ```bash
+   curl http://localhost:8000/api/v1/health
+   # {"status":"ok","environment":"local"}
+   ```
+8. **Pull the required Ollama models** (see "Running with Docker Compose" below):
+   ```bash
+   docker compose exec ollama ollama pull llama3.1
+   docker compose exec ollama ollama pull nomic-embed-text
+   ```
+9. **Verify Ollama health**:
+   ```bash
+   curl http://localhost:8000/api/v1/providers/ollama/health
+   ```
+10. **Install the Git pre-commit hook** (see "Pre-commit verification" below):
+    ```bash
+    ./scripts/install-git-hooks.sh
+    ```
+11. **Run the full verification suite**:
+    ```bash
+    make verify
+    ```
 
 Running the API directly (without Docker) requires reachable Postgres/Redis/Qdrant/Ollama —
 easiest to get via `docker compose up postgres redis qdrant ollama` and point `.env` at
@@ -77,15 +129,19 @@ uvicorn app.main:app --reload
 ## Running with Docker Compose
 
 ```bash
-cp .env.example .env
 docker compose up --build
 ```
+
+(If you haven't already, copy `.env.example` to `.env` first — see "Local setup" above.)
 
 This starts `app`, `postgres`, `redis`, `qdrant`, and `ollama`. The app is available at
 http://localhost:8000, with health check at `GET /api/v1/health`. Verified working end-to-end:
 all five containers start, the health endpoint responds `{"status":"ok","environment":"local"}`
 from the host, and the `app` container can reach `postgres:5432`, `redis:6379`, `qdrant:6333`,
 and `ollama:11434` over the internal Compose network.
+
+Once the `app`/`postgres` containers are up, run the Alembic migrations — see "Database
+migrations" below — before pulling Ollama models or testing document upload.
 
 To pull the required Ollama models after the `ollama` service is up:
 
@@ -166,6 +222,31 @@ print(result.decision, result.reason, result.confidence)
 
 It's internal-only — no public API endpoint exposes it, and it doesn't perform retrieval,
 generation, ingestion, or document upload itself; it only decides what *should* happen next.
+
+## Database migrations
+
+**Docker Compose currently starts services but does not apply Alembic migrations
+automatically** — `docker compose up` brings up a fresh, unmigrated Postgres, so the schema must
+be created explicitly before the app can persist anything. The `documents` and `ingestion_jobs`
+tables (see [ARCHITECTURE.md](ARCHITECTURE.md)) are required by `POST /api/v1/documents` — that
+endpoint will fail against an unmigrated database.
+
+Run migrations after the `postgres`/`app` containers are up and **before** testing document
+upload:
+
+```bash
+docker compose exec app alembic upgrade head
+```
+
+If you're instead running the app locally with an activated virtual environment (see "Local
+setup" above), and Postgres is reachable (e.g. via `docker compose up postgres`), run:
+
+```bash
+alembic upgrade head
+```
+
+See [alembic/README.md](alembic/README.md) for how migrations are structured, how to generate a
+new one, and the full list of Alembic commands used in this project.
 
 ### Document upload
 

@@ -44,16 +44,28 @@ starting point, not a guarantee of correctness.
 
 ## Applying migrations
 
+Docker Compose starts Postgres but does not apply migrations automatically — run this once the
+`app`/`postgres` containers are up (recommended, matches the containerized app environment):
+
+```bash
+docker compose exec app alembic upgrade head
+```
+
+Or, with an activated local virtual environment and Postgres reachable directly:
+
 ```bash
 alembic upgrade head
 ```
+
+See the root [README.md](../README.md#database-migrations) "Database migrations" section for
+when this fits into the onboarding flow.
 
 ## Common commands
 
 | Command | Purpose |
 |---|---|
 | `alembic revision --autogenerate -m "message"` | Generate a new migration from model changes |
-| `alembic upgrade head` | Apply all pending migrations |
+| `alembic upgrade head` | Apply all pending migrations (run locally; use `docker compose exec app alembic upgrade head` when running via Docker) |
 | `alembic downgrade -1` | Roll back the most recent migration |
 
 ## Current status
