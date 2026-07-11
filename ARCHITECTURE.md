@@ -27,7 +27,7 @@ Qdrant upsert all succeed.
 | `postgres` | `postgres:16-alpine`     | Stores `documents`/`ingestion_jobs` rows via async SQLAlchemy     | Session/metadata storage |
 | `redis`    | `redis:7-alpine`         | Available on the network                                         | Caching, task queues |
 | `qdrant`   | `qdrant/qdrant:latest`   | Collection create/upsert/search via `QdrantVectorStore`           | Backing document retrieval in a future RAG flow |
-| `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`nomic-embed-text`) + streaming generation (`llama3.1`) | Backing a future public chat endpoint |
+| `ollama`   | `ollama/ollama:latest`   | Health/model checks + embeddings (`bge-m3`) + streaming generation (`llama3.1`) | Backing a future public chat endpoint |
 
 The app queries Ollama's `/api/tags` endpoint (via `app/services/ollama_client.py`) to check
 reachability and whether the configured models are pulled, calls `/api/embeddings` (via
@@ -548,7 +548,7 @@ configurations. Every field is validated non-empty/positive at construction — 
 Must Be Explicit" below.
 
 `EmbeddingIndexConfig.collection_name` derives a deterministic, sanitized Qdrant collection name
-from all five fields (`documents__ollama__nomic-embed-text__ev1__cv1__d768`-shaped) — changing
+from all five fields (`documents__ollama__bge-m3__ev2__cv1__d1024`-shaped) — changing
 *any* field (a different model, dimension, embedding version, or chunking version) always
 produces a different collection name, so incompatible vectors can never land in the same
 collection. `QDRANT_COLLECTION_NAME` now serves as the `collection_prefix` input to this
@@ -675,22 +675,33 @@ below) unchanged — this milestone adds no new serialization path.
 
 ### Multilingual embedding model selection
 
-`OLLAMA_EMBEDDING_MODEL`'s Python-level default stays `nomic-embed-text` (768-dim,
-English-oriented) for backward compatibility — no existing deployment's behavior changes merely
-by upgrading. For genuine multilingual (Hebrew + English) retrieval quality, `.env.example`
-documents pulling and switching to `bge-m3` (1024-dim, BAAI's multilingual embedding model
-supporting 100+ languages including Hebrew) via `ollama pull bge-m3` + `EMBEDDING_MODEL=bge-m3` +
-`VECTOR_SIZE=1024` — always alongside an `EMBEDDING_VERSION` bump, so the change goes through a
-real re-index rather than silently reusing an incompatible collection. Automated tests
-(unit/integration/E2E) never depend on a real embedding model or download — they use
-`MultilingualFakeEmbeddingProvider` (`tests/multilingual_fixtures.py`), a deterministic
+`OLLAMA_EMBEDDING_MODEL`'s Python-level default is **`bge-m3`** (1024-dim, BAAI's embedding model
+supporting 100+ languages including Hebrew) — this is the actual default runtime configuration,
+not merely a documented override; a fresh installation must run `ollama pull bge-m3` before
+ingesting documents. `EMBEDDING_VERSION`'s default moved from `v1` to `v2` in the same change, so
+an installation upgrading from Phase 2.5 (which defaulted to `nomic-embed-text`/768-dim/`v1`)
+never silently reuses that now-incompatible collection: the active `EmbeddingIndexConfig`'s
+`collection_name` changes, existing documents are reported stale by `is_document_stale()`, and
+must go through `reindex_document()` (see "Re-index and collection migration" below) to be
+searchable again under the new config. **The previous `nomic-embed-text`/`v1` collection and its
+vectors are never deleted automatically** — `retire_collection()` remains a bookkeeping-only
+status flip.
+
+The legacy English-oriented `nomic-embed-text` (768-dim) model remains configurable — set
+`EMBEDDING_MODEL=nomic-embed-text` + `VECTOR_SIZE=768` + `EMBEDDING_VERSION=v1` — but
+`.env.example`/README no longer present it as the recommended default; it is documented only as
+an explicit opt-out for installations that don't need Hebrew retrieval.
+
+Automated tests (unit/integration/E2E) never depend on a real embedding model or download — they
+use `MultilingualFakeEmbeddingProvider` (`tests/multilingual_fixtures.py`), a deterministic
 bag-of-concepts hashing embedding with a small Hebrew/English synonym table (e.g. "vacation" and
 "חופשה" hash to the same dimension), so equivalent cross-language concepts score genuinely
 higher than an unrelated distractor — this demonstrates the retrieval *wiring* works
-cross-language, not real multilingual model quality. A real `bge-m3` evaluation requires a
-separate, manual run against an actual Ollama instance; this project's automated suites
-deliberately never pull or call a real embedding/LLM model (see "AI-provider policy in tests"
-below).
+cross-language, not real multilingual model quality. See "Real multilingual runtime smoke" below
+for an optional, manual, non-blocking check against a real `bge-m3` Ollama model; broader
+recall/ranking evaluation on a larger corpus remains future work, and this project's automated
+suites deliberately never pull or call a real embedding/LLM model (see "AI-provider policy in
+tests" below).
 
 ## Streaming chat endpoint
 
@@ -969,7 +980,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `QDRANT_URL`               | `http://qdrant:6333`                                                  | Used by `QdrantVectorStore` for collection/upsert/search; also checked by `GET /health/ready`/`/health/dependencies` |
 | `OLLAMA_BASE_URL`          | `http://ollama:11434`                                                 | Used by `OllamaClient` for health/model checks (also reused by `GET /health/ready`/`/health/dependencies`) |
 | `OLLAMA_CHAT_MODEL`        | `llama3.1`                                                             | Checked for availability; backward-compatible fallback for `LLM_MODEL` if unset |
-| `OLLAMA_EMBEDDING_MODEL`   | `nomic-embed-text`                                                     | Checked for availability; always used by `OllamaEmbeddingProvider` — fixed, not selectable via `LLM_MODEL` |
+| `OLLAMA_EMBEDDING_MODEL`   | `bge-m3`                                                     | Checked for availability; always used by `OllamaEmbeddingProvider` — fixed, not selectable via `LLM_MODEL` |
 | `LLM_PROVIDER`             | `ollama`                                                               | Selects the `LLMProvider` implementation; `openai`/`gemini`/`anthropic` are recognized stubs |
 | `LLM_MODEL`                | *(unset)*                                                              | Selects the model `OllamaLLMProvider` uses; falls back to `OLLAMA_CHAT_MODEL` if unset (see "LLM provider vs. model") |
 | `EMBEDDING_PROVIDER`       | `ollama`                                                               | Selects the `EmbeddingProvider` implementation via the provider factory |
@@ -977,12 +988,12 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `CHUNK_SIZE`               | `1000`                                                                 | Target chunk size in characters, used by `DocumentChunker` |
 | `CHUNK_OVERLAP`            | `200`                                                                  | Overlap between consecutive chunks in characters, used by `DocumentChunker` |
 | `QDRANT_COLLECTION_NAME`   | `documents`                                                            | The **prefix/namespace** `EmbeddingIndexConfig.collection_name` derives the real, versioned Qdrant collection name from (see "Multilingual RAG Foundation") — not a literal collection name by itself |
-| `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality — part of the active `EmbeddingIndexConfig`; must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors; `bge-m3` produces 1024) |
+| `VECTOR_SIZE`              | `1024`                                                                  | Vector dimensionality — part of the active `EmbeddingIndexConfig`; must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors; `bge-m3` produces 1024) |
 | `RETRIEVAL_TOP_K`          | `5`                                                                    | Default number of results `RetrievalService.retrieve()` asks Qdrant for, when no explicit `limit` is passed |
 | `RETRIEVAL_SCORE_THRESHOLD`| *(unset)*                                                              | Minimum Qdrant score a result must meet to be returned; unset/`null` disables score filtering |
 | `RAG_ENGINE`               | `custom`                                                               | Selects the `RagEngine` implementation via `get_rag_engine()` (see "RAG Engine Compatibility Layer"); `langchain` is the only other recognized value — anything else raises `UnsupportedRagEngineError` |
 | `EMBEDDING_MODEL`          | *(unset)*                                                              | Generic, provider-agnostic embedding model override; falls back to `OLLAMA_EMBEDDING_MODEL` if unset (same pattern as `LLM_MODEL`/`OLLAMA_CHAT_MODEL`) — part of the active `EmbeddingIndexConfig` |
-| `EMBEDDING_VERSION`        | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever the embedding model/dimension changes meaningfully, to roll onto a new Qdrant collection instead of silently mixing incompatible vectors |
+| `EMBEDDING_VERSION`        | `v2`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever the embedding model/dimension changes meaningfully, to roll onto a new Qdrant collection instead of silently mixing incompatible vectors |
 | `CHUNKING_VERSION`         | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever `CHUNK_SIZE`/`CHUNK_OVERLAP`/the chunking algorithm changes meaningfully |
 | `DEFAULT_RESPONSE_LANGUAGE`| `en`                                                                   | Fallback language `ScriptBasedLanguageDetector` resolves to when a question has no Hebrew/Latin words at all, or an exact word-count tie; must be `he` or `en` |
 | `PROMPT_CATALOG_VERSION`   | `v1`                                                                   | Stamped onto every `ResolvedPrompt.prompt_version` — see "Multilingual RAG Foundation" |

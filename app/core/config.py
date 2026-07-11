@@ -29,7 +29,10 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = Field(default="http://ollama:11434", alias="OLLAMA_BASE_URL")
     ollama_chat_model: str = Field(default="llama3.1", alias="OLLAMA_CHAT_MODEL")
-    ollama_embedding_model: str = Field(default="nomic-embed-text", alias="OLLAMA_EMBEDDING_MODEL")
+    # bge-m3 is the default: a genuinely multilingual (100+ languages, including Hebrew) Ollama
+    # embedding model, 1024-dim. See "Multilingual embedding model" in ARCHITECTURE.md for the
+    # selection rationale and the migration note for installations still on nomic-embed-text.
+    ollama_embedding_model: str = Field(default="bge-m3", alias="OLLAMA_EMBEDDING_MODEL")
 
     llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
     llm_model: str | None = Field(default=None, alias="LLM_MODEL")
@@ -41,7 +44,10 @@ class Settings(BaseSettings):
     # either requires bumping EMBEDDING_VERSION (see app/rag/embedding_config.py); the active
     # EmbeddingIndexConfig, not this setting alone, decides which Qdrant collection is used.
     embedding_model: str | None = Field(default=None, alias="EMBEDDING_MODEL")
-    embedding_version: str = Field(default="v1", alias="EMBEDDING_VERSION")
+    # v2: bumped alongside the nomic-embed-text -> bge-m3 default-model change, so installations
+    # upgrading from Phase 2.5's v1 land in a new, distinct Qdrant collection rather than
+    # silently reusing one built from 768-dim nomic-embed-text vectors under a bge-m3 config.
+    embedding_version: str = Field(default="v2", alias="EMBEDDING_VERSION")
     chunking_version: str = Field(default="v1", alias="CHUNKING_VERSION")
 
     chunk_size: int = Field(default=1000, alias="CHUNK_SIZE")
@@ -51,7 +57,9 @@ class Settings(BaseSettings):
     # versioned Qdrant collection name from (see app/rag/embedding_config.py) — not a literal
     # collection name by itself once versioned collections are in play.
     qdrant_collection_name: str = Field(default="documents", alias="QDRANT_COLLECTION_NAME")
-    vector_size: int = Field(default=768, alias="VECTOR_SIZE")
+    # 1024 matches bge-m3's output dimension (the default embedding model above). Installations
+    # pinned to the legacy nomic-embed-text (768-dim) must set VECTOR_SIZE=768 explicitly.
+    vector_size: int = Field(default=1024, alias="VECTOR_SIZE")
 
     retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K")
     retrieval_score_threshold: float | None = Field(

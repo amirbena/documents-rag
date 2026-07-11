@@ -14,7 +14,7 @@ environment variable reference.
 - Python 3.11+, FastAPI, Pydantic v2
 - SQLAlchemy 2.x (async) + Alembic
 - PostgreSQL, Redis, Qdrant
-- Ollama (local LLM + embeddings): `llama3.1` for chat, `nomic-embed-text` for embeddings
+- Ollama (local LLM + embeddings): `llama3.1` for chat, `bge-m3` for multilingual embeddings
 - Docker Compose
 - pytest, ruff, mypy
 
@@ -66,7 +66,7 @@ First-time onboarding, in order — later sections below go into more detail on 
 8. **Pull the required Ollama models** (see "Running with Docker Compose" below):
    ```bash
    docker compose exec ollama ollama pull llama3.1
-   docker compose exec ollama ollama pull nomic-embed-text
+   docker compose exec ollama ollama pull bge-m3
    ```
 9. **Verify Ollama health**:
    ```bash
@@ -149,7 +149,7 @@ To pull the required Ollama models after the `ollama` service is up:
 
 ```bash
 docker compose exec ollama ollama pull llama3.1
-docker compose exec ollama ollama pull nomic-embed-text
+docker compose exec ollama ollama pull bge-m3
 ```
 
 Check whether Ollama is reachable and those models are pulled via:
@@ -607,14 +607,20 @@ Question -> LanguageDetector -> PromptProvider -> PromptCatalog -> ResolvedPromp
   private constant. Governance instructions require answering only from context, in the query's
   language, preserving quoted source text and `[S1]`/`[S2]` labels untranslated, and never
   translating code/API names/class names/environment variables/command names.
-- **Multilingual embedding model** — `OLLAMA_EMBEDDING_MODEL` stays `nomic-embed-text` (768-dim)
-  by default for backward compatibility; `.env.example` documents pulling and switching to
-  `bge-m3` (1024-dim, genuinely multilingual) via `ollama pull bge-m3` +
-  `EMBEDDING_MODEL=bge-m3` + `VECTOR_SIZE=1024` + an `EMBEDDING_VERSION` bump. Automated tests
-  never depend on a real embedding model — they use a deterministic fake
-  (`tests/multilingual_fixtures.py`) with a small Hebrew/English concept-synonym table, which
-  proves the retrieval *wiring* works cross-language, not real model quality; a real `bge-m3`
-  evaluation is a separate, manual exercise.
+- **Multilingual embedding model** — `OLLAMA_EMBEDDING_MODEL` defaults to `bge-m3` (1024-dim,
+  BAAI's embedding model supporting 100+ languages including Hebrew); requires
+  `ollama pull bge-m3`. `EMBEDDING_VERSION` defaults to `v2` alongside this default-model change,
+  so any pre-existing installation built on Phase 2.5's `v1`/`nomic-embed-text` (768-dim) config
+  never silently reuses that collection — it re-indexes into a new one. `.env.example` documents
+  pinning back to the legacy English-only `nomic-embed-text` (768-dim, NOT recommended for
+  Hebrew content) via `EMBEDDING_MODEL=nomic-embed-text` + `VECTOR_SIZE=768` +
+  `EMBEDDING_VERSION=v1`. **Changing the embedding model always creates a new versioned
+  collection and requires document re-indexing** — the previous collection's vectors are never
+  deleted automatically. Automated tests never depend on a real embedding model — they use a
+  deterministic fake (`tests/multilingual_fixtures.py`) with a small Hebrew/English
+  concept-synonym table, which proves the retrieval *wiring* works cross-language, not real model
+  retrieval quality; see "Real multilingual runtime smoke" below for an optional, manual
+  real-`bge-m3` check — broader recall/ranking evaluation on a larger corpus remains future work.
 
 See "Multilingual RAG Foundation" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, and
 run the multilingual-specific tests with:

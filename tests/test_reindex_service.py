@@ -5,11 +5,20 @@ no real database (a minimal fake AsyncSession is enough since only .commit()/.ge
 import uuid
 from pathlib import Path
 
+import pytest
+
 import app.services.reindex_service as reindex_service_module
+from app.core.config import get_settings
 from app.models.document import Document
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorPoint
 from app.services.reindex_service import reindex_document
+
+
+@pytest.fixture(autouse=True)
+def _fake_embedding_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Match the active config's dimension to _FakeEmbeddingProvider's 3-dim output."""
+    monkeypatch.setattr(get_settings(), "vector_size", 3)
 
 
 class _FakeEmbeddingProvider:

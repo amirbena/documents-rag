@@ -1,10 +1,18 @@
 """Tests for RetrievalService against fake embedding/vector-store providers — no real network."""
 
+import pytest
+
 import app.rag.retrieval_service as retrieval_service_module
 from app.core.config import Settings, get_settings
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorSearchResult
 from app.rag.retrieval_service import EmptyQueryError, RetrievalService
+
+
+@pytest.fixture(autouse=True)
+def _fake_embedding_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Match the active config's dimension to _FakeEmbeddingProvider's 3-dim output."""
+    monkeypatch.setattr(get_settings(), "vector_size", 3)
 
 
 class _FakeEmbeddingProvider:
@@ -96,7 +104,7 @@ async def test_default_top_k_is_used(monkeypatch) -> None:
     """retrieve() without an explicit limit should search with RETRIEVAL_TOP_K."""
     vector_store = _FakeVectorStore()
     _patch_providers(monkeypatch, _FakeEmbeddingProvider(), vector_store)
-    settings = Settings(RETRIEVAL_TOP_K=7)
+    settings = Settings(RETRIEVAL_TOP_K=7, VECTOR_SIZE=3)
 
     await RetrievalService(settings=settings).retrieve("policy question")
 
@@ -107,7 +115,7 @@ async def test_explicit_limit_overrides_default(monkeypatch) -> None:
     """A limit passed to retrieve() should override RETRIEVAL_TOP_K."""
     vector_store = _FakeVectorStore()
     _patch_providers(monkeypatch, _FakeEmbeddingProvider(), vector_store)
-    settings = Settings(RETRIEVAL_TOP_K=7)
+    settings = Settings(RETRIEVAL_TOP_K=7, VECTOR_SIZE=3)
 
     await RetrievalService(settings=settings).retrieve("policy question", limit=2)
 
@@ -157,7 +165,7 @@ async def test_threshold_filters_low_score_results(monkeypatch) -> None:
     results = [_result("chunk-1", 0.9), _result("chunk-2", 0.3)]
     vector_store = _FakeVectorStore(results=results)
     _patch_providers(monkeypatch, _FakeEmbeddingProvider(), vector_store)
-    settings = Settings(RETRIEVAL_SCORE_THRESHOLD=0.5)
+    settings = Settings(RETRIEVAL_SCORE_THRESHOLD=0.5, VECTOR_SIZE=3)
 
     returned = await RetrievalService(settings=settings).retrieve("policy question")
 

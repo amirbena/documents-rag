@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.models.document import Document
 from app.rag.embedding_config import get_active_embedding_config
+from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.services.document_chunker import DocumentChunker
 from app.services.document_text_extractor import DocumentTextExtractor
@@ -53,6 +54,7 @@ async def reindex_document(
     if chunks:
         embedding_provider = get_embedding_provider(settings)
         vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
+        validate_embeddings(vectors, expected_count=len(chunks), expected_dimension=active_config.dimension)
         points = [
             to_vector_point(chunk, vector, document.original_filename)
             for chunk, vector in zip(chunks, vectors, strict=True)

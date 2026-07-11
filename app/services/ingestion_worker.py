@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
+from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunk, DocumentChunker
@@ -66,6 +67,7 @@ async def _default_process_document(
 
     embedding_provider = get_embedding_provider(settings)
     vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
+    validate_embeddings(vectors, expected_count=len(chunks), expected_dimension=config.dimension)
 
     points = [
         to_vector_point(chunk, vector, document.original_filename)

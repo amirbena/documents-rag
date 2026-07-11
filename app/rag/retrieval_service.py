@@ -11,6 +11,7 @@ embeddings and document embeddings can never silently drift onto different colle
 
 from app.core.config import Settings, get_settings
 from app.rag.embedding_config import get_active_embedding_config
+from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.rag.providers.vector_store import VectorSearchResult
 
@@ -36,12 +37,17 @@ class RetrievalService:
 
         top_k = limit if limit is not None else self._settings.retrieval_top_k
 
+        active_config = get_active_embedding_config(self._settings)
+
         embedding_provider = get_embedding_provider(self._settings)
-        query_vector = (await embedding_provider.embed([query]))[0]
+        query_vectors = await embedding_provider.embed([query])
+        validate_embeddings(query_vectors, expected_count=1, expected_dimension=active_config.dimension)
+        query_vector = query_vectors[0]
 
         vector_store = get_vector_store(self._settings)
-        collection_name = get_active_embedding_config(self._settings).collection_name
-        results = await vector_store.search_similar(collection_name, query_vector, limit=top_k)
+        results = await vector_store.search_similar(
+            active_config.collection_name, query_vector, limit=top_k
+        )
 
         threshold = self._settings.retrieval_score_threshold
         if threshold is not None:

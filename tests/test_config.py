@@ -9,7 +9,7 @@ def test_settings_load_with_expected_defaults() -> None:
 
     assert isinstance(settings, Settings)
     assert settings.ollama_chat_model == "llama3.1"
-    assert settings.ollama_embedding_model == "nomic-embed-text"
+    assert settings.ollama_embedding_model == "bge-m3"
 
 
 def test_resolved_llm_model_falls_back_to_ollama_chat_model() -> None:
