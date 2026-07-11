@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-e2e-backend test-rag-engines test-multilingual-rag lint typecheck compose verify verify-integration verify-e2e-backend verify-rag-engines verify-multilingual-rag
+.PHONY: help test test-unit test-integration test-e2e-backend test-rag-engines test-multilingual-rag lint typecheck compose verify verify-integration verify-e2e-backend verify-rag-engines verify-multilingual-rag smoke-multilingual-real
 
 help:
 	@echo "Available commands:"
@@ -20,6 +20,10 @@ help:
 	@echo "  make verify-e2e-backend - run the backend E2E suite plus its own checks"
 	@echo "  make verify-rag-engines - run the RAG engine tests plus their own checks"
 	@echo "  make verify-multilingual-rag - run the multilingual RAG tests plus their own checks"
+	@echo "  make smoke-multilingual-real - OPTIONAL, MANUAL, non-blocking: exercise the real"
+	@echo "                          configured embedding model (default bge-m3) against 5"
+	@echo "                          Hebrew/English scenarios. Needs a local Ollama with the"
+	@echo "                          model already pulled; never run by make verify/test/CI."
 	@echo "  make help              - show this message"
 	@echo ""
 	@echo "Install the pre-commit hook that runs 'make verify' automatically:"
@@ -69,3 +73,6 @@ verify-rag-engines: test-rag-engines
 
 verify-multilingual-rag: test-multilingual-rag
 	@echo "Multilingual RAG quality gates passed."
+
+smoke-multilingual-real:
+	python scripts/smoke_multilingual_real.py

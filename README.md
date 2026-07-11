@@ -593,20 +593,38 @@ Question -> LanguageDetector -> PromptProvider -> PromptCatalog -> ResolvedPromp
   provider/model/dimension/version and chunking version they were indexed with, and when; a
   document is "stale" whenever that stored configuration no longer matches the active one — not
   merely because vectors exist somewhere in Qdrant.
+- **Real embedding-vector validation** (`app/rag/embedding_validation.py`) — every embedding
+  batch (ingestion, re-index, and the single query vector at retrieval time) is checked against
+  the active configuration's expected count/dimension *before* any Qdrant write/search, catching a
+  misconfigured `EMBEDDING_MODEL`/`VECTOR_SIZE` pair immediately instead of only once an existing
+  collection happens to disagree.
 - **Re-index** (`app/services/reindex_service.py`) — re-derives a document's vectors from its
-  already-persisted stored file (no new upload) when its configuration changes; idempotent, never
-  marks a failed attempt as current, and only removes the document's *previous* collection's
-  vectors after the new write has already succeeded.
+  already-persisted stored file (no new upload) when its configuration changes; idempotent, and
+  returns a typed `ReindexResult`/`ReindexOutcome` (`ALREADY_CURRENT`/`REINDEXED`/
+  `REINDEXED_EMPTY`/`REINDEXED_WITH_CLEANUP_PENDING`) rather than a plain bool, since a bool can't
+  represent "zero-chunk document" or "the new collection committed but cleaning up the old one
+  failed" distinctly. A Postgres commit failure after a successful Qdrant write rolls back and
+  expires the `Document` — see "Re-index (`app/services/reindex_service.py`)" in
+  [ARCHITECTURE.md](ARCHITECTURE.md) for the full non-atomic-transaction contract. A failed
+  legacy-collection cleanup is tracked as a retryable `VectorCleanupJob`, never silently dropped.
 - **Language detection** (`app/rag/language.py`) — deterministic, word-level Hebrew/Latin
   script-dominance counting (not an ML model), so a few Latin-script technical identifiers
   (Kafka, Qdrant, Kubernetes, LangChain) embedded in a Hebrew question never override the
   surrounding language, and vice versa.
+- **Multilingual decision routing** (`app/rag/decision.py`) — `RuleBasedRagDecider` has Hebrew
+  equivalents of every English pattern (document/file references, extraction-verb-near-
+  sensitive-noun), so a natural Hebrew question (e.g. `לפי הקובץ שהעליתי, מה מדיניות השמירה?`)
+  routes to retrieval without needing an English trigger phrase, and both engines see the same
+  decision by construction (one shared decider, no per-engine decision logic).
 - **PromptCatalog/PromptProvider** (`app/rag/prompts/`) — five prompt types
   (`grounded_answer`/`direct_answer`/`clarification`/`no_results`/`out_of_scope`) x two languages
   (`he`/`en`); both engines resolve all fixed/governed text through `PromptProvider`, never a
-  private constant. Governance instructions require answering only from context, in the query's
-  language, preserving quoted source text and `[S1]`/`[S2]` labels untranslated, and never
-  translating code/API names/class names/environment variables/command names.
+  private constant. The two generation-backed types share **one English-authored governance
+  instruction** (never duplicated per language) plus an explicit response-language directive
+  (`"Respond directly and naturally in Hebrew (he)."`/`"...in English (en)."`) — never "answer in
+  English and translate." Instructions require answering only from context, preserving quoted
+  source text and `[S1]`/`[S2]` labels untranslated, and never translating code/API names/class
+  names/filenames/commands/environment variables/error messages.
 - **Multilingual embedding model** — `OLLAMA_EMBEDDING_MODEL` defaults to `bge-m3` (1024-dim,
   BAAI's embedding model supporting 100+ languages including Hebrew); requires
   `ollama pull bge-m3`. `EMBEDDING_VERSION` defaults to `v2` alongside this default-model change,
@@ -629,6 +647,17 @@ run the multilingual-specific tests with:
 make test-multilingual-rag     # unit + integration + E2E matrix tests (needs Docker)
 make verify-multilingual-rag   # runs test-multilingual-rag plus its own checks
 ```
+
+#### Real multilingual runtime smoke (optional, manual)
+
+`make smoke-multilingual-real` exercises the real, configured embedding model (default `bge-m3`)
+against five Hebrew/English scenarios (Hebrew doc/query, cross-language both directions, English
+doc/query, mixed Hebrew+English with embedded technical identifiers), asserting the correct
+source scores higher than an unrelated distractor and the vector dimension matches configuration.
+It requires a locally reachable Ollama with the model already pulled, fails clearly (non-zero
+exit, explicit message) if the model isn't installed, and is never run by `make verify`/
+`make test*`/CI — it's a small illustrative corpus, not a production-scale retrieval-quality
+evaluation.
 
 ### Streaming chat endpoint
 
