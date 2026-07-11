@@ -453,26 +453,16 @@ implementation: every other engine is judged against its behavior, not the other
 `RuleBasedRagDecider.decide(question)` directly, unmodified, *outside* any LangChain `Runnable` —
 this keeps the decision contract (which four `RagDecision` values exist, and their `reason`
 strings) identical to `CustomRagEngine`'s without needing LangChain to model routing at all.
-`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` stream the same fixed message text `RagOrchestrator` uses —
-both import it from `app/rag/responses.py` (see "Shared fixed RAG responses" below), so neither
-engine depends on the other's implementation module, and the two can never drift apart on that
-text — with no retrieval and no LLM call. For `NEEDS_RETRIEVAL`/`DIRECT_LLM`,
-it builds a LangChain `ChatPromptValue` (from literal `SystemMessage`/`HumanMessage` content —
-never an interpolated `ChatPromptTemplate`, so arbitrary document text containing `{`/`}`
-characters can never be misparsed as a template variable) and pipes it through a LangChain
-`RunnableLambda(...) | ProviderBackedLLM` chain, streaming the result chunk by chunk.
-
-**Shared fixed RAG responses** (`app/rag/responses.py`) — `CLARIFICATION_NEEDED_RESPONSE`,
-`OUT_OF_SCOPE_RESPONSE`, and `DIRECT_LLM_SYSTEM_PROMPT` live in their own framework-neutral
-module: no FastAPI dependency, no LangChain dependency, no provider-client construction, no
-engine-specific orchestration — just the fixed strings. Both `RagOrchestrator` and
-`LangChainRagEngine` import from this module directly; neither imports it from the other's
-implementation module, so `LangChainRagEngine` has no dependency on a `RagOrchestrator`
-implementation detail (and vice versa). This is an intentionally temporary compatibility
-boundary: a future Phase 2.5 multilingual Prompt Catalog will replace it with a language-aware
-`PromptProvider`/`PromptCatalog` that resolves response text per request language — until then,
-this module deliberately stays a flat set of English-only constants, with no language variants,
-detection, or catalog abstractions added ahead of that milestone.
+`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`/`NEEDS_RETRIEVAL`-with-no-results stream a fixed,
+language-appropriate message resolved via `PromptProvider` (see "Multilingual RAG Foundation"
+below) — neither engine owns this text or depends on the other's implementation module, and the
+two can never drift apart on it — with no retrieval (for clarification/out-of-scope) and no LLM
+call at all for any of the three. For `NEEDS_RETRIEVAL`-with-sources/`DIRECT_LLM`, it builds a
+LangChain `ChatPromptValue` (from literal `SystemMessage`/`HumanMessage` content — never an
+interpolated `ChatPromptTemplate`, so arbitrary document text containing `{`/`}` characters can
+never be misparsed as a template variable) using `PromptProvider`'s resolved, language-aware
+system instruction, and pipes it through a LangChain `RunnableLambda(...) | ProviderBackedLLM`
+chain, streaming the result chunk by chunk.
 
 **Adapter boundaries and provider-factory reuse** (`app/rag/engines/langchain_adapters.py`) —
 the *only* place `LangChainRagEngine` touches a LangChain provider-facing base class:
@@ -509,9 +499,10 @@ switching engines re-embeds a document, creates a new collection, or changes a c
 logic of its own either way.
 
 **No-results behavior is identical across engines**: when `RetrievalService.retrieve()` returns
-no results, `RagPromptBuilder` already emits its fixed "no relevant context was found" content
-with `sources=[]` — `LangChainRagEngine` never substitutes a `DIRECT_LLM` answer or fabricates a
-source in that case, matching `CustomRagEngine` exactly.
+results but `RagPromptBuilder` finds nothing attributable (`built.sources` empty), both engines
+stream a fixed, language-appropriate `no_results` message (see "Multilingual RAG Foundation"
+below) with `sources=[]` and **no LLM call at all** — `LangChainRagEngine` never substitutes a
+`DIRECT_LLM` answer or fabricates a source in that case, matching `CustomRagEngine` exactly.
 
 **Why LangGraph is intentionally deferred**: LangChain's `Runnable`/prompt/retriever primitives
 are sufficient to express this platform's existing four-way decision routing plus a single
@@ -520,6 +511,186 @@ conversation memory for LangGraph's graph/state machinery to add value to. Intro
 now would add a second orchestration paradigm with nothing for it to orchestrate; it belongs in a
 future milestone only once a real agentic workflow (multi-step tool use, conditional branching
 driven by intermediate LLM output, etc.) actually requires it.
+
+## Multilingual RAG Foundation
+
+Phase 2.5 makes multilingual (Hebrew + English) retrieval and language-aware prompting shared
+platform capabilities, reached identically by both `CustomRagEngine` and `LangChainRagEngine` —
+neither engine implements its own language detection, prompt catalog, embedding-version
+selection, or collection routing.
+
+```
+Question
+   ↓
+LanguageDetector          (app/rag/language.py)
+   ↓
+PromptProvider            (app/rag/prompts/provider.py)
+   ↓
+PromptCatalog             (app/rag/prompts/catalog.py)
+   ↓
+ResolvedPrompt             (app/rag/prompts/types.py)
+   ↓
+RagEngine
+   ├── CustomRagEngine
+   └── LangChainRagEngine
+```
+
+### Embedding/index versioning (`app/rag/embedding_config.py`)
+
+`EmbeddingIndexConfig` is the versioned identity of "how this platform is currently indexing
+documents" — `collection_prefix`, `provider`, `model`, `dimension`, `embedding_version`,
+`chunking_version`. `get_active_embedding_config(settings)` is the *only* place that reads
+`EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` (or `OLLAMA_EMBEDDING_MODEL`)/`VECTOR_SIZE`/
+`EMBEDDING_VERSION`/`CHUNKING_VERSION` for indexing purposes — `IngestionWorker` (write side),
+`RetrievalService` (read side), and `app/services/reindex_service.py` all call this function
+rather than reading those settings directly, so they can never resolve to different
+configurations. Every field is validated non-empty/positive at construction — see "Configuration
+Must Be Explicit" below.
+
+`EmbeddingIndexConfig.collection_name` derives a deterministic, sanitized Qdrant collection name
+from all five fields (`documents__ollama__nomic-embed-text__ev1__cv1__d768`-shaped) — changing
+*any* field (a different model, dimension, embedding version, or chunking version) always
+produces a different collection name, so incompatible vectors can never land in the same
+collection. `QDRANT_COLLECTION_NAME` now serves as the `collection_prefix` input to this
+identity, not a literal collection name by itself.
+
+### Why incompatible dimensions cannot share a collection
+
+`app/services/index_registry.py`'s `ensure_active_collection()` is the one gate every
+write/search path passes through before touching Qdrant: it calls
+`VectorStore.get_collection_vector_size()` (new on the `VectorStore`/`QdrantVectorStore`
+contract, alongside `delete_by_document_id()`) and raises `IncompatibleIndexConfigurationError`
+if an existing collection's dimension doesn't match the active config's — this should be
+unreachable in practice (the collection name itself encodes the dimension) but is checked anyway
+as a hard safety net against any Qdrant/Postgres drift. **Never** silently recreates or deletes a
+mismatched collection; an operator must resolve the conflict deliberately.
+
+### Document/collection indexing metadata (Postgres)
+
+`IndexCollection` (`app/models/index_collection.py`) tracks one row per distinct collection ever
+created: `collection_name` (primary key), `embedding_provider`, `embedding_model`,
+`embedding_dimension`, `embedding_version`, `chunking_version`, `status` (`active`/`retired`),
+`created_at`. `Document` (`app/models/document.py`) gained matching `embedding_*`/
+`chunking_version`/`collection_name`/`indexed_at` columns, populated only by
+`app/services/index_registry.py`'s `mark_document_indexed()` **after** a successful
+index/re-index — a failed attempt never updates them. `is_document_stale(document, config)`
+compares `document.collection_name` against the active config's collection name — a document
+with vectors sitting in some collection is not "current" merely because vectors exist somewhere;
+it is current only if its stored configuration matches the active one exactly. Migration:
+`alembic/versions/07f849bf2b95_...py`.
+
+PostgreSQL remains the source-of-truth for document lifecycle/metadata and active
+versions; local disk (`LocalFileStorage`) holds the original file content; Qdrant is a **derived**
+index, rebuildable at any time from the persisted file + the active `EmbeddingIndexConfig` via
+re-index (below) — never itself the source of truth for what a document "is."
+
+### Re-index (`app/services/reindex_service.py`)
+
+`reindex_document(document, session, settings)` re-derives a document's vectors from its
+already-persisted stored file — no new upload required. Flow: re-extract (`DocumentTextExtractor`,
+unchanged) -> re-chunk (`DocumentChunker`, active `chunking_version`) -> re-embed (active
+`EmbeddingIndexConfig`) -> `ensure_active_collection()` -> upsert into the new collection ->
+`mark_document_indexed()` + commit -> **only then** delete the document's vectors from its
+*previous* tracked collection (if any, and if different from the new one). A no-op (returns
+`True` immediately) if the document is already current. Idempotent: point IDs are derived
+identically to the initial-ingest path (`app.services.ingestion_worker.to_vector_point`, made
+public specifically so `reindex_service.py` can reuse it), so re-running against the same active
+collection overwrites rather than duplicates. A failure at any step propagates without touching
+the document's stored indexing metadata — `is_document_stale()` still reports it as stale
+afterward, exactly as if the attempt had never happened.
+
+`app/services/index_registry.py` additionally provides `get_stale_documents()` (list every
+document whose `collection_name` isn't the active one), `retire_collection()` (bookkeeping-only
+status flip, never deletes Qdrant data), and `delete_document_vectors()` (deletes a document's
+vectors from its currently-tracked collection only — there is no historical
+document-to-collection log in this milestone, so a document re-indexed across multiple
+collections without ever being deleted in between only has its *latest* collection cleaned up
+automatically). Migrating to a new embedding/chunking version is therefore: bump
+`EMBEDDING_VERSION`/`CHUNKING_VERSION` -> the next re-index run creates the new collection ->
+`get_stale_documents()` finds what still needs re-indexing -> old collections are never
+auto-deleted at startup; `retire_collection()` plus a manual Qdrant collection delete is the
+explicit cleanup boundary for once a migration is known-successful. A full admin migration UI is
+out of scope.
+
+### Language detection (`app/rag/language.py`)
+
+`LanguageDetector` (ABC) / `ScriptBasedLanguageDetector` (the only implementation) resolves a
+question to `SupportedLanguage.HE` or `SupportedLanguage.EN` — deterministic, word-level
+Hebrew/Latin script-dominance counting (not character-level, and not an ML model): each
+whitespace/punctuation-split word is classified as Hebrew, Latin, or ignored (digits/
+punctuation-only), and whichever script has more *words* wins. Word-level (not character-level)
+classification is what keeps a handful of Latin-script technical identifiers (Kafka, Qdrant,
+Kubernetes, LangChain) embedded in an otherwise-Hebrew sentence from outweighing the surrounding
+natural-language Hebrew words, and vice versa. An exact tie, or no Hebrew/Latin words at all
+(empty/punctuation/numbers-only), falls back to `DEFAULT_RESPONSE_LANGUAGE`. Neither engine calls
+this directly — both reach it only through `PromptProvider`.
+
+### PromptCatalog / PromptProvider / ResolvedPrompt (`app/rag/prompts/`)
+
+`PromptType` (`grounded_answer`, `direct_answer`, `clarification`, `no_results`, `out_of_scope`)
+x `SupportedLanguage` (`he`, `en`) -> `PromptCatalog` holds the actual text: a fixed
+`response_text` for the three no-LLM-call types (clarification/no_results/out_of_scope), or a
+governance `system_text` for the two generation-backed types (grounded_answer/direct_answer) —
+answer only from context, answer in the query's language, preserve quoted source text and
+`[S1]`/`[S2]` labels untranslated, never translate code/API names/class names/environment
+variables/command names, state explicitly when context is insufficient.
+`UnsupportedPromptLanguageError`/`UnsupportedPromptTypeError` fail explicitly for anything the
+catalog has no content for. `PromptProvider.resolve(prompt_type, question)` detects the
+question's language (via `LanguageDetector`) and returns a `ResolvedPrompt` (`prompt_type`,
+`language`, `prompt_version` from `PROMPT_CATALOG_VERSION`, and exactly one of
+`system_text`/`response_text`) — the single seam both engines call.
+
+**Supersedes `app.rag.responses`** (removed): the previous English-only fixed-constants module
+from the LangChain compatibility layer milestone is gone; `RagOrchestrator` and
+`LangChainRagEngine` both import from `app.rag.prompts.provider` directly, never from each
+other's implementation module.
+
+**Phase 2.5 boundary**: this catalog is a flat, hardcoded he/en dict — no persistence, no
+runtime-editable prompts, no additional languages, no language detection beyond
+script-dominance. A future milestone may introduce a database-backed, runtime-editable prompt
+system if the platform ever needs more languages or non-developer prompt edits; do not add that
+speculative machinery ahead of an actual need.
+
+### Engine integration
+
+Both `RagOrchestrator.stream_answer()` and `LangChainRagEngine.stream_answer()` now: resolve
+`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` via `PromptProvider.resolve(..., question).response_text`
+(no retrieval, no LLM call); resolve `NEEDS_RETRIEVAL`'s system instruction via
+`PromptProvider.resolve(PromptType.GROUNDED_ANSWER, question).system_text`, combined with
+`RagPromptBuilder`'s unchanged context/ranking/labeling; short-circuit to a fixed `no_results`
+message (also via `PromptProvider`, no LLM call) when `RagPromptBuilder` found nothing
+attributable; and resolve `DIRECT_LLM`'s system instruction via
+`PromptProvider.resolve(PromptType.DIRECT_ANSWER, question).system_text`. `LangChainRagEngine`
+builds its `ChatPromptValue` from the resolved `system_text` instead of a hardcoded English
+string — everything else about its LangChain `Runnable` composition, brace-injection safety, and
+provider adapters is unchanged from the LangChain compatibility layer milestone.
+
+### Multilingual citation behavior
+
+Source titles/filenames, quoted source text, and page/sheet metadata all come from
+`RagPromptBuilder`/`VectorSearchResult` unchanged by this milestone — a Hebrew answer can cite an
+English-titled source and vice versa; nothing here ever translates a citation or a document
+title. Hebrew/Unicode text already survives JSON/SSE serialization (see "Streaming chat endpoint"
+below) unchanged — this milestone adds no new serialization path.
+
+### Multilingual embedding model selection
+
+`OLLAMA_EMBEDDING_MODEL`'s Python-level default stays `nomic-embed-text` (768-dim,
+English-oriented) for backward compatibility — no existing deployment's behavior changes merely
+by upgrading. For genuine multilingual (Hebrew + English) retrieval quality, `.env.example`
+documents pulling and switching to `bge-m3` (1024-dim, BAAI's multilingual embedding model
+supporting 100+ languages including Hebrew) via `ollama pull bge-m3` + `EMBEDDING_MODEL=bge-m3` +
+`VECTOR_SIZE=1024` — always alongside an `EMBEDDING_VERSION` bump, so the change goes through a
+real re-index rather than silently reusing an incompatible collection. Automated tests
+(unit/integration/E2E) never depend on a real embedding model or download — they use
+`MultilingualFakeEmbeddingProvider` (`tests/multilingual_fixtures.py`), a deterministic
+bag-of-concepts hashing embedding with a small Hebrew/English synonym table (e.g. "vacation" and
+"חופשה" hash to the same dimension), so equivalent cross-language concepts score genuinely
+higher than an unrelated distractor — this demonstrates the retrieval *wiring* works
+cross-language, not real multilingual model quality. A real `bge-m3` evaluation requires a
+separate, manual run against an actual Ollama instance; this project's automated suites
+deliberately never pull or call a real embedding/LLM model (see "AI-provider policy in tests"
+below).
 
 ## Streaming chat endpoint
 
@@ -620,15 +791,28 @@ production `APP_ENV`/`DATABASE_URL`/`QDRANT_URL`.
 
 The RAG engine compatibility layer's tests span all three tiers above rather than forming a
 separate tier of their own: `tests/test_rag_engine_factory.py`/`test_custom_rag_engine.py`/
-`test_langchain_rag_engine.py`/`test_langchain_adapters.py`/`test_rag_responses.py` are unit
-tests, `tests/integration/test_langchain_rag_engine_integration.py` is an integration test (real
-ephemeral Qdrant, existing `VectorPoint` format, fake embeddings), and
+`test_langchain_rag_engine.py`/`test_langchain_adapters.py`/`test_prompt_provider_engine_parity.py`
+are unit tests, `tests/integration/test_langchain_rag_engine_integration.py` is an integration
+test (real ephemeral Qdrant, existing `VectorPoint` format, fake embeddings), and
 `tests/e2e/backend/test_rag_engine_parity.py` runs the full backend E2E flow under both
 `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`, comparing source IDs/ranking/metadata/SSE
 ordering/error/no-results behavior for equivalence (the generated answer text may legitimately
 differ). `make test-rag-engines`/`make verify-rag-engines` run just these files across all three
 tiers as a convenience — they are not a substitute for `make verify`/`verify-integration`/
 `verify-e2e-backend`, which still cover everything including this layer.
+
+The Phase 2.5 multilingual RAG foundation's tests follow the same span-all-three-tiers pattern:
+`tests/test_embedding_config.py`/`test_index_registry.py`/`test_language_detector.py`/
+`test_prompt_catalog.py`/`test_reindex_service.py` (plus the shared
+`test_prompt_provider_engine_parity.py` above) are unit tests,
+`tests/integration/test_multilingual_indexing.py` is an integration test (real ephemeral
+Postgres/Qdrant — indexing metadata persistence, dimension-mismatch rejection, staleness
+detection, re-index, document-vector cleanup, mixed Hebrew/English round-trip), and
+`tests/e2e/backend/test_multilingual_matrix.py` runs the full Hebrew/English/mixed-language
+document-and-question matrix under both engines. Both suites use
+`MultilingualFakeEmbeddingProvider`/fixtures from `tests/multilingual_fixtures.py` — never a real
+embedding model. `make test-multilingual-rag`/`make verify-multilingual-rag` run just these files
+as a convenience, same caveat as `verify-rag-engines` above.
 
 ### AI-provider policy in tests
 
@@ -792,11 +976,16 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `VECTOR_STORE_PROVIDER`    | `qdrant`                                                               | Selects the `VectorStore` implementation via the provider factory |
 | `CHUNK_SIZE`               | `1000`                                                                 | Target chunk size in characters, used by `DocumentChunker` |
 | `CHUNK_OVERLAP`            | `200`                                                                  | Overlap between consecutive chunks in characters, used by `DocumentChunker` |
-| `QDRANT_COLLECTION_NAME`   | `documents`                                                            | Collection `IngestionWorker` creates (if missing) and upserts chunk vectors into |
-| `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality passed to `create_collection_if_not_exists` — must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors) |
+| `QDRANT_COLLECTION_NAME`   | `documents`                                                            | The **prefix/namespace** `EmbeddingIndexConfig.collection_name` derives the real, versioned Qdrant collection name from (see "Multilingual RAG Foundation") — not a literal collection name by itself |
+| `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality — part of the active `EmbeddingIndexConfig`; must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors; `bge-m3` produces 1024) |
 | `RETRIEVAL_TOP_K`          | `5`                                                                    | Default number of results `RetrievalService.retrieve()` asks Qdrant for, when no explicit `limit` is passed |
 | `RETRIEVAL_SCORE_THRESHOLD`| *(unset)*                                                              | Minimum Qdrant score a result must meet to be returned; unset/`null` disables score filtering |
 | `RAG_ENGINE`               | `custom`                                                               | Selects the `RagEngine` implementation via `get_rag_engine()` (see "RAG Engine Compatibility Layer"); `langchain` is the only other recognized value — anything else raises `UnsupportedRagEngineError` |
+| `EMBEDDING_MODEL`          | *(unset)*                                                              | Generic, provider-agnostic embedding model override; falls back to `OLLAMA_EMBEDDING_MODEL` if unset (same pattern as `LLM_MODEL`/`OLLAMA_CHAT_MODEL`) — part of the active `EmbeddingIndexConfig` |
+| `EMBEDDING_VERSION`        | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever the embedding model/dimension changes meaningfully, to roll onto a new Qdrant collection instead of silently mixing incompatible vectors |
+| `CHUNKING_VERSION`         | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever `CHUNK_SIZE`/`CHUNK_OVERLAP`/the chunking algorithm changes meaningfully |
+| `DEFAULT_RESPONSE_LANGUAGE`| `en`                                                                   | Fallback language `ScriptBasedLanguageDetector` resolves to when a question has no Hebrew/Latin words at all, or an exact word-count tie; must be `he` or `en` |
+| `PROMPT_CATALOG_VERSION`   | `v1`                                                                   | Stamped onto every `ResolvedPrompt.prompt_version` — see "Multilingual RAG Foundation" |
 
 ## Current boundaries
 
@@ -812,7 +1001,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   unversioned platform health responses).
 - `app/db` — SQLAlchemy async engine/session setup.
 - `app/models` — ORM models: `Document`, `IngestionJob`/`IngestionStatus` (see "Document upload
-  and ingestion job skeleton" above).
+  and ingestion job skeleton" above), and `IndexCollection`/`IndexCollectionStatus`
+  (`app/models/index_collection.py`, see "Multilingual RAG Foundation" above). `Document` also
+  carries `embedding_*`/`chunking_version`/`collection_name`/`indexed_at` columns.
 - `app/schemas` — Pydantic request/response schemas.
 - `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
   async HTTP client scoped strictly to reachability and model-availability checks — it
@@ -826,13 +1017,28 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`app/services/document_text_extractor.py`), which extracts text from a document's stored
   `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction" above); and
   `DocumentChunker` (`app/services/document_chunker.py`), which splits an `ExtractedDocument`
-  into `DocumentChunk`s (see "Document chunking" above); and `platform_health.py`, the dependency
+  into `DocumentChunk`s (see "Document chunking" above); `platform_health.py`, the dependency
   checks backing `GET /health/ready`/`/health/dependencies` (see "Operational Health Contract"
-  above) — reuses `OllamaClient` for the Ollama check rather than duplicating it.
+  above) — reuses `OllamaClient` for the Ollama check rather than duplicating it;
+  `index_registry.py`, the collection-safety and document-indexing-metadata service (see
+  "Multilingual RAG Foundation" above) — `ensure_active_collection()`, `mark_document_indexed()`,
+  `is_document_stale()`, `get_stale_documents()`, `retire_collection()`,
+  `delete_document_vectors()`; and `reindex_service.py`'s `reindex_document()`, the backend
+  re-index capability.
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
-  `LLMProvider`.
+  `LLMProvider`. Resolves the collection to search via
+  `app.rag.embedding_config.get_active_embedding_config()`, never `QDRANT_COLLECTION_NAME`
+  directly.
+- `app/rag/embedding_config.py` — `EmbeddingIndexConfig`, `get_active_embedding_config()`,
+  `InvalidEmbeddingIndexConfigError` (see "Multilingual RAG Foundation" above). The single source
+  of the active indexing configuration for both `IngestionWorker` and `RetrievalService`.
+- `app/rag/language.py` — `LanguageDetector`, `ScriptBasedLanguageDetector`, `SupportedLanguage`
+  (see "Multilingual RAG Foundation" above).
+- `app/rag/prompts/` — `PromptType`, `ResolvedPrompt` (`types.py`), `PromptCatalog`
+  (`catalog.py`), `PromptProvider` (`provider.py`) — see "Multilingual RAG Foundation" above.
+  Supersedes the removed `app/rag/responses.py`.
 - `app/rag/prompt_builder.py` — `RagPromptBuilder`, `BuiltRagPrompt`, `PromptSource` (see "RAG
   prompt builder" above). Pure and synchronous — it calls no provider at all (not even
   `get_embedding_provider()`/`get_vector_store()`), consuming only the `VectorSearchResult`s a
@@ -871,9 +1077,6 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   "RAG orchestrator" above). The only component that composes the decision layer, retrieval
   service, prompt builder, and LLM provider together — no other module in `app/rag` calls more
   than one of them.
-- `app/rag/responses.py` — the shared, fixed RAG response/prompt text (see "Shared fixed RAG
-  responses" above). No imports of its own; both `RagOrchestrator` and `LangChainRagEngine`
-  import from it directly, never from each other.
 - `app/rag/engine.py` — the `RagEngine` abstraction (see "RAG Engine Compatibility Layer" above).
 - `app/rag/engines/` — concrete `RagEngine` implementations: `custom_engine.py`
   (`CustomRagEngine`, the default, wrapping `RagOrchestrator`), `langchain_engine.py`

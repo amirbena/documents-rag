@@ -137,6 +137,43 @@ def get_settings() -> Settings:
   use, conditional branching driven by intermediate LLM output, etc.). The current decide-then-
   generate flow has no agent loop for LangGraph's graph/state machinery to add value to.
 
+## Multilingual RAG Style
+
+- **Prompt ownership lives in the shared `PromptProvider`, never in an engine.** Fixed/governed
+  response text (`clarification`/`no_results`/`out_of_scope`/`grounded_answer`/`direct_answer`)
+  is resolved through `app/rag/prompts/provider.py`'s `PromptProvider`, which both
+  `RagOrchestrator` and `LangChainRagEngine` call — neither engine may hardcode this text, import
+  it from the other's implementation module, or reintroduce anything resembling the old
+  `app/rag/responses.py` (removed).
+- **No engine-specific prompt catalogs.** There is exactly one `PromptCatalog`
+  (`app/rag/prompts/catalog.py`) for the whole platform. Do not add a LangChain-only or
+  Custom-only prompt catalog, even a small one — both engines must resolve identical content for
+  the same `(PromptType, SupportedLanguage)` pair.
+- **Explicit embedding/index versioning is mandatory.** Any change to the embedding
+  provider/model/dimension or the chunking approach must be reflected by bumping
+  `EMBEDDING_VERSION`/`CHUNKING_VERSION` (see `app/rag/embedding_config.py`) — never change what a
+  collection's vectors mean without changing which collection they live in.
+  `get_active_embedding_config()` is the only function that should resolve these settings for
+  indexing purposes; do not read `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL`/`VECTOR_SIZE` directly
+  from `Settings` in ingestion or retrieval code.
+- **Collection migration must stay safe.** Never silently recreate or delete a Qdrant collection
+  whose dimension doesn't match the active configuration (raise
+  `IncompatibleIndexConfigurationError` instead, per `app/services/index_registry.py`), never
+  delete a document's existing vectors before its replacement index write has already succeeded,
+  and never auto-delete an old collection at startup — `retire_collection()` is a bookkeeping-only
+  status flip; actually removing Qdrant data is a separate, deliberate operational action.
+- **Documentation must stay consistent whenever prompts, languages, indexing metadata, or
+  collection routing change.** A change to `app/rag/prompts/`, `app/rag/language.py`,
+  `app/rag/embedding_config.py`, `app/models/index_collection.py`, or `Document`'s indexing
+  columns must come with a matching update to "Multilingual RAG Foundation" in
+  [ARCHITECTURE.md](ARCHITECTURE.md) and, where relevant, the "Multilingual RAG foundation"
+  section of [README.md](README.md) — in the same change, not deferred.
+- **Real Ollama/real embedding models stay out of the default automated suites.** Unit,
+  integration, and backend E2E tests use `MultilingualFakeEmbeddingProvider`
+  (`tests/multilingual_fixtures.py`) or an equivalent fake — never a real multilingual model
+  download or call. A real-model evaluation belongs in a separate, future manual/nightly
+  exercise, same as the existing real-Ollama smoke-suite boundary.
+
 ## Database Testing Style
 
 - **Do not add SQLite/`aiosqlite` for testing database-touching code.** The project targets

@@ -173,9 +173,10 @@ no public chat endpoint or SSE endpoint yet, and it doesn't touch ingestion or Q
 
 The model it uses is set independently of the provider: set `LLM_MODEL` (e.g. `llama3.1`) to
 choose the chat model without touching `LLM_PROVIDER`. If `LLM_MODEL` is unset, it falls back to
-`OLLAMA_CHAT_MODEL` for backward compatibility. `OLLAMA_EMBEDDING_MODEL` is separate and fixed —
-it's never affected by `LLM_MODEL`, since embeddings must stay on one model to keep previously
-computed vectors valid.
+`OLLAMA_CHAT_MODEL` for backward compatibility. `OLLAMA_EMBEDDING_MODEL` is never affected by
+`LLM_MODEL` — embeddings must stay on one model to keep previously computed vectors valid.
+Changing the embedding model deliberately (not via `LLM_MODEL`) is supported through
+`EMBEDDING_MODEL` + `EMBEDDING_VERSION` and a re-index — see "Multilingual RAG foundation" below.
 
 `QdrantVectorStore` (`app/rag/providers/qdrant_vector_store.py`) talks to Qdrant's HTTP API
 directly under `QDRANT_URL` (no official Qdrant SDK) via async `httpx`, supporting
@@ -549,13 +550,14 @@ platform's existing pieces via three adapters (`app/rag/engines/langchain_adapte
 Retrieved LangChain `Document`s are converted straight back into `VectorSearchResult`s and handed
 to the existing, unmodified `RagPromptBuilder`, so source labels (`[S1]`, `[S2]`), rank order, the
 "answer only from context / say so if the answer isn't present" instructions, and Hebrew/Unicode
-text all behave exactly as they do for `CustomRagEngine`. `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`
-never invoke retrieval or the LLM, and stream the exact same fixed message text `RagOrchestrator`
-uses — both come from `app/rag/responses.py`, a small framework-neutral shared module (no
-FastAPI/LangChain/engine dependency of its own) so neither engine imports this text from the
-other's implementation module; it's a deliberately temporary compatibility boundary ahead of a
-future multilingual Prompt Catalog. No LangGraph, no agents, no tool calling — see "LangChain
-compatibility layer" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
+text all behave exactly as they do for `CustomRagEngine`. `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`/
+no-results never invoke the LLM, and stream the exact same fixed, language-appropriate message
+text `RagOrchestrator` uses — both resolve it via `PromptProvider` (`app/rag/prompts/`), a small
+framework-neutral shared module (no FastAPI/LangChain/engine dependency of its own) so neither
+engine imports this text from the other's implementation module. See "Multilingual RAG
+foundation" below for the full language-aware prompt design. No LangGraph, no agents, no tool
+calling — see "LangChain compatibility layer" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full
+engine design.
 
 The generated answer text can legitimately differ between engines (LangChain's own prompt
 serialization differs from `RagOrchestrator`'s plain string concatenation), but the public
@@ -567,6 +569,59 @@ Run the engine-specific tests with:
 ```bash
 make test-rag-engines     # unit + integration + E2E-parity tests for both engines (needs Docker)
 make verify-rag-engines   # runs test-rag-engines plus its own checks
+```
+
+### Multilingual RAG foundation
+
+Multilingual (Hebrew + English) retrieval and language-aware prompting are shared platform
+capabilities, reached identically by both `CustomRagEngine` and `LangChainRagEngine` — neither
+engine detects language, selects an embedding model, or owns a prompt catalog itself:
+
+```
+Question -> LanguageDetector -> PromptProvider -> PromptCatalog -> ResolvedPrompt -> RagEngine
+```
+
+- **Versioned embedding/index configuration** (`app/rag/embedding_config.py`) — `provider`,
+  `model`, `dimension`, `EMBEDDING_VERSION`, `CHUNKING_VERSION` together derive a deterministic,
+  sanitized Qdrant collection name. Changing any one of them always produces a different
+  collection — incompatible vectors can never land in the same collection, and `IngestionWorker`/
+  `RetrievalService` always resolve the same active configuration.
+- **Collection safety** (`app/services/index_registry.py`) — an existing collection with the
+  wrong vector dimension is rejected explicitly (`IncompatibleIndexConfigurationError`), never
+  silently reused, recreated, or deleted.
+- **Document indexing metadata** — `Document` rows record exactly which embedding
+  provider/model/dimension/version and chunking version they were indexed with, and when; a
+  document is "stale" whenever that stored configuration no longer matches the active one — not
+  merely because vectors exist somewhere in Qdrant.
+- **Re-index** (`app/services/reindex_service.py`) — re-derives a document's vectors from its
+  already-persisted stored file (no new upload) when its configuration changes; idempotent, never
+  marks a failed attempt as current, and only removes the document's *previous* collection's
+  vectors after the new write has already succeeded.
+- **Language detection** (`app/rag/language.py`) — deterministic, word-level Hebrew/Latin
+  script-dominance counting (not an ML model), so a few Latin-script technical identifiers
+  (Kafka, Qdrant, Kubernetes, LangChain) embedded in a Hebrew question never override the
+  surrounding language, and vice versa.
+- **PromptCatalog/PromptProvider** (`app/rag/prompts/`) — five prompt types
+  (`grounded_answer`/`direct_answer`/`clarification`/`no_results`/`out_of_scope`) x two languages
+  (`he`/`en`); both engines resolve all fixed/governed text through `PromptProvider`, never a
+  private constant. Governance instructions require answering only from context, in the query's
+  language, preserving quoted source text and `[S1]`/`[S2]` labels untranslated, and never
+  translating code/API names/class names/environment variables/command names.
+- **Multilingual embedding model** — `OLLAMA_EMBEDDING_MODEL` stays `nomic-embed-text` (768-dim)
+  by default for backward compatibility; `.env.example` documents pulling and switching to
+  `bge-m3` (1024-dim, genuinely multilingual) via `ollama pull bge-m3` +
+  `EMBEDDING_MODEL=bge-m3` + `VECTOR_SIZE=1024` + an `EMBEDDING_VERSION` bump. Automated tests
+  never depend on a real embedding model — they use a deterministic fake
+  (`tests/multilingual_fixtures.py`) with a small Hebrew/English concept-synonym table, which
+  proves the retrieval *wiring* works cross-language, not real model quality; a real `bge-m3`
+  evaluation is a separate, manual exercise.
+
+See "Multilingual RAG Foundation" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, and
+run the multilingual-specific tests with:
+
+```bash
+make test-multilingual-rag     # unit + integration + E2E matrix tests (needs Docker)
+make verify-multilingual-rag   # runs test-multilingual-rag plus its own checks
 ```
 
 ### Streaming chat endpoint
@@ -832,6 +887,14 @@ in production code; see "Backend E2E tests" above. A `RagEngine` abstraction
 `RagOrchestrator` unchanged) as the default and an optional `LangChainRagEngine` selectable via
 `RAG_ENGINE=langchain` — both share the same provider factory, `RetrievalService`,
 `RagPromptBuilder`, Qdrant collection, and embedding model, and both produce an identical public
-API/SSE contract; see "RAG engine compatibility layer" above. Frontend E2E and a real-Ollama
-smoke suite remain future milestones — see "Integration tests" above, and "Test architecture" in
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
+API/SSE contract; see "RAG engine compatibility layer" above. Multilingual (Hebrew + English)
+retrieval and language-aware prompting are now shared platform capabilities: a versioned
+`EmbeddingIndexConfig` derives a deterministic Qdrant collection identity so incompatible
+embeddings can never share a collection, `Document` rows track exactly which configuration they
+were indexed with (staleness detection + a backend re-index capability), a deterministic
+`ScriptBasedLanguageDetector` resolves Hebrew/English from a question, and a shared
+`PromptCatalog`/`PromptProvider` resolves every fixed/governed prompt through both `RagEngine`
+implementations — see "Multilingual RAG foundation" above. Frontend E2E, a real-Ollama smoke
+suite, and a real multilingual-model evaluation run remain future milestones — see "Integration
+tests" above, and "Test architecture" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
+what's intentionally deferred.
