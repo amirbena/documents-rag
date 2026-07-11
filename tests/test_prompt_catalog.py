@@ -58,11 +58,39 @@ def test_grounded_answer_instructs_preserving_technical_identifiers() -> None:
         assert "translate" in text.lower() or "תתרגם" in text
 
 
-def test_grounded_answer_instructs_answering_in_query_language() -> None:
-    """The grounded_answer system text must instruct the model to answer in the query's language."""
+def test_grounded_answer_system_text_carries_an_explicit_response_language_directive() -> None:
+    """The composed system text must include an explicit "respond in <language>" directive."""
     text_en = PromptCatalog().get_system_text(PromptType.GROUNDED_ANSWER, SupportedLanguage.EN)
+    text_he = PromptCatalog().get_system_text(PromptType.GROUNDED_ANSWER, SupportedLanguage.HE)
 
-    assert "same language" in text_en.lower()
+    assert "respond directly and naturally in english (en)" in text_en.lower()
+    assert "respond directly and naturally in hebrew (he)" in text_he.lower()
+
+
+def test_shared_instructions_are_english_only_and_identical_across_languages() -> None:
+    """The English-authored shared instruction must never be duplicated or altered per language."""
+    catalog = PromptCatalog()
+
+    for prompt_type in _SYSTEM_TEXT_TYPES:
+        assert catalog.get_shared_instructions(prompt_type) == catalog.get_shared_instructions(
+            prompt_type
+        )
+        # Same shared instruction underlies both languages' composed system_text.
+        text_en = catalog.get_system_text(prompt_type, SupportedLanguage.EN)
+        text_he = catalog.get_system_text(prompt_type, SupportedLanguage.HE)
+        shared = catalog.get_shared_instructions(prompt_type)
+        assert text_en.startswith(shared)
+        assert text_he.startswith(shared)
+
+
+def test_response_language_directive_never_instructs_translate_after_the_fact() -> None:
+    """The directive must instruct a direct response, never "answer in English then translate"."""
+    catalog = PromptCatalog()
+
+    for language in (SupportedLanguage.EN, SupportedLanguage.HE):
+        directive = catalog.get_response_language_directive(language)
+        assert "translate" not in directive.lower()
+        assert "directly" in directive.lower()
 
 
 def test_unsupported_language_raises_explicitly() -> None:
@@ -113,6 +141,42 @@ def test_provider_resolves_generation_types_with_system_text_only() -> None:
         resolved = provider.resolve(prompt_type, "What is this?")
         assert resolved.system_text is not None
         assert resolved.response_text is None
+
+
+def test_provider_resolves_shared_instructions_and_language_directive_for_generation_types() -> None:
+    """Generation types must also expose shared_instructions/language_directive individually."""
+    provider = PromptProvider()
+
+    for prompt_type in _SYSTEM_TEXT_TYPES:
+        resolved = provider.resolve(prompt_type, "What is this?")
+        assert resolved.shared_instructions is not None
+        assert resolved.language_directive is not None
+        assert resolved.system_text == f"{resolved.shared_instructions}\n\n{resolved.language_directive}"
+
+    for prompt_type in _FIXED_RESPONSE_TYPES:
+        resolved = provider.resolve(prompt_type, "What is this?")
+        assert resolved.shared_instructions is None
+        assert resolved.language_directive is None
+
+
+def test_resolved_prompt_requires_shared_instructions_and_directive_iff_system_text() -> None:
+    """Constructing a ResolvedPrompt with system_text set but not its components must fail."""
+    with pytest.raises(ValueError, match="shared_instructions"):
+        ResolvedPrompt(
+            prompt_type=PromptType.GROUNDED_ANSWER,
+            language=SupportedLanguage.EN,
+            prompt_version="v2",
+            system_text="x",
+            language_directive="y",
+        )
+    with pytest.raises(ValueError, match="language_directive"):
+        ResolvedPrompt(
+            prompt_type=PromptType.GROUNDED_ANSWER,
+            language=SupportedLanguage.EN,
+            prompt_version="v2",
+            system_text="x",
+            shared_instructions="y",
+        )
 
 
 def test_provider_detects_language_before_resolving() -> None:

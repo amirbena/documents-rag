@@ -45,9 +45,13 @@ class PromptProvider:
                 response_text=self._catalog.get_response_text(prompt_type, language),
             )
 
+        shared_instructions = self._catalog.get_shared_instructions(prompt_type)
+        language_directive = self._catalog.get_response_language_directive(language)
         return ResolvedPrompt(
             prompt_type=prompt_type,
             language=language,
             prompt_version=version,
-            system_text=self._catalog.get_system_text(prompt_type, language),
+            system_text=f"{shared_instructions}\n\n{language_directive}",
+            shared_instructions=shared_instructions,
+            language_directive=language_directive,
         )

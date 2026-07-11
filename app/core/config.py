@@ -69,7 +69,10 @@ class Settings(BaseSettings):
     rag_engine: str = Field(default="custom", alias="RAG_ENGINE")
 
     default_response_language: str = Field(default="en", alias="DEFAULT_RESPONSE_LANGUAGE")
-    prompt_catalog_version: str = Field(default="v1", alias="PROMPT_CATALOG_VERSION")
+    # v2: bumped alongside the shared-English-instructions + explicit response-language-directive
+    # prompt architecture change — the resolved system prompt's content structure changed even
+    # though the catalog's PromptType coverage did not.
+    prompt_catalog_version: str = Field(default="v2", alias="PROMPT_CATALOG_VERSION")
 
     @field_validator("vector_size")
     @classmethod
