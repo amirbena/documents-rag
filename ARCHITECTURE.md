@@ -484,30 +484,44 @@ trade-off:
   stay fake and deterministic even here — no real Ollama container, no model pulled — see
   "AI-provider policy" below. Run via `make test-integration`/`make verify-integration`, never as
   part of `make test`/`make verify`.
-- **Backend E2E tests** — future milestone. Would exercise the full HTTP surface (upload → real
-  ingestion → real retrieval → real chat stream) end-to-end, likely still against Testcontainers
-  services plus a real Ollama container, as a slower/nightlier tier than the integration suite.
+- **Backend E2E tests** (`tests/e2e/backend/*.py`, `@pytest.mark.e2e`, auto-applied by
+  `tests/e2e/backend/conftest.py`) — exercises the complete backend user flow through real HTTP:
+  document upload → real `IngestionWorker` processing (extraction, chunking, Qdrant upsert) →
+  retrieval/orchestration → the streaming chat SSE endpoint, consumed incrementally so event
+  order/timing is genuinely exercised rather than inspected as one buffered string. Runs the real
+  FastAPI app behind a real ASGI HTTP client (`httpx.AsyncClient` + `ASGITransport`), against its
+  own ephemeral Testcontainers-managed Postgres and Qdrant — never `docker-compose.yml`, never
+  fixed ports, with an isolated database and Qdrant collection per test. AI providers stay fake
+  and deterministic here too — no real Ollama container, no model pulled — see "AI-provider
+  policy" below. Run via `make test-e2e-backend`/`make verify-e2e-backend`, never as part of
+  `make test`/`make verify`, and not added to the pre-commit hook.
 - **Frontend E2E tests** — future milestone; no frontend exists yet in this repository.
-- **Real-AI smoke tests** — future milestone, kept deliberately separate from both the unit and
-  integration suites: a small, manual/nightly suite that runs against a real Ollama container
-  with real models pulled, to catch drift in actual model behavior/output shape without paying
-  that cost (container pull time, model pull time, non-determinism) on every commit.
+- **Real-AI smoke tests** — future milestone, kept deliberately separate from the unit,
+  integration, and backend E2E suites: a small, manual/nightly suite that runs against a real
+  Ollama container with real models pulled, to catch drift in actual model behavior/output shape
+  without paying that cost (container pull time, model pull time, non-determinism) on every
+  commit.
 
 **Local development** (running the app, trying it end-to-end by hand) continues to use
-`docker-compose.yml` exactly as before — nothing about that workflow changes. Tests, in either
-tier, must never depend on `docker-compose.yml` being up or on any state it created; the
-integration suite's fixtures (`tests/integration/conftest.py`) start their own containers from
-scratch every session and guard against ever pointing at a production `APP_ENV`/`DATABASE_URL`/
-`QDRANT_URL`.
+`docker-compose.yml` exactly as before — nothing about that workflow changes. Tests, in any tier,
+must never depend on `docker-compose.yml` being up or on any state it created; the integration and
+backend E2E suites' fixtures (`tests/integration/conftest.py`, `tests/e2e/backend/conftest.py`)
+start their own containers from scratch every session and guard against ever pointing at a
+production `APP_ENV`/`DATABASE_URL`/`QDRANT_URL`.
 
 ### AI-provider policy in tests
 
-Neither tier pulls or calls a real LLM/embedding model. Unit tests use hand-written fake
-provider doubles (see e.g. `tests/test_retrieval_service.py`, `tests/test_rag_orchestrator.py`).
-The integration suite's one end-to-end pipeline test
+No tier pulls or calls a real LLM/embedding model. Unit tests use hand-written fake provider
+doubles (see e.g. `tests/test_retrieval_service.py`, `tests/test_rag_orchestrator.py`). The
+integration suite's one end-to-end pipeline test
 (`tests/integration/test_ingestion_worker_postgres.py`) runs the real `IngestionWorker` default
 pipeline against real Postgres and real Qdrant, but with `get_embedding_provider` monkeypatched
-to a small fixed-vector fake — real Ollama stays entirely outside the default integration run,
+to a small fixed-vector fake. The backend E2E suite goes one step further and exercises the real
+HTTP/chat surface too, with `FakeEmbeddingProvider` (deterministic bag-of-words hashing, so a
+query genuinely matches its relevant indexed chunks under Qdrant's real cosine search) and
+`FakeStreamingLLMProvider`/`FakeFailingLLMProvider` (`tests/e2e/backend/fakes.py`) swapped in by
+monkeypatching the provider-factory function each consuming module already imports — never a
+branch on `APP_ENV` in production code. Real Ollama stays entirely outside all three suites,
 reserved for the future real-AI smoke suite described above.
 
 ## Operational Health Contract

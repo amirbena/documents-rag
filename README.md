@@ -607,6 +607,38 @@ make test-integration     # pytest -m integration -q
 make verify-integration   # runs the integration suite (room for future integration-specific checks)
 ```
 
+## Backend E2E tests
+
+A separate suite lives under `tests/e2e/backend/` (marked `@pytest.mark.e2e`) — it is **not**
+part of `make test`/`make verify`, and it is a distinct suite from `tests/integration/`.
+
+- **Covers the complete backend user flow through real HTTP**: document upload
+  (`POST /api/v1/documents`) → ingestion (the real `IngestionWorker`: extraction, chunking,
+  embedding, Qdrant upsert) → retrieval/orchestration → the streaming chat SSE endpoint
+  (`POST /api/v1/chat`), consumed incrementally so event order (`metadata` → `token`(s) → `done`)
+  is genuinely exercised, not just inspected as one buffered string. It also covers validation
+  errors, the decision layer's clarification/out-of-scope/direct-LLM/no-relevant-results paths,
+  a mid-stream LLM failure, an ingestion failure, and liveness staying up when readiness fails.
+- **Docker is required** — like the integration suite, Testcontainers for Python starts real,
+  isolated, temporary Postgres and Qdrant containers on ephemeral (dynamically assigned) ports,
+  with an isolated database and Qdrant collection per test.
+- **The repository's main `docker-compose.yml` is not used** — no fixed ports, no
+  shared/persistent Compose volumes. Every container is started and torn down by Testcontainers.
+- **Real Postgres and real Qdrant, deterministic fake AI providers**: the FastAPI app runs for
+  real behind a real ASGI HTTP client, with real extraction/chunking/decision/prompt-building/
+  Qdrant code paths — only the embedding model and the chat LLM are swapped for deterministic
+  fakes (`FakeEmbeddingProvider`, `FakeStreamingLLMProvider`), via monkeypatching the provider
+  factory each consuming module already imports, never a production-code branch on `APP_ENV`.
+  **No real Ollama container runs and no model is pulled.**
+- **Containers and all state are removed after the test session.**
+
+Run it with:
+
+```bash
+make test-e2e-backend     # pytest -m e2e tests/e2e/backend -q
+make verify-e2e-backend   # runs the backend E2E suite (room for future E2E-specific checks)
+```
+
 ## Pre-commit verification
 
 Install a git hook that runs `make verify` automatically before every commit, so a broken
@@ -726,6 +758,11 @@ Ollama model. On top of the business API, four **unversioned** platform endpoint
 `/health/live`, `/health/ready`, `/health/dependencies`) now give Kubernetes/load
 balancers/monitoring a stable operational contract independent of API versioning — readiness
 checks Postgres, Qdrant, Ollama, and its two configured models for real, with a short timeout and
-no secrets/connection details ever in the response — see "Platform health and readiness" above,
-"Integration tests" above, and "Test architecture" in [ARCHITECTURE.md](ARCHITECTURE.md) for the
-full list of what's intentionally deferred.
+no secrets/connection details ever in the response — see "Platform health and readiness" above.
+A backend E2E suite (`tests/e2e/backend/`, `make test-e2e-backend`) now drives the full flow —
+upload → ingestion → retrieval/orchestration → streaming chat — through real HTTP against the
+same kind of ephemeral Postgres/Qdrant containers, with deterministic fake embedding/LLM
+providers swapped in via dependency/provider-factory overrides rather than any `APP_ENV` branch
+in production code; see "Backend E2E tests" above. Frontend E2E and a real-Ollama smoke suite
+remain future milestones — see "Integration tests" above, and "Test architecture" in
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
