@@ -39,7 +39,7 @@ def _clear_overrides():
 
 def test_ollama_health_reachable_with_both_models_available() -> None:
     """Both models present should report 200 with all flags true."""
-    transport = _tags_transport(["llama3.1:latest", "nomic-embed-text:latest"])
+    transport = _tags_transport(["llama3.1:latest", "bge-m3:latest"])
     app.dependency_overrides[get_ollama_client] = lambda: OllamaClient(
         settings=get_settings(), transport=transport
     )

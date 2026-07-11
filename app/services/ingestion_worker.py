@@ -7,7 +7,8 @@ Document -> extraction -> chunking -> embedding -> versioned-collection upsert, 
 job to completed on success or failed (with the error stored) if any step raises. On success,
 the document's indexing metadata (embedding provider/model/dimension/version, chunking version,
 collection name, indexed_at) is persisted via app/services/index_registry.py — a failure never
-marks a document as indexed.
+marks a document as indexed. A document producing zero chunks is still marked indexed, with no
+vectors written — it is never left permanently unindexed/stale merely for being empty.
 """
 
 import uuid
@@ -20,6 +21,7 @@ from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
+from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunk, DocumentChunker
@@ -61,21 +63,23 @@ async def _default_process_document(
     config = get_active_embedding_config(settings)
     chunker = DocumentChunker(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
     chunks = chunker.chunk(extracted)
-    if not chunks:
-        return
 
-    embedding_provider = get_embedding_provider(settings)
-    vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
+    if chunks:
+        embedding_provider = get_embedding_provider(settings)
+        vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
+        validate_embeddings(vectors, expected_count=len(chunks), expected_dimension=config.dimension)
 
-    points = [
-        to_vector_point(chunk, vector, document.original_filename)
-        for chunk, vector in zip(chunks, vectors, strict=True)
-    ]
+        points = [
+            to_vector_point(chunk, vector, document.original_filename)
+            for chunk, vector in zip(chunks, vectors, strict=True)
+        ]
 
-    vector_store = get_vector_store(settings)
-    await ensure_active_collection(vector_store, session, config)
-    await vector_store.upsert_vectors(config.collection_name, points)
+        vector_store = get_vector_store(settings)
+        await ensure_active_collection(vector_store, session, config)
+        await vector_store.upsert_vectors(config.collection_name, points)
 
+    # A document producing zero chunks is still marked indexed (with zero indexed content) —
+    # see "Zero-chunk behavior" in ARCHITECTURE.md. It is never silently left unindexed/stale.
     mark_document_indexed(document, config)
 
 

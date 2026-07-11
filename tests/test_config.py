@@ -9,7 +9,7 @@ def test_settings_load_with_expected_defaults() -> None:
 
     assert isinstance(settings, Settings)
     assert settings.ollama_chat_model == "llama3.1"
-    assert settings.ollama_embedding_model == "nomic-embed-text"
+    assert settings.ollama_embedding_model == "bge-m3"
 
 
 def test_resolved_llm_model_falls_back_to_ollama_chat_model() -> None:
@@ -24,3 +24,16 @@ def test_resolved_llm_model_prefers_llm_model_when_set() -> None:
     settings = Settings(LLM_MODEL="llama3.2", OLLAMA_CHAT_MODEL="mistral")
 
     assert settings.resolved_llm_model == "llama3.2"
+
+
+def test_generation_llm_provider_and_model_defaults_are_unchanged() -> None:
+    """The multilingual-runtime/re-index cleanup work must never change the generation LLM.
+
+    Only the embedding model/dimension/version defaults changed in this milestone — LLM_PROVIDER,
+    OLLAMA_CHAT_MODEL, and RAG_ENGINE stay exactly as they were.
+    """
+    settings = get_settings()
+
+    assert settings.llm_provider == "ollama"
+    assert settings.ollama_chat_model == "llama3.1"
+    assert settings.rag_engine == "custom"

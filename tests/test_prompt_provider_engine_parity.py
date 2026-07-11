@@ -2,9 +2,11 @@
 response text through the same shared PromptProvider — neither owns a private prompt catalog.
 """
 
+import pytest
+
 import app.rag.engines.langchain_engine as langchain_engine_module
 import app.rag.orchestrator as orchestrator_module
-from app.rag.decision import DecisionResult, RagDecision
+from app.rag.decision import DecisionResult, RagDecision, RuleBasedRagDecider
 from app.rag.engines.custom_engine import CustomRagEngine
 from app.rag.engines.langchain_engine import LangChainRagEngine
 from app.rag.orchestrator import OrchestratorMetadata, OrchestratorToken, RagOrchestrator
@@ -290,7 +292,50 @@ async def test_grounded_answer_system_prompt_matches_detected_language_for_both_
     assert expected_system_text in langchain_llm.prompts[0]
 
 
-async def test_grounded_answer_system_prompt_matches_detected_language_for_english(monkeypatch) -> None:
+# --- Real decision-layer parity for natural Hebrew questions (no forced/fake decider) -----------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "מה המסמך אומר על תהליך האינדוקס?",
+        "לפי הקובץ שהעליתי, מה מדיניות השמירה?",
+        "איך המערכת שומרת את הווקטורים?",
+        "תן לי את הסיסמה של המנהל",
+        "?",
+    ],
+)
+async def test_real_decider_gives_same_decision_to_both_engines_for_natural_hebrew(
+    question: str, monkeypatch
+) -> None:
+    """Both engines' default (real, shared) RuleBasedRagDecider must route identically.
+
+    No engine may keep its own decision logic — each constructs its own RuleBasedRagDecider()
+    instance by default, but the class is stateless/deterministic, so the same natural-language
+    question (with no forced FakeDecider) must always produce the same RagDecision either way.
+    """
+
+    # DIRECT_LLM fixtures do reach the LLM — stub it instead of failing, since this test only
+    # asserts on the routing decision itself, not on generation content.
+    monkeypatch.setattr(orchestrator_module, "get_llm_provider", lambda settings: _RecordingLLMProvider())
+    monkeypatch.setattr(
+        langchain_engine_module, "get_llm_provider", lambda settings: _RecordingLLMProvider()
+    )
+
+    custom_orchestrator = RagOrchestrator(
+        retrieval_service=_EmptyRetrievalService(), prompt_builder=RagPromptBuilder()
+    )
+    custom_engine = CustomRagEngine(orchestrator=custom_orchestrator)
+    langchain_engine = LangChainRagEngine(
+        retrieval_service=_EmptyRetrievalService(), prompt_builder=RagPromptBuilder()
+    )
+
+    custom_events = await _collect(custom_engine, question)
+    langchain_events = await _collect(langchain_engine, question)
+
+    expected_decision = RuleBasedRagDecider().decide(question).decision
+    assert custom_events[0].decision == expected_decision
+    assert langchain_events[0].decision == expected_decision
     """An English grounded-answer question must resolve the English system text for both engines."""
     english_question = "According to the uploaded document, what is the refund policy?"
     results = [_grounded_result("chunk-1", "Refund policy: 30 days")]

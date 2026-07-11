@@ -48,6 +48,7 @@ async def test_existing_vectors_are_searchable_through_the_langchain_adapter(
 ) -> None:
     """A collection indexed exactly like ingestion does must be searchable via ProviderBackedRetriever."""
     settings = get_settings()
+    monkeypatch.setattr(settings, "vector_size", 3)
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
     collection_name = get_active_embedding_config(settings).collection_name
@@ -85,6 +86,7 @@ async def test_existing_vectors_are_searchable_through_the_langchain_adapter(
 async def test_metadata_round_trips_correctly_through_real_qdrant(qdrant_url: str, monkeypatch) -> None:
     """document_id/chunk_id/source/page_number/sheet_name/score must survive a real round trip."""
     settings = get_settings()
+    monkeypatch.setattr(settings, "vector_size", 2)
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
     collection_name = get_active_embedding_config(settings).collection_name
@@ -124,6 +126,7 @@ async def test_metadata_round_trips_correctly_through_real_qdrant(qdrant_url: st
 async def test_no_separate_collection_is_created(qdrant_url: str, monkeypatch) -> None:
     """Retrieving through the LangChain adapter must not create any collection of its own."""
     settings = get_settings()
+    monkeypatch.setattr(settings, "vector_size", 2)
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
     collection_name = get_active_embedding_config(settings).collection_name
@@ -158,6 +161,7 @@ async def test_no_separate_collection_is_created(qdrant_url: str, monkeypatch) -
 async def test_configured_embedding_provider_is_used(qdrant_url: str, monkeypatch) -> None:
     """The retriever must embed the query via whichever EmbeddingProvider is configured."""
     settings = get_settings()
+    monkeypatch.setattr(settings, "vector_size", 2)
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
     collection_name = get_active_embedding_config(settings).collection_name
@@ -194,6 +198,7 @@ async def test_retrieval_result_returns_no_relevant_results_without_fabrication(
 ) -> None:
     """An empty collection must return no documents — no fabricated results."""
     settings = get_settings()
+    monkeypatch.setattr(settings, "vector_size", 2)
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
     collection_name = get_active_embedding_config(settings).collection_name

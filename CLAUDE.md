@@ -171,8 +171,41 @@ def get_settings() -> Settings:
 - **Real Ollama/real embedding models stay out of the default automated suites.** Unit,
   integration, and backend E2E tests use `MultilingualFakeEmbeddingProvider`
   (`tests/multilingual_fixtures.py`) or an equivalent fake — never a real multilingual model
-  download or call. A real-model evaluation belongs in a separate, future manual/nightly
-  exercise, same as the existing real-Ollama smoke-suite boundary.
+  download or call. A real-model evaluation belongs in `make smoke-multilingual-real`
+  (`scripts/smoke_multilingual_real.py`), a separate, manual, non-blocking target never invoked
+  by `make verify`/`make test*`/CI, same as the existing real-Ollama smoke-suite boundary.
+- **Validate real embedding-vector output, not just configuration.** Every embedding batch
+  (ingestion, re-index, and the query vector at retrieval) must pass through
+  `app/rag/embedding_validation.py`'s `validate_embeddings()` before any Qdrant write/search or
+  document-indexed marking — a wrong vector count or dimension must fail loudly
+  (`EmbeddingResultCountMismatchError`/`EmbeddingDimensionMismatchError`), never write partial or
+  mismatched data.
+- **The decision layer stays single and shared, in both languages.** `RuleBasedRagDecider`
+  (`app/rag/decision.py`) is the one decision service; do not add a
+  `CustomHebrewDecider`/`LangChainHebrewDecider` or any other engine-specific routing logic.
+  Hebrew patterns must match meaningful intent phrasing (a document/file reference, an extraction
+  verb near a sensitive noun) — never bare Hebrew-script detection.
+- **Generative system prompts share one English instruction, never duplicated per language.**
+  `PromptCatalog.get_shared_instructions()` is English-only; the per-language piece is only the
+  explicit response-language directive (`get_response_language_directive()`) — never instruct the
+  model to "answer in English and translate," and never claim the model "thinks in English."
+- **Re-index outcomes must be represented with a typed result, not a bare bool.**
+  `reindex_document()` returns `ReindexResult`/`ReindexOutcome` — a bare `bool` cannot represent
+  "zero-chunk document" or "the new collection/metadata committed but the old collection's
+  cleanup failed" distinctly from a plain success. A zero-chunk document is marked indexed (with
+  no vectors) — see `ARCHITECTURE.md`'s "Zero-chunk behavior" — never silently left unindexed.
+- **A legacy-vector cleanup failure is tracked, never silently dropped or conflated with
+  re-index failure.** Persist it as a `VectorCleanupJob` (`app/models/vector_cleanup_job.py`) and
+  expose a retryable `retry_cleanup_job()` — retried regardless of whether the document itself is
+  still stale, since cleanup success/failure is independent of `is_document_stale()`. Document
+  deletion (`delete_document_vectors()`) must clean every collection tracked by a pending/failed
+  cleanup job for that document, not just its current one.
+- **Never claim the Qdrant/PostgreSQL boundary is atomic, or that a failed attempt is
+  indistinguishable from one that never ran.** A Qdrant write can succeed before a Postgres
+  commit fails; `reindex_document()` rolls back and expires the `Document` in that case, but the
+  Qdrant points already exist (retry-safe via deterministic point IDs) — document this precisely,
+  per `ARCHITECTURE.md`'s "Re-index" transaction-semantics description, rather than glossing over
+  it.
 
 ## Database Testing Style
 

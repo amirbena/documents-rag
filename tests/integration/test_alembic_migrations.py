@@ -29,6 +29,7 @@ async def test_upgrade_head_creates_expected_tables(migrated_schema: None, postg
     assert "documents" in table_names
     assert "ingestion_jobs" in table_names
     assert "index_collections" in table_names
+    assert "vector_cleanup_jobs" in table_names
 
 
 async def test_upgrade_head_creates_expected_columns(migrated_schema: None, postgres_url: str) -> None:
@@ -195,3 +196,49 @@ async def test_upgrade_from_previous_revision_adds_indexing_metadata(
 
     assert "index_collections" in table_names
     assert "indexed_at" in document_columns
+
+
+async def test_upgrade_from_prior_revision_adds_vector_cleanup_jobs_table(
+    migrated_schema: None, postgres_url: str
+) -> None:
+    """Upgrading from 07f849bf2b95 alone should add the vector_cleanup_jobs table.
+
+    Runs downgrade to the immediately-prior revision first, confirming the new table is
+    genuinely absent, then upgrades to head and confirms it appears with the expected columns.
+    """
+    await asyncio.to_thread(run_alembic_downgrade, "07f849bf2b95")
+
+    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+    finally:
+        await engine.dispose()
+
+    assert "vector_cleanup_jobs" not in table_names
+
+    await asyncio.to_thread(run_alembic_upgrade, "head")
+
+    engine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+            cleanup_job_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"] for col in inspect(sync_conn).get_columns("vector_cleanup_jobs")
+                }
+            )
+    finally:
+        await engine.dispose()
+
+    assert "vector_cleanup_jobs" in table_names
+    assert cleanup_job_columns == {
+        "id",
+        "document_id",
+        "collection_name",
+        "status",
+        "attempts",
+        "last_error",
+        "created_at",
+        "completed_at",
+    }
