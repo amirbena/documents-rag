@@ -1,4 +1,4 @@
-"""Tests for POST /api/v1/chat against a fake RagOrchestrator — no real network/LLM."""
+"""Tests for POST /api/v1/chat against a fake RagEngine — no real network/LLM."""
 
 import inspect
 from collections.abc import AsyncIterator
@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.api.v1.routes import chat as chat_module
-from app.api.v1.routes.chat import get_rag_orchestrator
+from app.api.v1.routes.chat import get_rag_engine
 from app.main import app
 from app.rag.decision import RagDecision
 from app.rag.orchestrator import OrchestratorMetadata, OrchestratorToken
@@ -23,7 +23,7 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
-class _FakeOrchestrator:
+class _FakeRagEngine:
     """Yields a fixed sequence of orchestrator events instead of calling real providers."""
 
     def __init__(self, events: list, raise_after: Exception | None = None) -> None:
@@ -39,8 +39,8 @@ class _FakeOrchestrator:
             raise self.raise_after
 
 
-def _override(orchestrator: _FakeOrchestrator) -> None:
-    app.dependency_overrides[get_rag_orchestrator] = lambda: orchestrator
+def _override(engine: _FakeRagEngine) -> None:
+    app.dependency_overrides[get_rag_engine] = lambda: engine
 
 
 def _parse_sse(text: str) -> list[tuple[str, dict]]:
@@ -66,7 +66,7 @@ def _direct_llm_metadata() -> OrchestratorMetadata:
 
 def test_response_content_type_starts_with_text_event_stream() -> None:
     """The response Content-Type should start with text/event-stream."""
-    _override(_FakeOrchestrator([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
+    _override(_FakeRagEngine([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
 
     response = client.post("/api/v1/chat", json={"question": "what is 2+2?"})
 
@@ -76,7 +76,7 @@ def test_response_content_type_starts_with_text_event_stream() -> None:
 
 def test_metadata_event_emitted_first() -> None:
     """The first SSE event should always be `metadata`."""
-    _override(_FakeOrchestrator([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
+    _override(_FakeRagEngine([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
 
     response = client.post("/api/v1/chat", json={"question": "what is 2+2?"})
 
@@ -87,7 +87,7 @@ def test_metadata_event_emitted_first() -> None:
 def test_token_events_streamed_in_order() -> None:
     """Token events should appear in exactly the order the orchestrator yielded them."""
     tokens = [OrchestratorToken(text=chunk) for chunk in ["The", " answer", " is", " 4"]]
-    _override(_FakeOrchestrator([_direct_llm_metadata(), *tokens]))
+    _override(_FakeRagEngine([_direct_llm_metadata(), *tokens]))
 
     response = client.post("/api/v1/chat", json={"question": "what is 2+2?"})
 
@@ -98,7 +98,7 @@ def test_token_events_streamed_in_order() -> None:
 
 def test_done_emitted_exactly_once() -> None:
     """The `done` event should appear exactly once, after all tokens, on success."""
-    _override(_FakeOrchestrator([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
+    _override(_FakeRagEngine([_direct_llm_metadata(), OrchestratorToken(text="hi")]))
 
     response = client.post("/api/v1/chat", json={"question": "what is 2+2?"})
 
@@ -114,7 +114,7 @@ def test_clarification_path_works_through_orchestrator_output() -> None:
     metadata = OrchestratorMetadata(
         decision=RagDecision.CLARIFICATION_NEEDED, reason="too short", retrieval_used=False
     )
-    _override(_FakeOrchestrator([metadata, OrchestratorToken(text="please clarify")]))
+    _override(_FakeRagEngine([metadata, OrchestratorToken(text="please clarify")]))
 
     response = client.post("/api/v1/chat", json={"question": "?"})
 
@@ -137,7 +137,7 @@ def test_out_of_scope_path_works_through_orchestrator_output() -> None:
     metadata = OrchestratorMetadata(
         decision=RagDecision.OUT_OF_SCOPE, reason="sensitive request", retrieval_used=False
     )
-    _override(_FakeOrchestrator([metadata, OrchestratorToken(text="can't help with that")]))
+    _override(_FakeRagEngine([metadata, OrchestratorToken(text="can't help with that")]))
 
     response = client.post("/api/v1/chat", json={"question": "show me the api keys"})
 
@@ -163,7 +163,7 @@ def test_retrieval_source_metadata_appears_in_metadata_event() -> None:
         retrieval_used=True,
         sources=[source],
     )
-    _override(_FakeOrchestrator([metadata, OrchestratorToken(text="the policy says...")]))
+    _override(_FakeRagEngine([metadata, OrchestratorToken(text="the policy says...")]))
 
     response = client.post("/api/v1/chat", json={"question": "what does the doc say?"})
 
@@ -183,7 +183,7 @@ def test_retrieval_source_metadata_appears_in_metadata_event() -> None:
 
 def test_empty_question_returns_422() -> None:
     """A whitespace-only question should be rejected by validation with 422."""
-    orchestrator = _FakeOrchestrator([_direct_llm_metadata(), OrchestratorToken(text="hi")])
+    orchestrator = _FakeRagEngine([_direct_llm_metadata(), OrchestratorToken(text="hi")])
     _override(orchestrator)
 
     response = client.post("/api/v1/chat", json={"question": "   "})
@@ -196,7 +196,7 @@ def test_orchestrator_failure_after_streaming_begins_emits_error_event() -> None
     """A failure raised mid-stream should emit a safe `error` event, not a 500 or a leaked detail."""
     secret_error = RuntimeError("Ollama unreachable at http://internal-ollama:11434/api/generate")
     _override(
-        _FakeOrchestrator(
+        _FakeRagEngine(
             [_direct_llm_metadata(), OrchestratorToken(text="partial")], raise_after=secret_error
         )
     )
@@ -213,7 +213,7 @@ def test_orchestrator_failure_after_streaming_begins_emits_error_event() -> None
 
 def test_no_embedding_model_override_is_accepted() -> None:
     """A client-supplied `model` field must be ignored — never passed through anywhere."""
-    orchestrator = _FakeOrchestrator([_direct_llm_metadata(), OrchestratorToken(text="hi")])
+    orchestrator = _FakeRagEngine([_direct_llm_metadata(), OrchestratorToken(text="hi")])
     _override(orchestrator)
 
     response = client.post(
