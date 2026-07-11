@@ -1,9 +1,11 @@
-"""Streaming SSE chat endpoint: reuses RagOrchestrator, no orchestration logic of its own.
+"""Streaming SSE chat endpoint: reuses whichever RagEngine is configured, no orchestration logic
+of its own.
 
-Formats RagOrchestrator.stream_answer(question) output as Server-Sent Events (metadata, token,
-done, error) and returns it via a FastAPI StreamingResponse. Contains no decision, retrieval, or
-prompt-building logic and makes no direct provider calls — it only serializes events the
-orchestrator already produced.
+Formats RagEngine.stream_answer(question) output as Server-Sent Events (metadata, token, done,
+error) and returns it via a FastAPI StreamingResponse. Contains no decision, retrieval, or
+prompt-building logic, makes no direct provider calls, and does not know or care whether
+CustomRagEngine or LangChainRagEngine is configured (see RAG_ENGINE) — it only serializes events
+the engine already produced.
 """
 
 import json
@@ -12,7 +14,9 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from app.rag.orchestrator import OrchestratorMetadata, OrchestratorToken, RagOrchestrator
+from app.rag.engine import RagEngine
+from app.rag.engines.engine_factory import get_rag_engine as resolve_rag_engine
+from app.rag.orchestrator import OrchestratorMetadata, OrchestratorToken
 from app.rag.prompt_builder import PromptSource
 from app.schemas.chat import ChatRequest
 
@@ -21,9 +25,9 @@ router = APIRouter()
 _SAFE_ERROR_MESSAGE = "Failed to generate a response."
 
 
-def get_rag_orchestrator() -> RagOrchestrator:
-    """Build a RagOrchestrator instance."""
-    return RagOrchestrator()
+def get_rag_engine() -> RagEngine:
+    """Build the configured RagEngine (see RAG_ENGINE) instance."""
+    return resolve_rag_engine()
 
 
 def _sse_event(event: str, data: dict) -> str:
@@ -56,8 +60,8 @@ def _metadata_payload(metadata: OrchestratorMetadata) -> dict:
     }
 
 
-async def _stream_chat_events(question: str, orchestrator: RagOrchestrator) -> AsyncIterator[str]:
-    """Consume RagOrchestrator.stream_answer(question) and yield it as formatted SSE events.
+async def _stream_chat_events(question: str, engine: RagEngine) -> AsyncIterator[str]:
+    """Consume RagEngine.stream_answer(question) and yield it as formatted SSE events.
 
     Emits `metadata` before any `token`, then `done` exactly once on normal completion. A
     failure raised after streaming has started is emitted as a single `error` event with a
@@ -65,7 +69,7 @@ async def _stream_chat_events(question: str, orchestrator: RagOrchestrator) -> A
     streaming stops there without a `done` event. Client cancellation propagates normally.
     """
     try:
-        async for event in orchestrator.stream_answer(question):
+        async for event in engine.stream_answer(question):
             if isinstance(event, OrchestratorMetadata):
                 yield _sse_event("metadata", _metadata_payload(event))
             elif isinstance(event, OrchestratorToken):
@@ -80,10 +84,10 @@ async def _stream_chat_events(question: str, orchestrator: RagOrchestrator) -> A
 @router.post("/chat")
 async def chat(
     request: ChatRequest,
-    orchestrator: RagOrchestrator = Depends(get_rag_orchestrator),
+    engine: RagEngine = Depends(get_rag_engine),
 ) -> StreamingResponse:
-    """Stream RagOrchestrator's answer to `request.question` as Server-Sent Events."""
+    """Stream the configured RagEngine's answer to `request.question` as Server-Sent Events."""
     return StreamingResponse(
-        _stream_chat_events(request.question, orchestrator),
+        _stream_chat_events(request.question, engine),
         media_type="text/event-stream",
     )

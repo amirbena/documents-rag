@@ -101,6 +101,42 @@ def get_settings() -> Settings:
   This keeps dependencies minimal and behavior fully visible/testable via mocked `httpx`
   transports instead of SDK-specific mocking.
 
+## RAG Engine Compatibility Style
+
+- **`CustomRagEngine` (wrapping `RagOrchestrator`) remains the default and reference RAG engine.**
+  `RAG_ENGINE` defaults to `custom`; every other `RagEngine` implementation is judged against its
+  behavior, not the other way around. Never change this default without an explicit user request.
+- **A LangChain-based (or any alternative) RAG engine must be adapter-based**, not a rewrite.
+  It must reuse `RuleBasedRagDecider`/`RetrievalService`/`RagPromptBuilder` and the existing
+  provider factory (`app/rag/providers/provider_factory.py`) — see `app/rag/engines/
+  langchain_adapters.py` (`ProviderBackedLLM`/`ProviderBackedEmbeddings`/`ProviderBackedRetriever`)
+  for the established pattern: wrap an already-resolved provider/service instance, never
+  reimplement its logic.
+- **An alternative RAG engine must never bypass the provider factory.** It must resolve
+  `LLMProvider`/`EmbeddingProvider`/`VectorStore` via `get_llm_provider()`/
+  `get_embedding_provider()`/`get_vector_store()`, exactly like `RagOrchestrator` does — never
+  construct an Ollama/OpenAI/Gemini/Anthropic/Qdrant client directly inside an engine or its
+  adapters.
+- **An alternative RAG engine must never select a different embedding model, vector size, or
+  Qdrant collection than the one already configured** (`OLLAMA_EMBEDDING_MODEL`, `VECTOR_SIZE`,
+  `QDRANT_COLLECTION_NAME`) — switching `RAG_ENGINE` must never re-embed a document, create a new
+  collection, or change a chunk/point ID.
+- **Every `RagEngine` implementation must preserve the public API/SSE contract exactly.**
+  `POST /api/v1/chat`'s event types (`metadata`/`token`/`done`/`error`), field shapes, ordering
+  guarantees (metadata first, `done` exactly once on success, one `error` with no `done` on
+  failure), and safe-error-message rules apply identically regardless of which engine is
+  configured — the frontend must never need to know which one is selected.
+- **An unsupported `RAG_ENGINE` value must fail explicitly** (`UnsupportedRagEngineError`) —
+  mirroring the existing `LLM_PROVIDER`/`EMBEDDING_PROVIDER`/`VECTOR_STORE_PROVIDER` rule, never
+  silently fall back to `custom` or silently switch which engine/provider is used.
+- **API routes must remain engine-agnostic.** `app/api/v1/routes/chat.py` depends on the abstract
+  `RagEngine` (via the engine factory), never on a concrete engine class, and must never branch on
+  `RAG_ENGINE` or contain decision/retrieval/prompt/provider-selection logic of its own (see
+  "Route Layer Style" below).
+- **LangGraph must not be introduced until a real agentic workflow requires it** (multi-step tool
+  use, conditional branching driven by intermediate LLM output, etc.). The current decide-then-
+  generate flow has no agent loop for LangGraph's graph/state machinery to add value to.
+
 ## Database Testing Style
 
 - **Do not add SQLite/`aiosqlite` for testing database-touching code.** The project targets

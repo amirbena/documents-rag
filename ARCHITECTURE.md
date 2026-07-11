@@ -415,20 +415,116 @@ AsyncIterator[str]` alongside the existing `generate(prompt) -> str` (previously
 `ProviderNotImplementedError` from `stream_generate()` too, keeping the "stub never calls out"
 guarantee for both methods.
 
+## RAG Engine Compatibility Layer
+
+`RagOrchestrator` remains the platform's single reference RAG implementation, but
+`POST /api/v1/chat` no longer depends on it directly — it depends on a small `RagEngine`
+abstraction (`app/rag/engine.py`), so a second, LangChain-backed execution engine can be
+selected without touching the public API, the SSE contract, or any existing
+provider/retrieval/prompt/orchestration code:
+
+```
+RagEngine (app/rag/engine.py)
+├── CustomRagEngine    (app/rag/engines/custom_engine.py)   — default
+└── LangChainRagEngine (app/rag/engines/langchain_engine.py) — optional
+```
+
+**Contract**: `stream_answer(question: str) -> AsyncIterator[OrchestratorMetadata |
+OrchestratorToken]`, plus an `answer(question) -> str` default that collects the streamed
+tokens. Both concrete engines yield the exact same `OrchestratorMetadata`/`OrchestratorToken`
+dataclasses `RagOrchestrator` already defines — `RagEngine` is independent of FastAPI and SSE
+formatting, so `app/api/v1/routes/chat.py`'s SSE mapping needs no engine-specific branch.
+
+**Engine-selection flow**: `get_rag_engine(settings)`
+(`app/rag/engines/engine_factory.py`) reads `RAG_ENGINE` and resolves the concrete engine — the
+same "resolve, don't branch" shape as `provider_factory.py`. `RAG_ENGINE=custom` (the default)
+resolves to `CustomRagEngine`; `RAG_ENGINE=langchain` resolves to `LangChainRagEngine`; any other
+value raises `UnsupportedRagEngineError` immediately. There is no silent fallback to `custom` and
+no silent provider switch — mirroring the **no-fallback rule** `provider_factory.py` already
+established for `LLM_PROVIDER`/`EMBEDDING_PROVIDER`/`VECTOR_STORE_PROVIDER`.
+
+**`CustomRagEngine`** adds no logic: it constructs (or accepts) a `RagOrchestrator` and delegates
+`stream_answer()` straight to it. `RuleBasedRagDecider`, `RetrievalService`, `RagPromptBuilder`,
+`LLMProvider.stream_generate()`, source metadata, and failure propagation are byte-for-byte the
+same as before this layer existed — this is why `RagOrchestrator` remains the reference
+implementation: every other engine is judged against its behavior, not the other way around.
+
+**`LangChainRagEngine`** (`app/rag/engines/langchain_engine.py`) reuses
+`RuleBasedRagDecider.decide(question)` directly, unmodified, *outside* any LangChain `Runnable` —
+this keeps the decision contract (which four `RagDecision` values exist, and their `reason`
+strings) identical to `CustomRagEngine`'s without needing LangChain to model routing at all.
+`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` stream the same fixed message text `RagOrchestrator` uses
+(imported directly from `app.rag.orchestrator`, not duplicated, so the two engines can never
+drift apart on that text) with no retrieval and no LLM call. For `NEEDS_RETRIEVAL`/`DIRECT_LLM`,
+it builds a LangChain `ChatPromptValue` (from literal `SystemMessage`/`HumanMessage` content —
+never an interpolated `ChatPromptTemplate`, so arbitrary document text containing `{`/`}`
+characters can never be misparsed as a template variable) and pipes it through a LangChain
+`RunnableLambda(...) | ProviderBackedLLM` chain, streaming the result chunk by chunk.
+
+**Adapter boundaries and provider-factory reuse** (`app/rag/engines/langchain_adapters.py`) —
+the *only* place `LangChainRagEngine` touches a LangChain provider-facing base class:
+
+- `ProviderBackedLLM` (`langchain_core.language_models.llms.LLM`) streams from whatever
+  `LLMProvider` `app.rag.providers.provider_factory.get_llm_provider()` resolved.
+- `ProviderBackedEmbeddings` (`langchain_core.embeddings.Embeddings`) wraps whatever
+  `EmbeddingProvider` `get_embedding_provider()` resolved.
+- `ProviderBackedRetriever` (`langchain_core.retrievers.BaseRetriever`) wraps the existing
+  `RetrievalService` — the same `QdrantVectorStore`, `QDRANT_COLLECTION_NAME`,
+  `RETRIEVAL_TOP_K`/`RETRIEVAL_SCORE_THRESHOLD` filtering, and embedding provider every other
+  caller of `RetrievalService` gets. There is no `langchain-community` Qdrant vector-store
+  integration and no second Qdrant SDK path — `QdrantVectorStore`'s own `httpx`-based HTTP calls
+  are the only thing that ever talks to Qdrant, in either engine.
+
+None of the three adapters construct an Ollama, OpenAI, Gemini, Anthropic, or Qdrant client
+directly — each one is handed an already-resolved provider/service instance and only adapts its
+interface, never its configuration or selection.
+
+**Shared Qdrant/embedding contract**: `ProviderBackedRetriever` returns LangChain `Document`s
+built from `VectorSearchResult` (`document_to_search_result()`/`_search_result_to_document()` in
+`langchain_adapters.py` are exact inverses of each other), and `LangChainRagEngine` converts
+retrieved `Document`s straight back into `VectorSearchResult`s before handing them to the
+existing, unmodified `RagPromptBuilder`. This means: same embedding model, same `VECTOR_SIZE`,
+same `QDRANT_COLLECTION_NAME`, same vectors and payload metadata, same `[S1]`/`[S2]` source
+labels and rank order, same governance instructions ("answer only from context", "say so if the
+answer isn't present"), and the same Hebrew/Unicode handling as `CustomRagEngine` — nothing about
+switching engines re-embeds a document, creates a new collection, or changes a chunk/point ID.
+
+**API/SSE independence**: `app/api/v1/routes/chat.py` depends on `RagEngine` (via
+`get_rag_engine()`, a route-local dependency wrapping the factory), not `RagOrchestrator` or
+`LangChainRagEngine` — the route has no knowledge of which concrete engine is configured, no
+`RAG_ENGINE` branch, and (per "Route Layer Style" in CLAUDE.md) no decision/retrieval/prompt
+logic of its own either way.
+
+**No-results behavior is identical across engines**: when `RetrievalService.retrieve()` returns
+no results, `RagPromptBuilder` already emits its fixed "no relevant context was found" content
+with `sources=[]` — `LangChainRagEngine` never substitutes a `DIRECT_LLM` answer or fabricates a
+source in that case, matching `CustomRagEngine` exactly.
+
+**Why LangGraph is intentionally deferred**: LangChain's `Runnable`/prompt/retriever primitives
+are sufficient to express this platform's existing four-way decision routing plus a single
+retrieval-then-generate step — there is no multi-step agent loop, no tool calling, and no
+conversation memory for LangGraph's graph/state machinery to add value to. Introducing LangGraph
+now would add a second orchestration paradigm with nothing for it to orchestrate; it belongs in a
+future milestone only once a real agentic workflow (multi-step tool use, conditional branching
+driven by intermediate LLM output, etc.) actually requires it.
+
 ## Streaming chat endpoint
 
 `POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is the first public endpoint that produces an
 end-to-end RAG answer. It is deliberately a **thin route**: it validates the request, resolves a
-`RagOrchestrator` via a FastAPI dependency, and formats `stream_answer()`'s output as
-Server-Sent Events — it contains no decision, retrieval, or prompt-building logic, and makes no
-direct call to any provider factory (`get_embedding_provider()`/`get_vector_store()`/
-`get_llm_provider()`) or to `RuleBasedRagDecider`/`RetrievalService`/`RagPromptBuilder` — those
-all live inside `RagOrchestrator`, which the route only consumes.
+`RagEngine` via a FastAPI dependency (`get_rag_engine()` in the route module, wrapping
+`app.rag.engines.engine_factory.get_rag_engine()` — see "RAG Engine Compatibility Layer" above),
+and formats `stream_answer()`'s output as Server-Sent Events — it contains no decision,
+retrieval, or prompt-building logic, makes no direct call to any provider factory
+(`get_embedding_provider()`/`get_vector_store()`/`get_llm_provider()`) or to
+`RuleBasedRagDecider`/`RetrievalService`/`RagPromptBuilder`, and does not know or branch on
+whether `CustomRagEngine` or `LangChainRagEngine` is configured — those all live inside whichever
+`RagEngine` is resolved, which the route only consumes.
 
 - **Request**: `ChatRequest` (`app/schemas/chat.py`) — `{"question": str}` only. A
   `field_validator` rejects an empty/whitespace-only `question`, which FastAPI turns into a
   standard `422` response before the route body ever runs. There is no `model` field: neither
-  `RagOrchestrator.stream_answer()` nor `LLMProvider` currently accepts a validated per-request
+  `RagEngine.stream_answer()` nor `LLMProvider` currently accepts a validated per-request
   model override, so none is exposed — adding one is future work, not a silent gap. The embedding
   model is never client-selectable, matching the existing `OLLAMA_EMBEDDING_MODEL`-is-fixed rule
   (see "LLM provider vs. model" above).
@@ -508,6 +604,18 @@ must never depend on `docker-compose.yml` being up or on any state it created; t
 backend E2E suites' fixtures (`tests/integration/conftest.py`, `tests/e2e/backend/conftest.py`)
 start their own containers from scratch every session and guard against ever pointing at a
 production `APP_ENV`/`DATABASE_URL`/`QDRANT_URL`.
+
+The RAG engine compatibility layer's tests span all three tiers above rather than forming a
+separate tier of their own: `tests/test_rag_engine_factory.py`/`test_custom_rag_engine.py`/
+`test_langchain_rag_engine.py`/`test_langchain_adapters.py` are unit tests,
+`tests/integration/test_langchain_rag_engine_integration.py` is an integration test (real
+ephemeral Qdrant, existing `VectorPoint` format, fake embeddings), and
+`tests/e2e/backend/test_rag_engine_parity.py` runs the full backend E2E flow under both
+`RAG_ENGINE=custom` and `RAG_ENGINE=langchain`, comparing source IDs/ranking/metadata/SSE
+ordering/error/no-results behavior for equivalence (the generated answer text may legitimately
+differ). `make test-rag-engines`/`make verify-rag-engines` run just these files across all three
+tiers as a convenience — they are not a substitute for `make verify`/`verify-integration`/
+`verify-e2e-backend`, which still cover everything including this layer.
 
 ### AI-provider policy in tests
 
@@ -675,6 +783,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `VECTOR_SIZE`              | `768`                                                                  | Vector dimensionality passed to `create_collection_if_not_exists` — must match the embedding provider's output size (`nomic-embed-text` produces 768-dim vectors) |
 | `RETRIEVAL_TOP_K`          | `5`                                                                    | Default number of results `RetrievalService.retrieve()` asks Qdrant for, when no explicit `limit` is passed |
 | `RETRIEVAL_SCORE_THRESHOLD`| *(unset)*                                                              | Minimum Qdrant score a result must meet to be returned; unset/`null` disables score filtering |
+| `RAG_ENGINE`               | `custom`                                                               | Selects the `RagEngine` implementation via `get_rag_engine()` (see "RAG Engine Compatibility Layer"); `langchain` is the only other recognized value — anything else raises `UnsupportedRagEngineError` |
 
 ## Current boundaries
 
@@ -749,12 +858,19 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   "RAG orchestrator" above). The only component that composes the decision layer, retrieval
   service, prompt builder, and LLM provider together — no other module in `app/rag` calls more
   than one of them.
+- `app/rag/engine.py` — the `RagEngine` abstraction (see "RAG Engine Compatibility Layer" above).
+- `app/rag/engines/` — concrete `RagEngine` implementations: `custom_engine.py`
+  (`CustomRagEngine`, the default, wrapping `RagOrchestrator`), `langchain_engine.py`
+  (`LangChainRagEngine`, optional), `langchain_adapters.py` (`ProviderBackedLLM`/
+  `ProviderBackedEmbeddings`/`ProviderBackedRetriever`), and `engine_factory.py`
+  (`get_rag_engine()`, `UnsupportedRagEngineError`).
 - `app/workers` — background job placeholders.
 - `tests/integration/` — the Testcontainers-based integration suite (see "Test architecture"
   above): `conftest.py` (ephemeral Postgres/Qdrant fixtures, the production-environment guard,
   the Alembic-migration helpers), `test_alembic_migrations.py`, `test_ingestion_worker_postgres.py`,
-  `test_qdrant_vector_store_integration.py`. Entirely separate from `tests/*.py` (unit tests);
-  auto-marked `@pytest.mark.integration` and excluded from `make test`/`make verify`.
+  `test_qdrant_vector_store_integration.py`, `test_langchain_rag_engine_integration.py`. Entirely
+  separate from `tests/*.py` (unit tests); auto-marked `@pytest.mark.integration` and excluded
+  from `make test`/`make verify`.
 
 ## What is intentionally not implemented yet
 
@@ -773,9 +889,17 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
 - MinIO / any S3-compatible object storage, and a `FileStorage` provider factory —
   `LocalFileStorage` remains the only implementation
-- Backend E2E tests (full upload-to-chat flow) and frontend E2E tests — no frontend exists yet
+- Frontend E2E tests — no frontend exists yet in this repository
 - A real-Ollama smoke suite — deliberately kept separate/manual/nightly, not part of the default
   integration run (see "Test architecture" above)
+- LangGraph — the LangChain compatibility layer uses only `langchain-core`'s
+  `Runnable`/prompt/retriever primitives; see "Why LangGraph is intentionally deferred" under "RAG
+  Engine Compatibility Layer" above
+- Agents, tool calling, and any LangChain/LangGraph agent packages — neither `RagEngine`
+  implementation exposes tool use; both are a fixed decide-then-generate flow
+- A LangChain-specific ingestion path, a second Qdrant SDK/collection, or a client-selectable
+  `RAG_ENGINE` override — `RAG_ENGINE` is a server-side deployment setting, never a per-request
+  parameter
 - Kubernetes manifests, Helm charts, ArgoCD Application/Rollout resources, or any
   monitoring/alerting configuration that actually consumes the new `/health/*` endpoints — this
   milestone only establishes the operational health *contract* those future consumers would use

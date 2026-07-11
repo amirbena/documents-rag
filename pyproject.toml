@@ -18,6 +18,7 @@ dependencies = [
     "pypdf>=4.0",
     "python-docx>=1.1",
     "openpyxl>=3.1",
+    "langchain-core>=0.3",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +56,9 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
 
 [tool.mypy]
-python_version = "3.11"
+# 3.12, one above requires-python's floor: numpy's stub (pulled in transitively via
+# qdrant-client) uses a PEP 695 `type` alias mypy only parses under python_version >= 3.12,
+# even inside .pyi files. Does not change the app's actual runtime-supported Python version.
+python_version = "3.12"
 ignore_missing_imports = true
 disallow_untyped_defs = false

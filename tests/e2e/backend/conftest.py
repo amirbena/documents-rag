@@ -23,6 +23,7 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 from testcontainers.postgres import PostgresContainer
 
+import app.rag.engines.langchain_engine as langchain_engine_module
 import app.rag.orchestrator as orchestrator_module
 import app.rag.retrieval_service as retrieval_service_module
 import app.services.ingestion_worker as ingestion_worker_module
@@ -223,12 +224,17 @@ def e2e_provider_overrides(
     Qdrant container. Only the AI-model-backed providers are replaced, and only by monkeypatching
     the provider-factory function each consuming module already imported — no production code
     branches on APP_ENV, and the orchestration/decision/retrieval/prompt-building code paths run
-    exactly as they do in production.
+    exactly as they do in production. Patches both engines' LLM resolution
+    (app.rag.orchestrator for CustomRagEngine, app.rag.engines.langchain_engine for
+    LangChainRagEngine) so either RAG_ENGINE setting gets the same deterministic fake.
     """
     monkeypatch.setattr(
         retrieval_service_module, "get_embedding_provider", lambda settings=None: fake_embedding_provider
     )
     monkeypatch.setattr(orchestrator_module, "get_llm_provider", lambda settings=None: fake_llm_provider)
+    monkeypatch.setattr(
+        langchain_engine_module, "get_llm_provider", lambda settings=None: fake_llm_provider
+    )
     monkeypatch.setattr(
         ingestion_worker_module, "get_embedding_provider", lambda settings=None: fake_embedding_provider
     )

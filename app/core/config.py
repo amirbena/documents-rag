@@ -45,6 +45,8 @@ class Settings(BaseSettings):
         default=None, alias="RETRIEVAL_SCORE_THRESHOLD"
     )
 
+    rag_engine: str = Field(default="custom", alias="RAG_ENGINE")
+
     @property
     def resolved_llm_model(self) -> str:
         """Return LLM_MODEL if set, else OLLAMA_CHAT_MODEL for backward compatibility."""

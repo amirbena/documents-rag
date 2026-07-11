@@ -506,11 +506,73 @@ A failure in `RetrievalService` or the LLM provider (`get_llm_provider()`, reads
 propagates to the caller unchanged — `RagOrchestrator` never catches it to fall back from
 retrieval to a direct answer, and never silently switches providers.
 
+### RAG engine compatibility layer
+
+`RagOrchestrator` is wrapped behind a small, replaceable `RagEngine` abstraction
+(`app/rag/engine.py`) so an alternative RAG execution engine can be swapped in without touching
+the public API, the SSE contract, or any existing provider/retrieval/prompt/orchestration code:
+
+```
+RagEngine (app/rag/engine.py)
+├── CustomRagEngine   (app/rag/engines/custom_engine.py)   — default; wraps RagOrchestrator unchanged
+└── LangChainRagEngine (app/rag/engines/langchain_engine.py) — optional
+```
+
+Selected via `RAG_ENGINE`:
+
+```bash
+RAG_ENGINE=custom      # default — existing installs behave exactly as before
+RAG_ENGINE=langchain   # optional — routes RAG execution through LangChain Runnables
+```
+
+`get_rag_engine(settings)` (`app/rag/engines/engine_factory.py`) resolves the configured engine —
+an unrecognized `RAG_ENGINE` value raises `UnsupportedRagEngineError` immediately; it never
+silently falls back to `custom` and never silently switches providers.
+
+**`CustomRagEngine`** is a thin adapter with no logic of its own: it delegates every call directly
+to `RagOrchestrator`, so `RuleBasedRagDecider`, `RetrievalService`, `RagPromptBuilder`,
+`LLMProvider.stream_generate()`, source metadata, and failure propagation are all completely
+unchanged — this remains the platform's reference implementation.
+
+**`LangChainRagEngine`** runs the same four decision paths
+(`NEEDS_RETRIEVAL`/`DIRECT_LLM`/`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`) through LangChain
+Runnables/prompt values instead of `RagOrchestrator`'s plain Python composition, while reusing the
+platform's existing pieces via three adapters (`app/rag/engines/langchain_adapters.py`):
+
+- `ProviderBackedLLM` — a LangChain `LLM` that streams from whatever `LLMProvider`
+  `get_llm_provider()` resolved (never constructs an Ollama/OpenAI/Gemini/Anthropic client itself).
+- `ProviderBackedEmbeddings` — a LangChain `Embeddings` wrapping the configured `EmbeddingProvider`.
+- `ProviderBackedRetriever` — a LangChain `BaseRetriever` wrapping the existing `RetrievalService`
+  (and therefore the existing `QdrantVectorStore`/`QDRANT_COLLECTION_NAME`/`VECTOR_SIZE` — no
+  second Qdrant SDK path, no separate collection, no different embedding model).
+
+Retrieved LangChain `Document`s are converted straight back into `VectorSearchResult`s and handed
+to the existing, unmodified `RagPromptBuilder`, so source labels (`[S1]`, `[S2]`), rank order, the
+"answer only from context / say so if the answer isn't present" instructions, and Hebrew/Unicode
+text all behave exactly as they do for `CustomRagEngine`. `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`
+never invoke retrieval or the LLM, and stream the exact same fixed message text as
+`RagOrchestrator` (imported directly from `app/rag/orchestrator.py`, not duplicated). No
+LangGraph, no agents, no tool calling — see "LangChain compatibility layer" in
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
+
+The generated answer text can legitimately differ between engines (LangChain's own prompt
+serialization differs from `RagOrchestrator`'s plain string concatenation), but the public
+API/SSE contract, decision routing, retrieval usage, and source attribution are identical either
+way — the chat route and the frontend never need to know which engine is configured.
+
+Run the engine-specific tests with:
+
+```bash
+make test-rag-engines     # unit + integration + E2E-parity tests for both engines (needs Docker)
+make verify-rag-engines   # runs test-rag-engines plus its own checks
+```
+
 ### Streaming chat endpoint
 
-`POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is a thin route that streams
-`RagOrchestrator.stream_answer(question)` back as Server-Sent Events — no decision, retrieval,
-or prompt-building logic in the route itself, and no direct provider calls:
+`POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is a thin route that streams the configured
+`RagEngine.stream_answer(question)` back as Server-Sent Events — no decision, retrieval, or
+prompt-building logic in the route itself, no direct provider calls, and no branch on which engine
+is selected:
 
 ```bash
 curl -N -X POST http://localhost:8000/api/v1/chat \
@@ -540,12 +602,12 @@ Four deterministic event types, always in this shape:
 | `metadata` | Always first, once, from the run's `OrchestratorMetadata` | `decision`, `reason`, `retrieval_used`, `sources` (each: `document_id`, `chunk_id`, `source`, `score`, plus `page_number`/`sheet_name` when present) |
 | `token` | Once per `OrchestratorToken`, in generation order | `text` |
 | `done` | Exactly once, after the last token, only on normal completion | `status: "completed"` |
-| `error` | At most once, if `RagOrchestrator.stream_answer(...)` raises after streaming has started | `message` (a fixed, safe string — never a stack trace, prompt, secret, credential, internal URL, or provider response body), `status: "failed"` |
+| `error` | At most once, if the configured `RagEngine.stream_answer(...)` raises after streaming has started | `message` (a fixed, safe string — never a stack trace, prompt, secret, credential, internal URL, or provider response body), `status: "failed"` |
 
 An `error` event ends the stream — no `done` event follows it. The route does not buffer the
-full answer: each `OrchestratorToken` is written to the response as soon as the orchestrator
-yields it, so `curl -N` (no-buffer mode, shown above) prints tokens as they arrive rather than
-all at once at the end.
+full answer: each `OrchestratorToken` is written to the response as soon as the engine yields it,
+so `curl -N` (no-buffer mode, shown above) prints tokens as they arrive rather than all at once at
+the end. This event shape is identical regardless of which `RagEngine` produced it.
 
 ## Verification
 
@@ -763,6 +825,11 @@ A backend E2E suite (`tests/e2e/backend/`, `make test-e2e-backend`) now drives t
 upload → ingestion → retrieval/orchestration → streaming chat — through real HTTP against the
 same kind of ephemeral Postgres/Qdrant containers, with deterministic fake embedding/LLM
 providers swapped in via dependency/provider-factory overrides rather than any `APP_ENV` branch
-in production code; see "Backend E2E tests" above. Frontend E2E and a real-Ollama smoke suite
-remain future milestones — see "Integration tests" above, and "Test architecture" in
+in production code; see "Backend E2E tests" above. A `RagEngine` abstraction
+(`app/rag/engine.py`) now sits behind `POST /api/v1/chat`, with `CustomRagEngine` (wrapping
+`RagOrchestrator` unchanged) as the default and an optional `LangChainRagEngine` selectable via
+`RAG_ENGINE=langchain` — both share the same provider factory, `RetrievalService`,
+`RagPromptBuilder`, Qdrant collection, and embedding model, and both produce an identical public
+API/SSE contract; see "RAG engine compatibility layer" above. Frontend E2E and a real-Ollama
+smoke suite remain future milestones — see "Integration tests" above, and "Test architecture" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
