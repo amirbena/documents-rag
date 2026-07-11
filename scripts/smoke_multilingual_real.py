@@ -126,6 +126,11 @@ async def main() -> int:
         return 1
 
     print(f"All {len(_SCENARIOS)} scenarios passed against the real {active_config.model} model.")
+    print(
+        "This confirms the model is reachable, produces correctly-dimensioned vectors, and "
+        "ranks the matching source above an unrelated distractor for this tiny corpus. It is "
+        "NOT a retrieval-quality benchmark — no recall/precision/ranking evaluation has been run."
+    )
     return 0
 
 

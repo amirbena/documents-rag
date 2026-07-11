@@ -14,7 +14,8 @@ from app.rag.embedding_config import EmbeddingIndexConfig
 from app.services.index_registry import (
     IncompatibleIndexConfigurationError,
     create_cleanup_job,
-    delete_document_vectors,
+    delete_all_tracked_document_vectors,
+    delete_current_document_vectors,
     ensure_active_collection,
     get_pending_cleanup_jobs,
     is_document_stale,
@@ -222,17 +223,17 @@ async def test_retire_collection_marks_status_without_deleting_anything() -> Non
     assert vector_store.deleted == []
 
 
-async def test_delete_document_vectors_targets_only_the_documents_tracked_collection() -> None:
-    """delete_document_vectors() must delete from the document's own collection_name only."""
+async def test_delete_current_document_vectors_targets_only_the_tracked_collection() -> None:
+    """delete_current_document_vectors() must delete from the document's own collection_name only."""
     vector_store = _FakeVectorStore()
     document = _document(collection_name="documents__ollama__m__ev1__cv1__d768")
 
-    await delete_document_vectors(document, vector_store)
+    await delete_current_document_vectors(document, vector_store)
 
     assert vector_store.deleted == [("documents__ollama__m__ev1__cv1__d768", document.id)]
 
 
-async def test_delete_document_vectors_is_a_noop_for_a_never_indexed_document() -> None:
+async def test_delete_current_document_vectors_is_a_noop_for_a_never_indexed_document() -> None:
     """A document with no collection_name has nothing to delete — no vector-store call at all."""
 
     class _AssertNoDeleteVectorStore(_FakeVectorStore):
@@ -241,7 +242,7 @@ async def test_delete_document_vectors_is_a_noop_for_a_never_indexed_document() 
 
     document = _document(collection_name=None)
 
-    await delete_document_vectors(document, _AssertNoDeleteVectorStore())
+    await delete_current_document_vectors(document, _AssertNoDeleteVectorStore())
 
 
 def test_mark_document_indexed_uses_timezone_aware_utc() -> None:
@@ -376,15 +377,15 @@ async def test_retry_cleanup_job_is_retried_even_when_document_is_no_longer_stal
     assert succeeded is True
 
 
-async def test_delete_document_vectors_also_cleans_pending_historical_collections() -> None:
-    """Deleting a document must clean its current collection AND every pending legacy collection."""
+async def test_delete_all_tracked_document_vectors_cleans_current_and_historical_collections() -> None:
+    """Full deletion must clean the current collection AND every pending legacy collection."""
     session = _FakeSession()
     document = _document(collection_name="current-collection")
     await create_cleanup_job(session, document.id, "legacy-collection-1", error="failure")
     await create_cleanup_job(session, document.id, "legacy-collection-2", error="failure")
     vector_store = _FakeVectorStore()
 
-    await delete_document_vectors(document, vector_store, session)
+    await delete_all_tracked_document_vectors(document, vector_store, session)
 
     assert set(vector_store.deleted) == {
         ("current-collection", document.id),
@@ -393,11 +394,42 @@ async def test_delete_document_vectors_also_cleans_pending_historical_collection
     }
 
 
-async def test_delete_document_vectors_without_session_only_cleans_current_collection() -> None:
-    """Backward-compat: omitting `session` still cleans the tracked collection, no cleanup lookup."""
+async def test_delete_all_tracked_document_vectors_requires_a_session() -> None:
+    """Full deletion has no `session=None` escape hatch — omitting it must fail at the call site,
+    not silently degrade to partial cleanup.
+    """
+    import inspect
+
+    signature = inspect.signature(delete_all_tracked_document_vectors)
+    assert signature.parameters["session"].default is inspect.Parameter.empty
+
+
+async def test_delete_all_tracked_document_vectors_is_idempotent() -> None:
+    """Calling full deletion twice must not error, and must not double-delete or duplicate calls."""
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="failure")
+    vector_store = _FakeVectorStore()
+
+    await delete_all_tracked_document_vectors(document, vector_store, session)
+    await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    # Each call performs its own delete-by-filter; repeating it is a harmless no-op against
+    # already-empty collections in real Qdrant — here we only assert it doesn't raise and the
+    # same two collections are targeted both times.
+    assert vector_store.deleted.count(("current-collection", document.id)) == 2
+    assert vector_store.deleted.count(("legacy-collection-1", document.id)) == 2
+
+
+async def test_delete_current_document_vectors_never_consults_cleanup_jobs() -> None:
+    """The explicitly-partial function must never touch VectorCleanupJob bookkeeping at all."""
     document = _document(collection_name="current-collection")
     vector_store = _FakeVectorStore()
 
-    await delete_document_vectors(document, vector_store)
+    await delete_current_document_vectors(document, vector_store)
 
-    assert vector_store.deleted == [("current-collection", document.id)]
+    # No `session` parameter exists on this function at all — this is the type-level guarantee
+    # that it cannot accidentally perform historical cleanup.
+    import inspect
+
+    assert "session" not in inspect.signature(delete_current_document_vectors).parameters

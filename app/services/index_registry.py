@@ -114,27 +114,41 @@ async def get_stale_documents(session: AsyncSession, active_config: EmbeddingInd
     return [document for document in result.scalars().all() if is_document_stale(document, active_config)]
 
 
-async def delete_document_vectors(
-    document: Document, vector_store: VectorStore, session: AsyncSession | None = None
-) -> None:
-    """Delete a document's vectors from every collection they could still exist in.
+async def delete_current_document_vectors(document: Document, vector_store: VectorStore) -> None:
+    """Delete a document's vectors from its *currently tracked* collection only.
 
-    Covers the document's currently tracked collection (`collection_name`) and, when `session` is
-    given, every historical collection still tracked by a pending/failed VectorCleanupJob for this
-    document (see `get_pending_cleanup_jobs()`) — so a document deleted after one or more failed
-    re-index cleanups never leaves vectors behind in an old collection merely because the failure
-    happened to occur before this deletion. `session` is optional only for backward compatibility
-    with call sites that have no historical-cleanup tracking to check (e.g. a document that was
-    never re-indexed); pass it whenever available. Completed cleanup jobs are left untouched
-    (retained for audit, per the "successful cleanup records may be retained" project convention)
-    — this function only removes Qdrant data, it does not mutate VectorCleanupJob bookkeeping,
-    since the document row itself is about to be deleted by the caller.
+    PARTIAL cleanup — the name says so deliberately. Does not consult VectorCleanupJob, so any
+    historical collection still pending/failed cleanup for this document is left untouched. This
+    exists only for call sites that provably have no historical-cleanup tracking to check (e.g. a
+    document that was never re-indexed) or that intentionally want the narrower operation. Any
+    document *lifecycle* deletion (removing a document entirely) must use
+    `delete_all_tracked_document_vectors()` instead — never this function — so partial cleanup is
+    never silently mistaken for full cleanup.
     """
     if document.collection_name is not None:
         await vector_store.delete_by_document_id(document.collection_name, document.id)
 
-    if session is None:
-        return
+
+async def delete_all_tracked_document_vectors(
+    document: Document, vector_store: VectorStore, session: AsyncSession
+) -> None:
+    """Delete a document's vectors from every collection they could still exist in.
+
+    The FULL cleanup operation — this is what any document lifecycle/deletion path must call.
+    Covers the document's currently tracked collection (`collection_name`) *and* every historical
+    collection still tracked by a pending/failed VectorCleanupJob for this document (see
+    `get_pending_cleanup_jobs()`), so a document deleted after one or more failed re-index
+    cleanups never leaves vectors behind in an old collection merely because the failure happened
+    to occur before this deletion. `session` is mandatory — there is no way to check historical
+    cleanup tracking without it, and defaulting it to `None` would let a caller silently get only
+    partial cleanup while believing deletion was complete. Idempotent: deleting from a collection
+    with no matching vectors (already cleaned, or never populated) is a harmless no-op. Completed
+    cleanup jobs are left untouched (retained for audit, per the "successful cleanup records may
+    be retained" project convention) — this function only removes Qdrant data, it does not mutate
+    VectorCleanupJob bookkeeping, since the document row itself is about to be deleted by the
+    caller.
+    """
+    await delete_current_document_vectors(document, vector_store)
 
     for job in await get_pending_cleanup_jobs(session, document_id=document.id):
         if job.collection_name == document.collection_name:

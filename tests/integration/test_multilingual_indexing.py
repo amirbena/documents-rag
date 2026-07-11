@@ -22,7 +22,7 @@ from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.services.index_registry import (
-    delete_document_vectors,
+    delete_all_tracked_document_vectors,
     ensure_active_collection,
     get_pending_cleanup_jobs,
     is_document_stale,
@@ -336,10 +336,79 @@ async def test_reindex_cleanup_failure_persists_job_and_retry_succeeds_against_r
         assert jobs_after_retry == []  # the completed job no longer shows up as pending/failed
 
 
+async def test_full_document_deletion_cleans_pending_historical_collection_against_real_qdrant(
+    migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
+) -> None:
+    """delete_all_tracked_document_vectors() must clean an outstanding pending legacy collection
+    too, not just the document's current one — even without an explicit retry beforehand.
+    """
+    _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
+    settings = get_settings()
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world " * 20, encoding="utf-8")
+
+    async with _new_session(postgres_url) as session:
+        await _create_pending_job(session, stored_path=str(file_path))
+        await IngestionWorker().process_next_job(session)
+
+    original_config = get_active_embedding_config(settings)
+    monkeypatch.setattr(settings, "embedding_version", "v3-multilingual")
+    new_config = get_active_embedding_config(settings)
+    _use_multilingual_fake_embeddings(monkeypatch, reindex_service_module)
+
+    real_vector_store = QdrantVectorStore(settings=settings)
+
+    class _AlwaysFailForOldCollection:
+        async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
+            await real_vector_store.create_collection_if_not_exists(collection_name, vector_size)
+
+        async def upsert_vectors(self, collection_name: str, points: list) -> None:
+            await real_vector_store.upsert_vectors(collection_name, points)
+
+        async def get_collection_vector_size(self, collection_name: str) -> int | None:
+            return await real_vector_store.get_collection_vector_size(collection_name)
+
+        async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+            if collection_name == original_config.collection_name:
+                raise RuntimeError("simulated persistent Qdrant failure")
+            await real_vector_store.delete_by_document_id(collection_name, document_id)
+
+    monkeypatch.setattr(
+        reindex_service_module, "get_vector_store", lambda settings=None: _AlwaysFailForOldCollection()
+    )
+
+    async with _new_session(postgres_url) as session:
+        document = (await session.execute(select(Document))).scalar_one()
+        result = await reindex_document(document, session, settings)
+        assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
+
+    async with _new_session(postgres_url) as session:
+        jobs = await get_pending_cleanup_jobs(session, document_id=document.id)
+        assert len(jobs) == 1
+        assert jobs[0].collection_name == original_config.collection_name
+
+        # No retry attempted — go straight to full document deletion.
+        await delete_all_tracked_document_vectors(document, real_vector_store, session)
+
+    fake = MultilingualFakeEmbeddingProvider(vector_size=settings.vector_size)
+    query_vector = (await fake.embed(["hello world"]))[0]
+
+    remaining_in_old = await real_vector_store.search_similar(
+        original_config.collection_name, query_vector, limit=10
+    )
+    assert not any(result.document_id == document.id for result in remaining_in_old)
+
+    remaining_in_new = await real_vector_store.search_similar(
+        new_config.collection_name, query_vector, limit=10
+    )
+    assert not any(result.document_id == document.id for result in remaining_in_new)
+
+
 async def test_deleting_a_document_cleans_its_tracked_vectors(
     migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
 ) -> None:
-    """Deleting a document must remove its vectors from its currently tracked collection."""
+    """Full document deletion (delete_all_tracked_document_vectors) removes its real Qdrant vectors."""
     fake = _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
     settings = get_settings()
     active_config = get_active_embedding_config(settings)
@@ -358,7 +427,8 @@ async def test_deleting_a_document_cleans_its_tracked_vectors(
     before = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
     assert any(result.document_id == document.id for result in before)
 
-    await delete_document_vectors(document, vector_store)
+    async with _new_session(postgres_url) as session:
+        await delete_all_tracked_document_vectors(document, vector_store, session)
 
     after = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
     assert not any(result.document_id == document.id for result in after)
