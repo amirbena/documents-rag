@@ -11,6 +11,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from tests.e2e.backend.fakes import FakeEmbeddingProvider, FakeStreamingLLMProvider
 from tests.e2e.backend.sse import iter_sse_events
@@ -86,10 +87,11 @@ async def test_full_backend_flow_upload_to_streaming_chat(
 
     # D. Verify persistence: vectors exist in the configured Qdrant collection, metadata preserved.
     settings = get_settings()
+    active_config = get_active_embedding_config(settings)
     vector_store = QdrantVectorStore(settings=settings)
     query_vector = (await fake_embedding_provider.embed(["vacation days"]))[0]
     search_results = await vector_store.search_similar(
-        settings.qdrant_collection_name, query_vector, limit=10
+        active_config.collection_name, query_vector, limit=10
     )
     assert search_results
     vacation_results = [result for result in search_results if result.document_id == document_id]

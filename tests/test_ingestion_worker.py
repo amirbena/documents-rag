@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import app.services.ingestion_worker as ingestion_worker_module
-from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunker
 from app.services.ingestion_worker import IngestionWorker
@@ -51,6 +51,12 @@ class _FakeVectorStore:
     async def upsert_vectors(self, collection_name: str, points: list[VectorPoint]) -> None:
         self.upserted_points.extend(points)
 
+    async def get_collection_vector_size(self, collection_name: str) -> int | None:
+        return None
+
+    async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+        return None
+
 
 class _FailingVectorStore:
     """create_collection_if_not_exists succeeds; upsert_vectors always raises."""
@@ -60,6 +66,12 @@ class _FailingVectorStore:
 
     async def upsert_vectors(self, collection_name: str, points: list[VectorPoint]) -> None:
         raise RuntimeError("vector store unavailable")
+
+    async def get_collection_vector_size(self, collection_name: str) -> int | None:
+        return None
+
+    async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+        return None
 
 
 class _FakeScalarResult:
@@ -123,7 +135,7 @@ def _add_document_and_job(
 async def test_pending_job_transitions_to_completed() -> None:
     """A pending job should be processed and end up completed."""
 
-    async def _noop(document: Document | None, job: IngestionJob) -> None:
+    async def _noop(document: Document | None, job: IngestionJob, session: object) -> None:
         return None
 
     session = _FakeAsyncSession()
@@ -143,7 +155,7 @@ async def test_processing_exception_marks_job_failed() -> None:
     session = _FakeAsyncSession()
     _add_document_and_job(session)
 
-    async def _boom(document: Document | None, job: IngestionJob) -> None:
+    async def _boom(document: Document | None, job: IngestionJob, session: object) -> None:
         raise RuntimeError("boom: extraction not implemented")
 
     worker = IngestionWorker(process_document=_boom)
@@ -192,7 +204,7 @@ async def test_repeated_calls_do_not_reprocess_completed_job() -> None:
     """Running process_next_job() repeatedly must not re-process a job already completed."""
     call_count = 0
 
-    async def _counting_process(document: Document | None, job: IngestionJob) -> None:
+    async def _counting_process(document: Document | None, job: IngestionJob, session: object) -> None:
         nonlocal call_count
         call_count += 1
 
@@ -213,7 +225,7 @@ async def test_placeholder_processing_called_exactly_once_with_document_and_job(
     """The processing step should be invoked exactly once, with the claimed document and job."""
     calls: list[tuple[Document | None, IngestionJob]] = []
 
-    async def _recording_process(document: Document | None, job: IngestionJob) -> None:
+    async def _recording_process(document: Document | None, job: IngestionJob, session: object) -> None:
         calls.append((document, job))
 
     session = _FakeAsyncSession()
@@ -359,9 +371,11 @@ async def test_worker_upserts_vectors_preserving_metadata(tmp_path: Path, monkey
 
     assert result is not None
     assert result.status == IngestionStatus.COMPLETED
-    assert vector_store.created_collections == [
-        (get_settings().qdrant_collection_name, get_settings().vector_size)
-    ]
+    active_config = get_active_embedding_config()
+    assert vector_store.created_collections == [(active_config.collection_name, active_config.dimension)]
+    assert document.collection_name == active_config.collection_name
+    assert document.embedding_version == active_config.embedding_version
+    assert document.indexed_at is not None
     assert len(vector_store.upserted_points) == 1
     point = vector_store.upserted_points[0]
     assert point.vector == [1.0, 2.0]

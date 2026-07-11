@@ -137,3 +137,54 @@ class QdrantVectorStore(VectorStore):
             raise QdrantVectorStoreError("Malformed search response from Qdrant") from exc
 
         return [_parse_search_result(item) for item in results]
+
+    async def get_collection_vector_size(self, collection_name: str) -> int | None:
+        """Return the existing collection's configured vector size, or None if it doesn't exist."""
+        async with self._client() as client:
+            try:
+                response = await client.get(f"/collections/{collection_name}")
+            except httpx.HTTPError as exc:
+                raise QdrantVectorStoreError(f"Qdrant unreachable at /collections: {exc}") from exc
+
+        if response.status_code == 404:
+            return None
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise QdrantVectorStoreError(
+                f"Qdrant returned {exc.response.status_code} inspecting collection {collection_name!r}"
+            ) from exc
+
+        try:
+            vectors_config = response.json()["result"]["config"]["params"]["vectors"]
+            # Qdrant returns either {"size": N, "distance": ...} for a single unnamed vector, or
+            # {"<name>": {"size": N, ...}, ...} for named vectors — this project only ever creates
+            # the single unnamed form, so only that shape is supported.
+            return int(vectors_config["size"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise QdrantVectorStoreError(
+                f"Malformed collection-info response from Qdrant for {collection_name!r}"
+            ) from exc
+
+    async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+        """Delete every point belonging to document_id from a collection, if it exists."""
+        exists = await self.get_collection_vector_size(collection_name)
+        if exists is None:
+            return
+
+        async with self._client() as client:
+            try:
+                response = await client.post(
+                    f"/collections/{collection_name}/points/delete",
+                    params={"wait": "true"},
+                    json={"filter": {"must": [{"key": "document_id", "match": {"value": document_id}}]}},
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise QdrantVectorStoreError(
+                    f"Qdrant returned {exc.response.status_code} deleting document {document_id!r} "
+                    f"from {collection_name!r}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise QdrantVectorStoreError(f"Qdrant unreachable deleting vectors: {exc}") from exc

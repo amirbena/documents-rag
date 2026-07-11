@@ -12,6 +12,7 @@ import app.rag.orchestrator as orchestrator_module
 import app.services.platform_health as platform_health_module
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.schemas.health import DependencyCheckResult
 from tests.e2e.backend.fakes import FakeFailingLLMProvider, FakeStreamingLLMProvider
@@ -103,8 +104,9 @@ async def test_retrieval_with_no_relevant_results_does_not_fabricate_context(
 ) -> None:
     """A retrieval-triggering question against an empty (but existing) collection yields no sources."""
     settings = get_settings()
+    active_config = get_active_embedding_config(settings)
     await QdrantVectorStore(settings=settings).create_collection_if_not_exists(
-        settings.qdrant_collection_name, settings.vector_size
+        active_config.collection_name, active_config.dimension
     )
 
     events = await _collect_sse(app_client, "What does the uploaded document say about refunds?")

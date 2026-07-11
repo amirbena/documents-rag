@@ -16,6 +16,7 @@ import app.rag.engines.langchain_engine as langchain_engine_module
 import app.rag.orchestrator as orchestrator_module
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from tests.e2e.backend.fakes import FakeFailingLLMProvider, FakeStreamingLLMProvider
 from tests.e2e.backend.sse import iter_sse_events
@@ -118,8 +119,9 @@ async def test_both_engines_agree_on_no_results_behavior(
 ) -> None:
     """With nothing indexed, both engines must return empty sources — never fabricated context."""
     settings = get_settings()
+    active_config = get_active_embedding_config(settings)
     await QdrantVectorStore(settings=settings).create_collection_if_not_exists(
-        settings.qdrant_collection_name, settings.vector_size
+        active_config.collection_name, active_config.dimension
     )
 
     custom_result = await _run_chat_and_capture(app_client, "custom", _RETRIEVAL_QUESTION, monkeypatch)

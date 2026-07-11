@@ -13,6 +13,7 @@ import httpx
 
 import app.rag.retrieval_service as retrieval_service_module
 from app.core.config import get_settings
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.engines.langchain_adapters import build_provider_backed_retriever
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorPoint
@@ -49,6 +50,7 @@ async def test_existing_vectors_are_searchable_through_the_langchain_adapter(
     settings = get_settings()
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_name = get_active_embedding_config(settings).collection_name
 
     vector_store = QdrantVectorStore(settings=settings)
     await vector_store.create_collection_if_not_exists(collection_name, vector_size=3)
@@ -85,6 +87,7 @@ async def test_metadata_round_trips_correctly_through_real_qdrant(qdrant_url: st
     settings = get_settings()
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_name = get_active_embedding_config(settings).collection_name
 
     vector_store = QdrantVectorStore(settings=settings)
     await vector_store.create_collection_if_not_exists(collection_name, vector_size=2)
@@ -123,6 +126,7 @@ async def test_no_separate_collection_is_created(qdrant_url: str, monkeypatch) -
     settings = get_settings()
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_name = get_active_embedding_config(settings).collection_name
 
     vector_store = QdrantVectorStore(settings=settings)
     await vector_store.create_collection_if_not_exists(collection_name, vector_size=2)
@@ -156,6 +160,7 @@ async def test_configured_embedding_provider_is_used(qdrant_url: str, monkeypatc
     settings = get_settings()
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_name = get_active_embedding_config(settings).collection_name
 
     vector_store = QdrantVectorStore(settings=settings)
     await vector_store.create_collection_if_not_exists(collection_name, vector_size=2)
@@ -191,6 +196,7 @@ async def test_retrieval_result_returns_no_relevant_results_without_fabrication(
     settings = get_settings()
     collection_name = _unique_collection_name()
     monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_name = get_active_embedding_config(settings).collection_name
 
     vector_store = QdrantVectorStore(settings=settings)
     await vector_store.create_collection_if_not_exists(collection_name, vector_size=2)
