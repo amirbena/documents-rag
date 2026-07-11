@@ -1,10 +1,11 @@
-.PHONY: help test test-unit test-integration lint typecheck compose verify verify-integration
+.PHONY: help test test-unit test-integration test-e2e-backend lint typecheck compose verify verify-integration verify-e2e-backend
 
 help:
 	@echo "Available commands:"
 	@echo "  make test              - run the fast suite, excluding integration/e2e/slow (pytest)"
 	@echo "  make test-unit         - alias for 'make test'"
 	@echo "  make test-integration  - run the Testcontainers-based integration suite (needs Docker)"
+	@echo "  make test-e2e-backend  - run the Testcontainers-based backend E2E suite (needs Docker)"
 	@echo "  make lint              - lint the codebase (ruff check .)"
 	@echo "  make typecheck         - type-check the app package (mypy app)"
 	@echo "  make compose           - validate docker-compose.yml (docker compose config)"
@@ -12,6 +13,7 @@ help:
 	@echo "                          the first failure (the canonical pre-commit/pre-PR check;"
 	@echo "                          fast, does not require Docker beyond compose-config validation)"
 	@echo "  make verify-integration - run the integration suite plus its own checks"
+	@echo "  make verify-e2e-backend - run the backend E2E suite plus its own checks"
 	@echo "  make help              - show this message"
 	@echo ""
 	@echo "Install the pre-commit hook that runs 'make verify' automatically:"
@@ -24,6 +26,9 @@ test-unit: test
 
 test-integration:
 	pytest -m integration -q
+
+test-e2e-backend:
+	pytest -m e2e tests/e2e/backend -q
 
 lint:
 	ruff check .
@@ -39,3 +44,6 @@ verify: test lint typecheck compose
 
 verify-integration: test-integration
 	@echo "Integration quality gates passed."
+
+verify-e2e-backend: test-e2e-backend
+	@echo "Backend E2E quality gates passed."

@@ -151,6 +151,35 @@ def get_settings() -> Settings:
   see the guard fixture in `tests/integration/conftest.py` — rather than silently running against
   whatever `DATABASE_URL`/`QDRANT_URL` happens to be set.
 
+## Backend E2E Testing Style
+
+- **Backend E2E tests use Testcontainers and fully ephemeral state, exactly like the integration
+  suite.** `tests/e2e/backend/` starts its own ephemeral Postgres/Qdrant containers via
+  Testcontainers on dynamically assigned ports — never the repository's `docker-compose.yml`,
+  never a fixed host port, never a persistent Compose volume — and every test gets its own
+  isolated database rows and Qdrant collection (see `tests/e2e/backend/conftest.py`).
+- **Backend E2E tests traverse the real public HTTP boundary where practical.** Drive the app
+  through a real ASGI HTTP client (`httpx.AsyncClient` + `ASGITransport`) against the real
+  FastAPI app — `POST /api/v1/documents`, `POST /api/v1/chat`, `GET /health*` — rather than
+  calling service/route functions directly, so the actual request/response contract (status
+  codes, SSE framing, validation errors) is what's exercised, not an internal shortcut.
+- **AI providers remain deterministic fakes in the default backend E2E suite.** Real
+  Ollama never runs and no model is ever pulled here — `FakeEmbeddingProvider` and
+  `FakeStreamingLLMProvider`/`FakeFailingLLMProvider` (`tests/e2e/backend/fakes.py`) stand in,
+  swapped via monkeypatching the provider-factory function each consuming module already
+  imports, never a production-code branch on `APP_ENV`. The vector store is never faked —
+  `QdrantVectorStore` keeps talking to the real ephemeral Qdrant container.
+- **Real Ollama belongs in a separate, future manual/nightly smoke suite** — never added to
+  `tests/e2e/backend/`, `make test-e2e-backend`, or `make verify-e2e-backend`.
+- **Do not add backend E2E tests to the pre-commit hook without explicit approval.** The
+  pre-commit hook runs `make verify`, which must stay fast and Docker-independent — `make
+  test-e2e-backend`/`make verify-e2e-backend` are separate, manually-invoked targets and stay
+  that way unless the user explicitly asks to change that.
+- **Never use the main Compose environment (`docker-compose.yml`) as the E2E test environment.**
+  Backend E2E fixtures must fail loudly (before starting any container or test) if the ambient
+  environment looks like production — see the guard fixture in `tests/e2e/backend/conftest.py` —
+  rather than silently running against whatever `DATABASE_URL`/`QDRANT_URL` happens to be set.
+
 ## Operational Endpoints
 
 - **Operational endpoints remain unversioned.** `GET /health`, `/health/live`, `/health/ready`,
