@@ -28,6 +28,7 @@ async def test_upgrade_head_creates_expected_tables(migrated_schema: None, postg
 
     assert "documents" in table_names
     assert "ingestion_jobs" in table_names
+    assert "index_collections" in table_names
 
 
 async def test_upgrade_head_creates_expected_columns(migrated_schema: None, postgres_url: str) -> None:
@@ -54,6 +55,13 @@ async def test_upgrade_head_creates_expected_columns(migrated_schema: None, post
         "file_size",
         "stored_path",
         "created_at",
+        "embedding_provider",
+        "embedding_model",
+        "embedding_dimension",
+        "embedding_version",
+        "chunking_version",
+        "collection_name",
+        "indexed_at",
     }
     assert job_columns == {
         "id",
@@ -114,13 +122,13 @@ async def test_foreign_key_rejects_ingestion_job_for_missing_document(
 
 
 async def test_downgrade_and_reupgrade_is_stable(migrated_schema: None, postgres_url: str) -> None:
-    """downgrade -1 then upgrade head again should leave the same schema behind.
+    """downgrade to base then upgrade head again should leave the same schema behind.
 
     Alembic's env.py drives migrations via asyncio.run(...), which cannot be called from
     inside this test's already-running event loop — so the sync Alembic calls run on a
     separate thread via asyncio.to_thread instead.
     """
-    await asyncio.to_thread(run_alembic_downgrade, "-1")
+    await asyncio.to_thread(run_alembic_downgrade, "base")
 
     engine: AsyncEngine = create_async_engine(postgres_url, future=True)
     try:
@@ -147,3 +155,43 @@ async def test_downgrade_and_reupgrade_is_stable(migrated_schema: None, postgres
 
     assert "documents" in table_names_after_reupgrade
     assert "ingestion_jobs" in table_names_after_reupgrade
+
+
+async def test_upgrade_from_previous_revision_adds_indexing_metadata(
+    migrated_schema: None, postgres_url: str
+) -> None:
+    """Upgrading from the prior revision alone should add index_collections + the new columns.
+
+    Runs downgrade to the prior revision (acf1b01d5a02) first, confirming the new table/columns
+    are genuinely absent, then upgrades to head and confirms they appear — proving `head` is
+    reachable incrementally from the previous revision, not just from a fresh database.
+    """
+    await asyncio.to_thread(run_alembic_downgrade, "acf1b01d5a02")
+
+    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+            document_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
+            )
+    finally:
+        await engine.dispose()
+
+    assert "index_collections" not in table_names
+    assert "indexed_at" not in document_columns
+
+    await asyncio.to_thread(run_alembic_upgrade, "head")
+
+    engine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+            document_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
+            )
+    finally:
+        await engine.dispose()
+
+    assert "index_collections" in table_names
+    assert "indexed_at" in document_columns

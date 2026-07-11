@@ -21,6 +21,7 @@ import app.services.ingestion_worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.services.ingestion_worker import IngestionWorker
 
@@ -48,11 +49,15 @@ class _FakeEmbeddingProvider:
         return [self._vector for _ in texts]
 
 
-async def _noop_process_document(document: Document | None, job: IngestionJob) -> None:
+async def _noop_process_document(
+    document: Document | None, job: IngestionJob, session: AsyncSession
+) -> None:
     """A trivial injectable processing step: succeeds without touching any provider."""
 
 
-async def _failing_process_document(document: Document | None, job: IngestionJob) -> None:
+async def _failing_process_document(
+    document: Document | None, job: IngestionJob, session: AsyncSession
+) -> None:
     """A trivial injectable processing step: always raises, to exercise the failure path."""
     raise RuntimeError("simulated processing failure")
 
@@ -186,13 +191,14 @@ async def test_default_pipeline_against_real_postgres_and_qdrant_with_fake_embed
     never pulls or calls a real LLM/embedding model.
     """
     settings = get_settings()
-    collection_name = f"integration-worker-{uuid.uuid4().hex}"
-    monkeypatch.setattr(settings, "qdrant_collection_name", collection_name)
+    collection_prefix = f"integration-worker-{uuid.uuid4().hex}"
+    monkeypatch.setattr(settings, "qdrant_collection_name", collection_prefix)
     monkeypatch.setattr(
         ingestion_worker_module,
         "get_embedding_provider",
         lambda settings=None: _FakeEmbeddingProvider(get_settings().vector_size),
     )
+    active_config = get_active_embedding_config(settings)
 
     file_path = tmp_path / "notes.txt"
     file_path.write_text("hello world " * 100, encoding="utf-8")
@@ -208,10 +214,12 @@ async def test_default_pipeline_against_real_postgres_and_qdrant_with_fake_embed
 
         document = await session.get(Document, result.document_id)
         assert document is not None
+        assert document.collection_name == active_config.collection_name
+        assert document.indexed_at is not None
 
     vector_store = QdrantVectorStore(settings=settings)
     query_vector = [0.1] * settings.vector_size
-    results = await vector_store.search_similar(collection_name, query_vector, limit=10)
+    results = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
 
     assert len(results) > 0
     assert all(result.document_id == document.id for result in results)

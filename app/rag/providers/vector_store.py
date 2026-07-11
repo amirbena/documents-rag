@@ -36,7 +36,7 @@ class VectorSearchResult:
 
 
 class VectorStore(ABC):
-    """Contract for collection creation, vector upsert, and similarity search."""
+    """Contract for collection creation, vector upsert, similarity search, and cleanup."""
 
     @abstractmethod
     async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
@@ -53,4 +53,14 @@ class VectorStore(ABC):
         self, collection_name: str, query_vector: list[float], limit: int = 5
     ) -> list[VectorSearchResult]:
         """Return the top `limit` nearest points to query_vector in a collection."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_collection_vector_size(self, collection_name: str) -> int | None:
+        """Return the existing collection's configured vector size, or None if it doesn't exist."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+        """Delete every point belonging to document_id from a collection, if the collection exists."""
         raise NotImplementedError

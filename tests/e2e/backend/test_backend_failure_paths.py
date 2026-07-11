@@ -12,6 +12,7 @@ import app.rag.orchestrator as orchestrator_module
 import app.services.platform_health as platform_health_module
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionStatus
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.schemas.health import DependencyCheckResult
 from tests.e2e.backend.fakes import FakeFailingLLMProvider, FakeStreamingLLMProvider
@@ -101,13 +102,19 @@ async def test_out_of_scope_question_is_deterministic_with_no_llm_or_retrieval(
 async def test_retrieval_with_no_relevant_results_does_not_fabricate_context(
     app_client: httpx.AsyncClient, fake_llm_provider: FakeStreamingLLMProvider
 ) -> None:
-    """A retrieval-triggering question against an empty (but existing) collection yields no sources."""
+    """A retrieval-triggering question against an empty (but existing) collection yields no
+    sources, and a fixed no-results message with no LLM call at all."""
+    from app.rag.prompts.provider import PromptProvider
+    from app.rag.prompts.types import PromptType
+
     settings = get_settings()
+    active_config = get_active_embedding_config(settings)
     await QdrantVectorStore(settings=settings).create_collection_if_not_exists(
-        settings.qdrant_collection_name, settings.vector_size
+        active_config.collection_name, active_config.dimension
     )
 
-    events = await _collect_sse(app_client, "What does the uploaded document say about refunds?")
+    question = "What does the uploaded document say about refunds?"
+    events = await _collect_sse(app_client, question)
 
     metadata = events[0][1]
     assert metadata["decision"] == "needs_retrieval"
@@ -118,7 +125,8 @@ async def test_retrieval_with_no_relevant_results_does_not_fabricate_context(
     assert event_names[-1] == "done"
     assert "error" not in event_names
     tokens = [data["text"] for name, data in events if name == "token"]
-    assert tokens == list(fake_llm_provider.chunks)
+    expected_text = PromptProvider().resolve(PromptType.NO_RESULTS, question).response_text
+    assert tokens == [expected_text], "no-results must skip the LLM and stream the fixed message"
 
 
 async def test_llm_failure_produces_one_error_event_and_no_done(

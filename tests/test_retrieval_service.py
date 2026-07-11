@@ -2,6 +2,7 @@
 
 import app.rag.retrieval_service as retrieval_service_module
 from app.core.config import Settings, get_settings
+from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorSearchResult
 from app.rag.retrieval_service import EmptyQueryError, RetrievalService
 
@@ -82,13 +83,13 @@ async def test_query_is_embedded_exactly_once(monkeypatch) -> None:
 
 
 async def test_configured_collection_is_searched(monkeypatch) -> None:
-    """retrieve() should search the QDRANT_COLLECTION_NAME collection."""
+    """retrieve() should search the active versioned collection (see app.rag.embedding_config)."""
     vector_store = _FakeVectorStore()
     _patch_providers(monkeypatch, _FakeEmbeddingProvider(), vector_store)
 
     await RetrievalService().retrieve("policy question")
 
-    assert vector_store.search_calls[0][0] == get_settings().qdrant_collection_name
+    assert vector_store.search_calls[0][0] == get_active_embedding_config(get_settings()).collection_name
 
 
 async def test_default_top_k_is_used(monkeypatch) -> None:
