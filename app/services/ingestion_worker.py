@@ -29,8 +29,13 @@ from app.services.index_registry import ensure_active_collection, mark_document_
 ProcessDocumentFn = Callable[[Document | None, IngestionJob, AsyncSession], Awaitable[None]]
 
 
-def _to_vector_point(chunk: DocumentChunk, vector: list[float], source: str) -> VectorPoint:
-    """Build a VectorPoint from a DocumentChunk and its embedding, preserving all metadata."""
+def to_vector_point(chunk: DocumentChunk, vector: list[float], source: str) -> VectorPoint:
+    """Build a VectorPoint from a DocumentChunk and its embedding, preserving all metadata.
+
+    Public (not `_`-prefixed) because app/services/reindex_service.py reuses it verbatim — the
+    point ID must be derived identically on both the initial-ingest and re-index paths, or the
+    same chunk would upsert under two different point IDs and silently duplicate.
+    """
     return VectorPoint(
         id=str(uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)),
         vector=vector,
@@ -63,7 +68,7 @@ async def _default_process_document(
     vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
 
     points = [
-        _to_vector_point(chunk, vector, document.original_filename)
+        to_vector_point(chunk, vector, document.original_filename)
         for chunk, vector in zip(chunks, vectors, strict=True)
     ]
 

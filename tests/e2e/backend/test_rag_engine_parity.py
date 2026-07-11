@@ -117,7 +117,11 @@ async def test_both_engines_agree_on_no_results_behavior(
     fake_llm_provider: FakeStreamingLLMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With nothing indexed, both engines must return empty sources — never fabricated context."""
+    """With nothing indexed, both engines must return empty sources and a fixed no-results
+    message — never fabricated context, and no LLM call either."""
+    from app.rag.prompts.provider import PromptProvider
+    from app.rag.prompts.types import PromptType
+
     settings = get_settings()
     active_config = get_active_embedding_config(settings)
     await QdrantVectorStore(settings=settings).create_collection_if_not_exists(
@@ -129,13 +133,14 @@ async def test_both_engines_agree_on_no_results_behavior(
         app_client, "langchain", _RETRIEVAL_QUESTION, monkeypatch
     )
 
+    expected_text = PromptProvider().resolve(PromptType.NO_RESULTS, _RETRIEVAL_QUESTION).response_text
     for result in (custom_result, langchain_result):
         assert result["metadata"]["decision"] == "needs_retrieval"
         assert result["metadata"]["retrieval_used"] is True
         assert result["metadata"]["sources"] == []
         assert result["event_names"][-1] == "done"
         assert "error" not in result["event_names"]
-        assert result["tokens"] == list(fake_llm_provider.chunks)
+        assert result["tokens"] == [expected_text]
 
 
 async def test_both_engines_agree_on_llm_failure_behavior(

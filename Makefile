@@ -34,7 +34,7 @@ test-e2e-backend:
 	pytest -m e2e tests/e2e/backend -q
 
 test-rag-engines:
-	pytest tests/test_rag_engine_factory.py tests/test_custom_rag_engine.py tests/test_langchain_rag_engine.py tests/test_langchain_adapters.py tests/test_rag_responses.py -q
+	pytest tests/test_rag_engine_factory.py tests/test_custom_rag_engine.py tests/test_langchain_rag_engine.py tests/test_langchain_adapters.py tests/test_prompt_provider_engine_parity.py -q
 	pytest -m integration tests/integration/test_langchain_rag_engine_integration.py -q
 	pytest -m e2e tests/e2e/backend/test_rag_engine_parity.py -q
 

@@ -103,3 +103,17 @@ async def get_stale_documents(session: AsyncSession, active_config: EmbeddingInd
     """Return every Document whose stored collection_name is not the active one (or never indexed)."""
     result = await session.execute(select(Document))
     return [document for document in result.scalars().all() if is_document_stale(document, active_config)]
+
+
+async def delete_document_vectors(document: Document, vector_store: VectorStore) -> None:
+    """Delete a document's vectors from its currently tracked collection, if it has one.
+
+    Scope limitation: this only cleans the single collection currently tracked on the Document
+    row (`collection_name`). There is no historical document-to-collection log in this
+    milestone, so if a document was re-indexed into a new collection without ever being deleted
+    from the previous one in between, only the latest tracked collection is covered here — see
+    reindex_document() in app/services/reindex_service.py, which does clean up the
+    immediately-previous collection as part of a successful re-index.
+    """
+    if document.collection_name is not None:
+        await vector_store.delete_by_document_id(document.collection_name, document.id)
