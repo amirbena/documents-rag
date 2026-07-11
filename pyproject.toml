@@ -19,6 +19,14 @@ dependencies = [
     "python-docx>=1.1",
     "openpyxl>=3.1",
     "langchain-core>=0.3",
+    # Pinned below 2.5: not used directly by this app (pulled in transitively — a runtime
+    # dependency of qdrant-client, and type-checking-only via langchain-core's
+    # `langchain_core.utils.image`). numpy>=2.5's bundled .pyi stub uses a PEP 695 `type` alias
+    # that mypy only parses under python_version >= 3.12 — this project targets/ships on Python
+    # 3.11 (see Dockerfile, requires-python above), so python_version stays 3.11 and this pin
+    # keeps numpy's own stub parseable instead. Safe to lift once either mypy parses that stub
+    # syntax independent of target version, or this project's Python floor moves to 3.12+.
+    "numpy<2.5",
 ]
 
 [project.optional-dependencies]
@@ -56,9 +64,6 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
 
 [tool.mypy]
-# 3.12, one above requires-python's floor: numpy's stub (pulled in transitively via
-# qdrant-client) uses a PEP 695 `type` alias mypy only parses under python_version >= 3.12,
-# even inside .pyi files. Does not change the app's actual runtime-supported Python version.
-python_version = "3.12"
+python_version = "3.11"
 ignore_missing_imports = true
 disallow_untyped_defs = false

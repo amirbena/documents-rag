@@ -15,15 +15,12 @@ from app.core.config import Settings, get_settings
 from app.rag.decision import DecisionResult, RagDecision, RuleBasedRagDecider
 from app.rag.prompt_builder import PromptSource, RagPromptBuilder
 from app.rag.providers.provider_factory import get_llm_provider
-from app.rag.retrieval_service import RetrievalService
-
-_DIRECT_LLM_SYSTEM_PROMPT = "You are a helpful assistant. Answer the user's question directly."
-
-_CLARIFICATION_MESSAGE = (
-    "Could you rephrase or add more detail? Your question is too short or unclear to act on."
+from app.rag.responses import (
+    CLARIFICATION_NEEDED_RESPONSE,
+    DIRECT_LLM_SYSTEM_PROMPT,
+    OUT_OF_SCOPE_RESPONSE,
 )
-
-_OUT_OF_SCOPE_MESSAGE = "I can't help with that request."
+from app.rag.retrieval_service import RetrievalService
 
 
 @dataclass
@@ -72,12 +69,12 @@ class RagOrchestrator:
 
         if decision_result.decision == RagDecision.CLARIFICATION_NEEDED:
             yield self._metadata(decision_result, retrieval_used=False)
-            yield OrchestratorToken(text=_CLARIFICATION_MESSAGE)
+            yield OrchestratorToken(text=CLARIFICATION_NEEDED_RESPONSE)
             return
 
         if decision_result.decision == RagDecision.OUT_OF_SCOPE:
             yield self._metadata(decision_result, retrieval_used=False)
-            yield OrchestratorToken(text=_OUT_OF_SCOPE_MESSAGE)
+            yield OrchestratorToken(text=OUT_OF_SCOPE_RESPONSE)
             return
 
         if decision_result.decision == RagDecision.NEEDS_RETRIEVAL:
@@ -87,7 +84,7 @@ class RagOrchestrator:
             prompt = f"{built.system_prompt}\n\n{built.user_prompt}"
         else:
             yield self._metadata(decision_result, retrieval_used=False)
-            prompt = f"{_DIRECT_LLM_SYSTEM_PROMPT}\n\nQuestion: {question}"
+            prompt = f"{DIRECT_LLM_SYSTEM_PROMPT}\n\nQuestion: {question}"
 
         llm_provider = get_llm_provider(self._settings)
         async for chunk in llm_provider.stream_generate(prompt):

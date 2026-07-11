@@ -550,10 +550,12 @@ Retrieved LangChain `Document`s are converted straight back into `VectorSearchRe
 to the existing, unmodified `RagPromptBuilder`, so source labels (`[S1]`, `[S2]`), rank order, the
 "answer only from context / say so if the answer isn't present" instructions, and Hebrew/Unicode
 text all behave exactly as they do for `CustomRagEngine`. `CLARIFICATION_NEEDED`/`OUT_OF_SCOPE`
-never invoke retrieval or the LLM, and stream the exact same fixed message text as
-`RagOrchestrator` (imported directly from `app/rag/orchestrator.py`, not duplicated). No
-LangGraph, no agents, no tool calling — see "LangChain compatibility layer" in
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
+never invoke retrieval or the LLM, and stream the exact same fixed message text `RagOrchestrator`
+uses — both come from `app/rag/responses.py`, a small framework-neutral shared module (no
+FastAPI/LangChain/engine dependency of its own) so neither engine imports this text from the
+other's implementation module; it's a deliberately temporary compatibility boundary ahead of a
+future multilingual Prompt Catalog. No LangGraph, no agents, no tool calling — see "LangChain
+compatibility layer" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
 
 The generated answer text can legitimately differ between engines (LangChain's own prompt
 serialization differs from `RagOrchestrator`'s plain string concatenation), but the public

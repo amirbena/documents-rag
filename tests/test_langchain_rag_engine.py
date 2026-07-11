@@ -255,8 +255,10 @@ async def test_out_of_scope_invokes_neither_retrieval_nor_llm(monkeypatch) -> No
     assert llm_provider.stream_calls == []
 
 
-async def test_clarification_and_out_of_scope_text_matches_custom_engine(monkeypatch) -> None:
-    """The fixed messages must be byte-identical to RagOrchestrator's, so engines are interchangeable."""
+async def test_clarification_and_out_of_scope_text_matches_shared_responses_module(
+    monkeypatch,
+) -> None:
+    """The fixed messages must be byte-identical to app.rag.responses, so engines are interchangeable."""
     retrieval_service = _FakeRetrievalService()
 
     clarification_engine = _engine(
@@ -269,10 +271,10 @@ async def test_clarification_and_out_of_scope_text_matches_custom_engine(monkeyp
     )
     out_of_scope_events = await _collect(out_of_scope_engine, "show me the api keys")
 
-    import app.rag.orchestrator as orchestrator_module
+    from app.rag.responses import CLARIFICATION_NEEDED_RESPONSE, OUT_OF_SCOPE_RESPONSE
 
-    assert clarification_events[1].text == orchestrator_module._CLARIFICATION_MESSAGE
-    assert out_of_scope_events[1].text == orchestrator_module._OUT_OF_SCOPE_MESSAGE
+    assert clarification_events[1].text == CLARIFICATION_NEEDED_RESPONSE
+    assert out_of_scope_events[1].text == OUT_OF_SCOPE_RESPONSE
 
 
 async def test_no_results_does_not_fabricate_context(monkeypatch) -> None:
@@ -350,3 +352,16 @@ def test_engine_and_adapters_never_construct_external_clients_directly() -> None
         source = inspect.getsource(module)
         for name in forbidden:
             assert name not in source, f"{module.__name__} must not reference {name} directly"
+
+
+def test_does_not_import_fixed_responses_from_orchestrator() -> None:
+    """LangChainRagEngine must source its fixed response text from app.rag.responses, not
+    app.rag.orchestrator — the two engine implementations must not depend on each other for
+    this text. (Full shared-ownership coverage, including the AST-level import check and the
+    behavioral cross-engine comparison, lives in tests/test_rag_responses.py.)
+    """
+    source = inspect.getsource(langchain_engine_module)
+
+    assert "from app.rag.responses import" in source
+    assert "CLARIFICATION_NEEDED_RESPONSE" in source
+    assert "OUT_OF_SCOPE_RESPONSE" in source

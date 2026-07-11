@@ -453,13 +453,26 @@ implementation: every other engine is judged against its behavior, not the other
 `RuleBasedRagDecider.decide(question)` directly, unmodified, *outside* any LangChain `Runnable` —
 this keeps the decision contract (which four `RagDecision` values exist, and their `reason`
 strings) identical to `CustomRagEngine`'s without needing LangChain to model routing at all.
-`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` stream the same fixed message text `RagOrchestrator` uses
-(imported directly from `app.rag.orchestrator`, not duplicated, so the two engines can never
-drift apart on that text) with no retrieval and no LLM call. For `NEEDS_RETRIEVAL`/`DIRECT_LLM`,
+`CLARIFICATION_NEEDED`/`OUT_OF_SCOPE` stream the same fixed message text `RagOrchestrator` uses —
+both import it from `app/rag/responses.py` (see "Shared fixed RAG responses" below), so neither
+engine depends on the other's implementation module, and the two can never drift apart on that
+text — with no retrieval and no LLM call. For `NEEDS_RETRIEVAL`/`DIRECT_LLM`,
 it builds a LangChain `ChatPromptValue` (from literal `SystemMessage`/`HumanMessage` content —
 never an interpolated `ChatPromptTemplate`, so arbitrary document text containing `{`/`}`
 characters can never be misparsed as a template variable) and pipes it through a LangChain
 `RunnableLambda(...) | ProviderBackedLLM` chain, streaming the result chunk by chunk.
+
+**Shared fixed RAG responses** (`app/rag/responses.py`) — `CLARIFICATION_NEEDED_RESPONSE`,
+`OUT_OF_SCOPE_RESPONSE`, and `DIRECT_LLM_SYSTEM_PROMPT` live in their own framework-neutral
+module: no FastAPI dependency, no LangChain dependency, no provider-client construction, no
+engine-specific orchestration — just the fixed strings. Both `RagOrchestrator` and
+`LangChainRagEngine` import from this module directly; neither imports it from the other's
+implementation module, so `LangChainRagEngine` has no dependency on a `RagOrchestrator`
+implementation detail (and vice versa). This is an intentionally temporary compatibility
+boundary: a future Phase 2.5 multilingual Prompt Catalog will replace it with a language-aware
+`PromptProvider`/`PromptCatalog` that resolves response text per request language — until then,
+this module deliberately stays a flat set of English-only constants, with no language variants,
+detection, or catalog abstractions added ahead of that milestone.
 
 **Adapter boundaries and provider-factory reuse** (`app/rag/engines/langchain_adapters.py`) —
 the *only* place `LangChainRagEngine` touches a LangChain provider-facing base class:
@@ -607,8 +620,8 @@ production `APP_ENV`/`DATABASE_URL`/`QDRANT_URL`.
 
 The RAG engine compatibility layer's tests span all three tiers above rather than forming a
 separate tier of their own: `tests/test_rag_engine_factory.py`/`test_custom_rag_engine.py`/
-`test_langchain_rag_engine.py`/`test_langchain_adapters.py` are unit tests,
-`tests/integration/test_langchain_rag_engine_integration.py` is an integration test (real
+`test_langchain_rag_engine.py`/`test_langchain_adapters.py`/`test_rag_responses.py` are unit
+tests, `tests/integration/test_langchain_rag_engine_integration.py` is an integration test (real
 ephemeral Qdrant, existing `VectorPoint` format, fake embeddings), and
 `tests/e2e/backend/test_rag_engine_parity.py` runs the full backend E2E flow under both
 `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`, comparing source IDs/ranking/metadata/SSE
@@ -858,6 +871,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   "RAG orchestrator" above). The only component that composes the decision layer, retrieval
   service, prompt builder, and LLM provider together — no other module in `app/rag` calls more
   than one of them.
+- `app/rag/responses.py` — the shared, fixed RAG response/prompt text (see "Shared fixed RAG
+  responses" above). No imports of its own; both `RagOrchestrator` and `LangChainRagEngine`
+  import from it directly, never from each other.
 - `app/rag/engine.py` — the `RagEngine` abstraction (see "RAG Engine Compatibility Layer" above).
 - `app/rag/engines/` — concrete `RagEngine` implementations: `custom_engine.py`
   (`CustomRagEngine`, the default, wrapping `RagOrchestrator`), `langchain_engine.py`

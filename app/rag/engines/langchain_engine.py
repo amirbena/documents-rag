@@ -7,9 +7,11 @@ for NEEDS_RETRIEVAL, ProviderBackedRetriever -> the existing, unmodified RagProm
 LangChain ChatPromptValue piped into ProviderBackedLLM; for DIRECT_LLM, a direct-answer
 ChatPromptValue piped into the same LLM adapter. No LangGraph, no agents, no tool calling.
 
-The CLARIFICATION_NEEDED/OUT_OF_SCOPE/DIRECT_LLM message text is imported directly from
-app.rag.orchestrator (rather than duplicated here) so both engines emit byte-identical text for
-the same decision — a single source of truth, with zero changes to orchestrator.py itself.
+The CLARIFICATION_NEEDED/OUT_OF_SCOPE/DIRECT_LLM message text comes from app.rag.responses — a
+framework-neutral shared module, not orchestrator.py — so neither engine implementation depends
+on the other's internals, and both stay byte-identical for that text by construction. See
+app/rag/responses.py's module docstring for the Phase 2.5 (multilingual Prompt Catalog) boundary
+this shared module intentionally stops short of.
 """
 
 from collections.abc import AsyncIterator
@@ -26,15 +28,14 @@ from app.rag.engines.langchain_adapters import (
     build_provider_backed_retriever,
     document_to_search_result,
 )
-from app.rag.orchestrator import _CLARIFICATION_MESSAGE as CLARIFICATION_MESSAGE
-from app.rag.orchestrator import _DIRECT_LLM_SYSTEM_PROMPT as DIRECT_LLM_SYSTEM_PROMPT
-from app.rag.orchestrator import _OUT_OF_SCOPE_MESSAGE as OUT_OF_SCOPE_MESSAGE
-from app.rag.orchestrator import (
-    OrchestratorMetadata,
-    OrchestratorToken,
-)
+from app.rag.orchestrator import OrchestratorMetadata, OrchestratorToken
 from app.rag.prompt_builder import PromptSource, RagPromptBuilder
 from app.rag.providers.provider_factory import get_llm_provider
+from app.rag.responses import (
+    CLARIFICATION_NEEDED_RESPONSE,
+    DIRECT_LLM_SYSTEM_PROMPT,
+    OUT_OF_SCOPE_RESPONSE,
+)
 from app.rag.retrieval_service import RetrievalService
 
 
@@ -69,12 +70,12 @@ class LangChainRagEngine(RagEngine):
 
         if decision_result.decision == RagDecision.CLARIFICATION_NEEDED:
             yield self._metadata(decision_result, retrieval_used=False)
-            yield OrchestratorToken(text=CLARIFICATION_MESSAGE)
+            yield OrchestratorToken(text=CLARIFICATION_NEEDED_RESPONSE)
             return
 
         if decision_result.decision == RagDecision.OUT_OF_SCOPE:
             yield self._metadata(decision_result, retrieval_used=False)
-            yield OrchestratorToken(text=OUT_OF_SCOPE_MESSAGE)
+            yield OrchestratorToken(text=OUT_OF_SCOPE_RESPONSE)
             return
 
         if decision_result.decision == RagDecision.NEEDS_RETRIEVAL:
