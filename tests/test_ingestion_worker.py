@@ -286,6 +286,34 @@ async def test_worker_marks_completed_when_extraction_succeeds(
     assert result.error_message is None
 
 
+async def test_worker_marks_zero_chunk_document_indexed_with_no_vectors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A document producing zero chunks is still marked indexed, with no vectors written."""
+    vector_store = _FakeVectorStore()
+    monkeypatch.setattr(
+        ingestion_worker_module, "get_embedding_provider", lambda settings: _FakeEmbeddingProvider()
+    )
+    monkeypatch.setattr(ingestion_worker_module, "get_vector_store", lambda settings: vector_store)
+    monkeypatch.setattr(DocumentChunker, "chunk", lambda self, extracted: [])
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+
+    session = _FakeAsyncSession()
+    job = _add_document_and_job(session, stored_path=str(file_path))
+    document = session._documents[job.document_id]
+    worker = IngestionWorker()
+
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    assert document.indexed_at is not None
+    assert document.collection_name == get_active_embedding_config().collection_name
+    assert vector_store.upserted_points == []
+
+
 async def test_worker_marks_failed_when_extraction_fails(tmp_path: Path) -> None:
     """The real default processing step should fail the job when the stored file is missing."""
     missing_path = tmp_path / "does_not_exist.txt"

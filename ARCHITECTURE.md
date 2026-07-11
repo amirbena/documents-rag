@@ -130,6 +130,21 @@ with an LLM-based router, but the rule-based version exists first so the decisio
 (`RagDecision`/`DecisionResult`) is fixed and testable before anything calls out to a model for
 routing.
 
+**Multilingual decision patterns.** Every pattern above has a Hebrew equivalent, in the same
+single `RuleBasedRagDecider` — neither `CustomRagEngine` nor `LangChainRagEngine` implements its
+own decision logic (no `CustomHebrewDecider`/`LangChainHebrewDecider`). Retrieval-intent patterns
+cover Hebrew document/file references (`מסמך`/`מסמכים`, `קובץ`/`קבצים`, uploaded/attached/indexed
+conjugations, "according to the file/document," "based on," "knowledge base," "written in the
+file/document") — meaningful intent phrasing, never bare Hebrew-script detection: a Hebrew
+question with none of these phrasings (e.g. "how does the system store vectors?") routes to
+`DIRECT_LLM` like an equivalent English one. Extraction-intent patterns mirror the English
+verb-near-sensitive-noun proximity check with Hebrew verbs (show/reveal/give/send/extract/
+disclose) and nouns (password, credit card, ID number, credentials, secret/private key, bank
+account), so "how do I reset a password?" (`איך מאפסים סיסמה?`) stays in scope exactly like its
+English equivalent. A question mixing Hebrew and embedded English technical identifiers (e.g.
+`איך Qdrant שומר את ה-embeddings לפי המסמך?`) is classified on the Hebrew retrieval-intent phrase
+alone, same as an English question with an embedded Hebrew entity name.
+
 ## Document upload and ingestion job skeleton
 
 `POST /api/v1/documents` (`app/api/v1/routes/documents.py`) is the first public endpoint that
@@ -586,31 +601,87 @@ re-index (below) — never itself the source of truth for what a document "is."
 
 ### Re-index (`app/services/reindex_service.py`)
 
-`reindex_document(document, session, settings)` re-derives a document's vectors from its
-already-persisted stored file — no new upload required. Flow: re-extract (`DocumentTextExtractor`,
-unchanged) -> re-chunk (`DocumentChunker`, active `chunking_version`) -> re-embed (active
-`EmbeddingIndexConfig`) -> `ensure_active_collection()` -> upsert into the new collection ->
-`mark_document_indexed()` + commit -> **only then** delete the document's vectors from its
-*previous* tracked collection (if any, and if different from the new one). A no-op (returns
-`True` immediately) if the document is already current. Idempotent: point IDs are derived
-identically to the initial-ingest path (`app.services.ingestion_worker.to_vector_point`, made
-public specifically so `reindex_service.py` can reuse it), so re-running against the same active
-collection overwrites rather than duplicates. A failure at any step propagates without touching
-the document's stored indexing metadata — `is_document_stale()` still reports it as stale
-afterward, exactly as if the attempt had never happened.
+`reindex_document(document, session, settings) -> ReindexResult` re-derives a document's vectors
+from its already-persisted stored file — no new upload required. Flow: re-extract
+(`DocumentTextExtractor`, unchanged) -> re-chunk (`DocumentChunker`, active `chunking_version`) ->
+re-embed (active `EmbeddingIndexConfig`) -> validate real vector dimensions
+(`app/rag/embedding_validation.py`) -> `ensure_active_collection()` -> upsert into the new
+collection -> `mark_document_indexed()` + commit -> attempt to delete the document's vectors from
+its *previous* tracked collection (if any, and if different from the new one).
+
+`ReindexResult` (`outcome: ReindexOutcome`, `document`) replaces the old plain-`bool` return —
+`bool` could not represent the distinct outcomes below:
+
+- `ALREADY_CURRENT` — no-op, the document already matches the active configuration.
+- `REINDEXED` — successful, non-empty re-index.
+- `REINDEXED_EMPTY` — the document produced zero chunks (see "Zero-chunk behavior" below); marked
+  current anyway, with no vectors written.
+- `REINDEXED_WITH_CLEANUP_PENDING` — the new collection/metadata committed successfully, but
+  deleting the previous collection's vectors failed; see "Legacy-vector cleanup" below. The
+  re-index itself is **not** reported as a failure.
+
+Idempotent: point IDs are derived identically to the initial-ingest path
+(`app.services.ingestion_worker.to_vector_point`, made public specifically so
+`reindex_service.py` can reuse it), so re-running against the same active collection overwrites
+rather than duplicates.
+
+**Transaction semantics — Qdrant and PostgreSQL are never one atomic transaction.** Three
+distinct failure modes, each with different observable state:
+
+1. **Extraction/chunking/embedding/validation/collection/upsert failure** (before the metadata
+   commit): the exception propagates, no Document indexing metadata is ever committed, and no
+   previously-valid vectors are touched. `is_document_stale()` still reports the document stale.
+2. **The Qdrant upsert succeeds but the following Postgres commit fails** (e.g. a dropped
+   connection): `reindex_document()` calls `session.rollback()` then `session.expire(document)`
+   before re-raising, so no mutated in-memory attribute survives the failed commit and the next
+   access re-reads the true (unchanged) persisted state. **This is intentionally not
+   indistinguishable from an attempt that never ran** — the new points already exist in Qdrant.
+   Deterministic point IDs make this safe: the next successful re-index attempt overwrites the
+   same points rather than duplicating them, and no cleanup ever runs against orphaned points
+   from a failed attempt (cleanup only triggers after a *successful* metadata commit).
+3. **The previous-collection vector delete fails after a successful metadata commit** — tracked
+   as a `REINDEXED_WITH_CLEANUP_PENDING` outcome, described next; the document IS current, this is
+   not classified as a re-index failure.
+
+### Zero-chunk behavior
+
+A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still
+marked indexed — via the same `mark_document_indexed()` call, with zero vectors written — rather
+than being silently left permanently stale. Both `IngestionWorker`'s default processing step and
+`reindex_document()` (as `ReindexOutcome.REINDEXED_EMPTY`) apply this identically: no false claim
+that searchable content exists, and predictable no-results behavior at retrieval time (there is
+simply nothing in the collection for that document to match against).
+
+### Legacy-vector cleanup (`VectorCleanupJob`)
+
+`VectorCleanupJob` (`app/models/vector_cleanup_job.py`; migration
+`alembic/versions/1c2d9f3a7b4e_...py`) durably tracks a legacy collection's vectors still needing
+deletion after a re-index, independently of whether the document itself is still considered
+stale — so a cleanup failure is never silently lost or conflated with re-index failure, and stays
+discoverable/retryable even once the document is current. One row per `(document_id,
+collection_name)`, with `status` (`pending`/`failed`/`completed`), `attempts`, `last_error`,
+`created_at`, `completed_at`. Multiple pending rows for the same document (different historical
+collections) are supported and never overwrite each other.
+
+`app/services/index_registry.py` provides: `create_cleanup_job()` (called by `reindex_document()`
+immediately after a failed delete, recording the first attempt's error), `get_pending_cleanup_jobs()`
+(every `pending`/`failed` row, optionally scoped to one document), and `retry_cleanup_job()`
+(retries the delete; marks `completed` on success or increments `attempts`/records `last_error`
+and stays `failed` otherwise — idempotent, since retrying a delete against already-empty vectors
+is a harmless no-op). `delete_document_vectors(document, vector_store, session)` — used when a
+document itself is deleted — cleans both the document's currently-tracked collection **and**
+every collection still tracked by a pending/failed `VectorCleanupJob` for it, so a document
+deleted after one or more failed cleanups never leaves vectors behind. Completed jobs are
+retained (audit trail), never auto-deleted.
 
 `app/services/index_registry.py` additionally provides `get_stale_documents()` (list every
-document whose `collection_name` isn't the active one), `retire_collection()` (bookkeeping-only
-status flip, never deletes Qdrant data), and `delete_document_vectors()` (deletes a document's
-vectors from its currently-tracked collection only — there is no historical
-document-to-collection log in this milestone, so a document re-indexed across multiple
-collections without ever being deleted in between only has its *latest* collection cleaned up
-automatically). Migrating to a new embedding/chunking version is therefore: bump
-`EMBEDDING_VERSION`/`CHUNKING_VERSION` -> the next re-index run creates the new collection ->
-`get_stale_documents()` finds what still needs re-indexing -> old collections are never
-auto-deleted at startup; `retire_collection()` plus a manual Qdrant collection delete is the
-explicit cleanup boundary for once a migration is known-successful. A full admin migration UI is
-out of scope.
+document whose `collection_name` isn't the active one) and `retire_collection()`
+(bookkeeping-only status flip, never deletes Qdrant data). Migrating to a new embedding/chunking
+version is therefore: bump `EMBEDDING_VERSION`/`CHUNKING_VERSION` -> the next re-index run creates
+the new collection -> `get_stale_documents()` finds what still needs re-indexing -> old
+collections are never auto-deleted at startup; `retire_collection()` plus a manual Qdrant
+collection delete is the explicit cleanup boundary for once a migration is known-successful. A
+full admin migration UI is out of scope.
 
 ### Language detection (`app/rag/language.py`)
 
@@ -628,17 +699,26 @@ this directly — both reach it only through `PromptProvider`.
 ### PromptCatalog / PromptProvider / ResolvedPrompt (`app/rag/prompts/`)
 
 `PromptType` (`grounded_answer`, `direct_answer`, `clarification`, `no_results`, `out_of_scope`)
-x `SupportedLanguage` (`he`, `en`) -> `PromptCatalog` holds the actual text: a fixed
-`response_text` for the three no-LLM-call types (clarification/no_results/out_of_scope), or a
-governance `system_text` for the two generation-backed types (grounded_answer/direct_answer) —
-answer only from context, answer in the query's language, preserve quoted source text and
-`[S1]`/`[S2]` labels untranslated, never translate code/API names/class names/environment
-variables/command names, state explicitly when context is insufficient.
+x `SupportedLanguage` (`he`, `en`) -> `PromptCatalog`. The two generation-backed types
+(grounded_answer/direct_answer) use **one English-authored governance instruction each — never
+duplicated per language** (`get_shared_instructions()`): answer only from context, do not
+fabricate, preserve quoted source text and `[S1]`/`[S2]` labels untranslated, never translate
+code/API names/class names/filenames/commands/environment variables/error messages, state
+explicitly when context is insufficient. An explicit, per-language response-language directive
+(`get_response_language_directive()`) is appended — `"Respond directly and naturally in Hebrew
+(he)."` / `"...in English (en)."` — never "answer in English and translate," never a claim that
+the model "thinks in English." `get_system_text()` composes
+`shared_instructions + "\n\n" + language_directive`. The three no-LLM-call types
+(clarification/no_results/out_of_scope) remain naturally authored per language via
+`get_response_text()`, since they bypass the LLM entirely and there is no
+instruction-language-vs-output-language distinction to make for them.
 `UnsupportedPromptLanguageError`/`UnsupportedPromptTypeError` fail explicitly for anything the
 catalog has no content for. `PromptProvider.resolve(prompt_type, question)` detects the
 question's language (via `LanguageDetector`) and returns a `ResolvedPrompt` (`prompt_type`,
-`language`, `prompt_version` from `PROMPT_CATALOG_VERSION`, and exactly one of
-`system_text`/`response_text`) — the single seam both engines call.
+`language`, `prompt_version` from `PROMPT_CATALOG_VERSION` — `v2` since this structural change —
+and exactly one of `system_text`/`response_text`); for generation-backed types, `system_text`'s
+two components are also exposed individually as `shared_instructions`/`language_directive`. This
+is the single seam both engines call.
 
 **Supersedes `app.rag.responses`** (removed): the previous English-only fixed-constants module
 from the LangChain compatibility layer milestone is gone; `RagOrchestrator` and
@@ -996,7 +1076,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `EMBEDDING_VERSION`        | `v2`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever the embedding model/dimension changes meaningfully, to roll onto a new Qdrant collection instead of silently mixing incompatible vectors |
 | `CHUNKING_VERSION`         | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever `CHUNK_SIZE`/`CHUNK_OVERLAP`/the chunking algorithm changes meaningfully |
 | `DEFAULT_RESPONSE_LANGUAGE`| `en`                                                                   | Fallback language `ScriptBasedLanguageDetector` resolves to when a question has no Hebrew/Latin words at all, or an exact word-count tie; must be `he` or `en` |
-| `PROMPT_CATALOG_VERSION`   | `v1`                                                                   | Stamped onto every `ResolvedPrompt.prompt_version` — see "Multilingual RAG Foundation" |
+| `PROMPT_CATALOG_VERSION`   | `v2`                                                                   | Stamped onto every `ResolvedPrompt.prompt_version` — see "Multilingual RAG Foundation" |
 
 ## Current boundaries
 
@@ -1012,9 +1092,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   unversioned platform health responses).
 - `app/db` — SQLAlchemy async engine/session setup.
 - `app/models` — ORM models: `Document`, `IngestionJob`/`IngestionStatus` (see "Document upload
-  and ingestion job skeleton" above), and `IndexCollection`/`IndexCollectionStatus`
-  (`app/models/index_collection.py`, see "Multilingual RAG Foundation" above). `Document` also
-  carries `embedding_*`/`chunking_version`/`collection_name`/`indexed_at` columns.
+  and ingestion job skeleton" above), `IndexCollection`/`IndexCollectionStatus`
+  (`app/models/index_collection.py`, see "Multilingual RAG Foundation" above), and
+  `VectorCleanupJob`/`VectorCleanupStatus` (`app/models/vector_cleanup_job.py`, see "Legacy-vector
+  cleanup" above). `Document` also carries `embedding_*`/`chunking_version`/`collection_name`/
+  `indexed_at` columns.
 - `app/schemas` — Pydantic request/response schemas.
 - `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
   async HTTP client scoped strictly to reachability and model-availability checks — it
@@ -1045,6 +1127,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `app/rag/embedding_config.py` — `EmbeddingIndexConfig`, `get_active_embedding_config()`,
   `InvalidEmbeddingIndexConfigError` (see "Multilingual RAG Foundation" above). The single source
   of the active indexing configuration for both `IngestionWorker` and `RetrievalService`.
+- `app/rag/embedding_validation.py` — `validate_embeddings()`,
+  `EmbeddingDimensionMismatchError`, `EmbeddingResultCountMismatchError` (see "Multilingual RAG
+  Foundation" above). Called by `IngestionWorker`, `reindex_service.py`, and `RetrievalService`
+  before any Qdrant write/search or document-indexed marking.
 - `app/rag/language.py` — `LanguageDetector`, `ScriptBasedLanguageDetector`, `SupportedLanguage`
   (see "Multilingual RAG Foundation" above).
 - `app/rag/prompts/` — `PromptType`, `ResolvedPrompt` (`types.py`), `PromptCatalog`
