@@ -33,8 +33,17 @@ from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app
 from app.services.ingestion_worker import IngestionWorker
+from app.storage.factory import create_file_storage
 from app.storage.local_storage import LocalFileStorage
 from tests.e2e.backend.fakes import FakeEmbeddingProvider, FakeStreamingLLMProvider
+from tests.support.minio_containers import (
+    MINIO_TEST_ROOT_PASSWORD,
+    MINIO_TEST_ROOT_USER,
+    minio_container_session,
+)
+from tests.support.minio_containers import (
+    minio_endpoint as _minio_endpoint,
+)
 
 _PRODUCTION_ENV_NAMES = {"production", "prod"}
 _ALEMBIC_INI = Path(__file__).resolve().parents[3] / "alembic.ini"
@@ -116,6 +125,30 @@ def qdrant_url(qdrant_container: DockerContainer) -> str:
     host = qdrant_container.get_container_host_ip()
     port = qdrant_container.get_exposed_port(6333)
     return f"http://{host}:{port}"
+
+
+@pytest.fixture(scope="session")
+def minio_container() -> Iterator[DockerContainer]:
+    """Start one ephemeral MinIO container for the whole E2E session, dynamic port.
+
+    Only started lazily, when a test actually requests it (directly or via minio_endpoint) — the
+    local-storage E2E tests never reference this fixture, so they never pay for a MinIO container.
+    Startup logic lives in tests/support/minio_containers.py, shared with
+    tests/integration/conftest.py's identical fixture, instead of duplicating it here.
+    """
+    yield from minio_container_session()
+
+
+@pytest.fixture(scope="session")
+def minio_endpoint(minio_container: DockerContainer) -> str:
+    """Dynamically generated host:port endpoint for the ephemeral MinIO container."""
+    return _minio_endpoint(minio_container)
+
+
+@pytest.fixture(scope="session")
+def minio_credentials() -> tuple[str, str]:
+    """The test-only access key / secret key the ephemeral MinIO container was started with."""
+    return MINIO_TEST_ROOT_USER, MINIO_TEST_ROOT_PASSWORD
 
 
 @pytest.fixture(scope="session")
@@ -303,5 +336,51 @@ def process_pending_job(
     async def _process():
         async with e2e_session_factory() as session:
             return await IngestionWorker(file_storage=file_storage).process_next_job(session)
+
+    return _process
+
+
+@pytest.fixture
+async def minio_app_client(
+    e2e_session_factory: async_sessionmaker[AsyncSession],
+    e2e_provider_overrides: None,
+    isolated_test_state: None,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A real ASGI HTTP client identical to app_client, except file storage is left un-overridden.
+
+    Used only by the MinIO backend E2E test (tests/e2e/backend/test_minio_e2e.py): file storage
+    must be resolved by the app's real get_file_storage()/create_file_storage() dependency chain
+    via Settings, exactly as a real deployment would, rather than the tmp_path-rooted
+    LocalFileStorage override app_client installs for every other E2E test. The caller is
+    responsible for pointing Settings at FILE_STORAGE_PROVIDER=minio (and the MINIO_* settings)
+    before making any request against this client.
+    """
+    app.dependency_overrides[get_db_session] = _db_session_override(e2e_session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://e2e-testserver") as client:
+        try:
+            yield client
+        finally:
+            app.dependency_overrides.pop(get_db_session, None)
+
+
+@pytest.fixture
+def process_pending_job_minio(
+    e2e_session_factory: async_sessionmaker[AsyncSession],
+    e2e_provider_overrides: None,
+    isolated_test_state: None,
+):
+    """Run the real IngestionWorker against one pending job, storage resolved via create_file_storage().
+
+    Unlike process_pending_job (which always reads from a tmp_path-rooted LocalFileStorage), this
+    resolves FileStorage through the same app.storage.factory.create_file_storage() the app itself
+    uses — the caller must have already pointed Settings at FILE_STORAGE_PROVIDER=minio, so the
+    worker reads the uploaded content from the real ephemeral MinIO container, never a local path.
+    """
+
+    async def _process():
+        async with e2e_session_factory() as session:
+            return await IngestionWorker(file_storage=create_file_storage()).process_next_job(session)
 
     return _process

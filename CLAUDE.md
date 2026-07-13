@@ -101,6 +101,57 @@ def get_settings() -> Settings:
   This keeps dependencies minimal and behavior fully visible/testable via mocked `httpx`
   transports instead of SDK-specific mocking.
 
+## Storage Abstraction Style
+
+- **Ingestion/upload/extraction/re-index code depends only on `FileStorage`
+  (`app/storage/contract.py`), never on `LocalFileStorage`/`MinioFileStorage` concretely, and
+  never on a filesystem path or a MinIO SDK type.** `app/api/v1/routes/documents.py`,
+  `app/services/document_upload_service.py`, `app/services/ingestion_worker.py`,
+  `app/services/document_text_extractor.py`, and `app/services/reindex_service.py` all take a
+  `FileStorage` as a constructor/function parameter (or resolve one via
+  `app/storage/factory.py`'s `create_file_storage()`) — never instantiate a concrete storage
+  class themselves, and never branch on `settings.file_storage_provider`.
+- **Provider SDK types never leave a storage adapter.** MinIO SDK exceptions, `urllib3` response
+  objects, and local filesystem exceptions (`OSError`, `FileNotFoundError`, etc.) are translated
+  to the `app.storage.errors.StorageError` hierarchy at the `LocalFileStorage`/`MinioFileStorage`
+  boundary, preserving the original exception as `__cause__` — no other module ever catches or
+  re-raises an SDK-specific exception type.
+- **Object keys are provider-neutral and application-generated.** `app/storage/keys.py`'s
+  `generate_object_key()` is the only place a new key is created; a storage provider (especially
+  `MinioFileStorage`) never invents its own key. `validate_object_key()` rejects absolute paths
+  and `..` traversal before any provider call.
+- **Presigned/download URLs are never persisted as a document's identity.** The persisted
+  identity is always `Document.storage_provider`/`storage_bucket`/`storage_key` — never a
+  `generate_download_url()` result, which is time-limited (MinIO) or an internal-only
+  representation (local) and must be regenerated on demand, never stored or logged.
+- **Storage and PostgreSQL are non-atomic — document this precisely, never claim otherwise.**
+  `app/services/document_upload_service.py`'s `upload_document()` saves the object before
+  persisting/committing the `Document`/`IngestionJob` rows; a commit failure after a successful
+  save triggers a best-effort object delete (failure there is logged, never hidden, and never
+  replaces the original DB exception, which always propagates unchanged).
+- **A new storage provider must pass the same contract-level test suite** the existing
+  implementations do (see `tests/test_local_file_storage.py`/`tests/test_minio_file_storage.py`
+  and their Testcontainers integration counterparts) before being wired into
+  `create_file_storage()` — never merged with only implementation-specific tests.
+- **Local-path assumptions must never re-enter ingestion/extraction code.**
+  `DocumentTextExtractor` reads bytes via `FileStorage.read()` and parses them in memory
+  (`io.BytesIO`) — never `Path(...)`/`open(...)` against a document's storage location. If a
+  future parser genuinely requires a real filesystem path, introduce an explicit, narrowly-scoped
+  temporary-materialization boundary rather than leaking a path assumption into the extractor
+  itself.
+- **Documentation must stay consistent whenever the storage contract, providers, object-key
+  strategy, or persisted storage identity change.** A change to `app/storage/`, `Document`'s
+  storage-identity columns, or `FILE_STORAGE_PROVIDER`/`MINIO_*`/`LOCAL_STORAGE_ROOT` settings
+  must come with a matching update to "Storage Abstraction (Phase 2.6/2.7)" in
+  [ARCHITECTURE.md](ARCHITECTURE.md) and the "Storage abstraction" section of
+  [README.md](README.md) — in the same change, not deferred.
+- **Do not silently broaden storage scope beyond Phase 2.6/2.7.** No document-deletion endpoint,
+  lifecycle/download/listing API, orphan-object cleanup worker, hash-based deduplication, AWS
+  S3/Cloudflare R2 implementation, or presigned multipart upload support belongs in this layer
+  until a future phase explicitly adds it — `MinioFileStorage`'s `delete()`/
+  `generate_download_url()` exist to satisfy the `FileStorage` contract, not because a route
+  calls them yet.
+
 ## RAG Engine Compatibility Style
 
 - **`CustomRagEngine` (wrapping `RagOrchestrator`) remains the default and reference RAG engine.**

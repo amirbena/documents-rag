@@ -19,6 +19,14 @@ from testcontainers.postgres import PostgresContainer
 
 from alembic import command
 from app.core.config import get_settings
+from tests.support.minio_containers import (
+    MINIO_TEST_ROOT_PASSWORD,
+    MINIO_TEST_ROOT_USER,
+    minio_container_session,
+)
+from tests.support.minio_containers import (
+    minio_endpoint as _minio_endpoint,
+)
 
 _PRODUCTION_ENV_NAMES = {"production", "prod"}
 _ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
@@ -92,6 +100,29 @@ def qdrant_container() -> Iterator[DockerContainer]:
         yield container
     finally:
         container.stop()
+
+
+@pytest.fixture(scope="session")
+def minio_container() -> Iterator[DockerContainer]:
+    """Start one ephemeral MinIO container for the whole integration session, dynamic port.
+
+    Test-only credentials, dynamic host port, no persistent volume — mirrors qdrant_container's
+    style exactly (see module docstring). Startup itself lives in tests/support/minio_containers.py
+    so tests/e2e/backend/conftest.py can start the identical container without duplicating it.
+    """
+    yield from minio_container_session()
+
+
+@pytest.fixture(scope="session")
+def minio_endpoint(minio_container: DockerContainer) -> str:
+    """Dynamically generated host:port endpoint for the ephemeral MinIO container."""
+    return _minio_endpoint(minio_container)
+
+
+@pytest.fixture(scope="session")
+def minio_credentials() -> tuple[str, str]:
+    """The test-only access key / secret key the ephemeral MinIO container was started with."""
+    return MINIO_TEST_ROOT_USER, MINIO_TEST_ROOT_PASSWORD
 
 
 @pytest.fixture(scope="session")
