@@ -15,7 +15,7 @@ from app.main import app
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from tests.support.fake_document_deletion_session import FakeDocumentDeletionSession
+from tests.support.documents.deletion.fake_session import FakeDocumentDeletionSession
 
 client = TestClient(app)
 
