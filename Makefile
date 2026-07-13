@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio test-document-read test-document-read-integration test-ingestion-retry test-ingestion-retry-integration lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio verify-document-read verify-document-read-integration verify-ingestion-retry verify-ingestion-retry-integration smoke-multilingual-real recover-stale-ingestion-jobs
+.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio test-document-read test-document-read-integration test-ingestion-retry test-ingestion-retry-integration test-document-deletion test-document-deletion-integration lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio verify-document-read verify-document-read-integration verify-ingestion-retry verify-ingestion-retry-integration verify-document-deletion verify-document-deletion-integration smoke-multilingual-real recover-stale-ingestion-jobs process-pending-document-deletions
 
 help:
 	@echo "Available commands:"
@@ -58,6 +58,18 @@ help:
 	@echo "  make recover-stale-ingestion-jobs - OPTIONAL, MANUAL: run one stale-PROCESSING-job"
 	@echo "                          recovery batch against the configured database and print a"
 	@echo "                          summary; never run by make verify/test/CI."
+	@echo "  make test-document-deletion - run the Phase 2.8.4 full-document-deletion unit tests —"
+	@echo "                          no Docker required"
+	@echo "  make test-document-deletion-integration - run the Phase 2.8.4 deletion Postgres +"
+	@echo "                          Qdrant + storage integration and Backend E2E coverage"
+	@echo "                          (needs Docker)"
+	@echo "  make verify-document-deletion - run the document-deletion unit tests plus their own"
+	@echo "                          checks"
+	@echo "  make verify-document-deletion-integration - run the document-deletion integration"
+	@echo "                          coverage plus its own checks"
+	@echo "  make process-pending-document-deletions - OPTIONAL, MANUAL: process pending"
+	@echo "                          DocumentDeletionJob rows against the configured database and"
+	@echo "                          print a summary; never run by make verify/test/CI."
 	@echo "  make help              - show this message"
 	@echo ""
 	@echo "Install the pre-commit hook that runs 'make verify' automatically:"
@@ -111,6 +123,13 @@ test-ingestion-retry-integration:
 	pytest -m integration tests/integration/test_ingestion_retry_postgres.py -q
 	pytest -m e2e tests/e2e/backend/test_ingestion_retry_recovery.py -q
 
+test-document-deletion:
+	pytest tests/test_document_deletion_service.py tests/test_document_deletion_routes.py -q
+
+test-document-deletion-integration:
+	pytest -m integration tests/integration/test_document_deletion_postgres.py tests/integration/test_document_deletion_qdrant.py tests/integration/test_document_deletion_storage.py -q
+	pytest -m e2e tests/e2e/backend/test_document_deletion.py -q
+
 lint:
 	ruff check .
 
@@ -159,8 +178,17 @@ verify-ingestion-retry: test-ingestion-retry
 verify-ingestion-retry-integration: test-ingestion-retry-integration
 	@echo "Ingestion retry/stale-recovery integration quality gates passed."
 
+verify-document-deletion: test-document-deletion
+	@echo "Document deletion quality gates passed."
+
+verify-document-deletion-integration: test-document-deletion-integration
+	@echo "Document deletion integration/E2E quality gates passed."
+
 smoke-multilingual-real:
 	python scripts/smoke_multilingual_real.py
 
 recover-stale-ingestion-jobs:
 	python scripts/recover_stale_ingestion_jobs.py
+
+process-pending-document-deletions:
+	python scripts/process_pending_document_deletions.py

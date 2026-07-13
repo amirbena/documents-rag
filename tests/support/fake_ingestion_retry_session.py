@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob
 from app.models.ingestion_job import IngestionJob
 
 
@@ -52,6 +53,7 @@ class FakeIngestionRetrySession:
     def __init__(self, *, enforce_unique_active_index: bool = True) -> None:
         self.documents: dict[str, Document] = {}
         self.jobs: dict[str, IngestionJob] = {}
+        self.deletion_jobs: dict[str, DocumentDeletionJob] = {}
         self._pending_new_jobs: list[IngestionJob] = []
         self.commit_count = 0
         self.rollback_count = 0
@@ -65,6 +67,8 @@ class FakeIngestionRetrySession:
     def add(self, instance: object) -> None:
         if isinstance(instance, Document):
             self.documents[instance.id] = instance
+        elif isinstance(instance, DocumentDeletionJob):
+            self.deletion_jobs[instance.id] = instance
         elif isinstance(instance, IngestionJob):
             self._pending_new_jobs.append(instance)
 
@@ -75,6 +79,18 @@ class FakeIngestionRetrySession:
 
     async def execute(self, stmt: Any) -> _ListResult:
         compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+
+        if "document_deletion_jobs" in compiled:
+            deletion_jobs = list(self.deletion_jobs.values())
+            eq_match = re.search(r"document_deletion_jobs\.document_id = '([^']*)'", compiled)
+            if eq_match:
+                deletion_jobs = [job for job in deletion_jobs if job.document_id == eq_match.group(1)]
+            deletion_jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
+            limit_match = re.search(r"LIMIT (\d+)", compiled)
+            if limit_match:
+                deletion_jobs = deletion_jobs[: int(limit_match.group(1))]
+            return _ListResult(deletion_jobs)
+
         jobs = list(self.jobs.values())
 
         eq_match = re.search(r"document_id = '([^']*)'", compiled)

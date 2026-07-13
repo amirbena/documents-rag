@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.services.ingestion_retry_service import (
     STALE_RECOVERY_ERROR_PREFIX,
@@ -229,6 +230,48 @@ async def test_retry_concurrent_insert_race_returns_existing_active_job() -> Non
     assert result.job is not None
     assert result.job.id == winning_job.id
     assert session.rollback_count == 1
+
+
+async def test_retry_blocked_when_deletion_job_pending() -> None:
+    """A Phase 2.8.4 deletion job in progress must block ingestion retry with DELETION_ACTIVE."""
+    session = FakeIngestionRetrySession()
+    document = _document()
+    failed_job = _job(document.id, IngestionStatus.FAILED)
+    _seed(session, document, failed_job)
+    session.deletion_jobs["d1"] = DocumentDeletionJob(
+        id="d1",
+        document_id=document.id,
+        status=DocumentDeletionStatus.PENDING,
+        vector_cleanup_completed=False,
+        storage_cleanup_completed=False,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    result = await retry_ingestion(session, document.id, stale_after_seconds=STALE_AFTER, now=NOW)
+
+    assert result.outcome == RetryOutcome.DELETION_ACTIVE
+    assert session.commit_count == 0
+
+
+async def test_retry_blocked_when_document_already_deleted() -> None:
+    """A document whose deletion already COMPLETED must never be implicitly resurrected via retry."""
+    session = FakeIngestionRetrySession()
+    document = _document()
+    _seed(session, document)
+    session.deletion_jobs["d2"] = DocumentDeletionJob(
+        id="d2",
+        document_id=document.id,
+        status=DocumentDeletionStatus.COMPLETED,
+        vector_cleanup_completed=True,
+        storage_cleanup_completed=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    result = await retry_ingestion(session, document.id, stale_after_seconds=STALE_AFTER, now=NOW)
+
+    assert result.outcome == RetryOutcome.DELETION_ACTIVE
 
 
 async def test_recover_stale_jobs_marks_failed_and_creates_replacement() -> None:

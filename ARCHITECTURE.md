@@ -455,6 +455,180 @@ a recoverable `PROCESSING` row (which is exactly what stale recovery targets), a
 and recovery both only ever create a new `PENDING` row for the existing worker to pick up through
 its unchanged claim path.
 
+## Full document deletion (Phase 2.8.4)
+
+Safe, idempotent, asynchronous deletion of a document's vectors and original stored object,
+across PostgreSQL, Qdrant, and object storage. **PostgreSQL remains authoritative and the
+`Document` row is never physically deleted** — a successful deletion never removes the
+`Document` row, nor any `IngestionJob`/`VectorCleanupJob`/`DocumentDeletionJob` history; only the
+document's external resources (Qdrant vectors, the stored object) are removed. This phase does
+not implement hash deduplication, orphan reconciliation, version-aware re-indexing, a background
+scheduler deployment, retention/purge policy, bulk deletion, or physical row deletion — those
+remain explicitly out of scope.
+
+### `DocumentDeletionJob` — an append-only deletion-attempt ledger
+
+`app/models/document_deletion_job.py` mirrors `IngestionJob`'s lifecycle style: `id`,
+`document_id`, `status` (`DocumentDeletionStatus`: `PENDING`, `PROCESSING`, `PARTIALLY_FAILED`,
+`COMPLETED` — stored as a plain `VARCHAR`, `native_enum=False`, exactly like `IngestionStatus`),
+`vector_cleanup_completed`/`storage_cleanup_completed` (booleans tracking that attempt's
+progress through the two-step cleanup order below), `error_code` (a stable, machine-identifiable
+marker — see "Error model" below), `error_message` (the raw internal detail, Postgres-only, never
+returned by a public API verbatim), `created_at`/`updated_at`/`completed_at`. A
+`PARTIALLY_FAILED` row is never reset back to `PENDING` and never deleted — retrying always
+creates a brand-new row for the same `document_id`; deletion history is append-only, exactly like
+ingestion retry.
+
+**One active deletion job per document** is enforced by a real partial unique index,
+`ix_document_deletion_jobs_one_active_per_document` (migration `c8f3a2b6d1e7`,
+`ON document_deletion_jobs (document_id) WHERE status IN ('pending', 'processing')`), mirroring
+`b7e2f6a1c9d4`'s ingestion-job index exactly. Unlike that migration, `c8f3a2b6d1e7` adds **no**
+defensive duplicate-row cleanup before creating the index: `document_deletion_jobs` is a
+brand-new table created in the same migration, so no duplicate-active-row data can possibly exist
+yet in any installation — there is no reachable path to duplicate data here at all, not merely an
+unreachable-in-practice one (unlike the ingestion-job migration, which added its index onto a
+pre-existing, already-populated table).
+
+### Scheduling: `request_document_deletion()` — the service behind `DELETE /api/v1/documents/{id}`
+
+`app/services/document_deletion_service.py`'s `request_document_deletion()` only ever schedules a
+deletion by inserting a `PENDING` `DocumentDeletionJob` row — it never performs the actual
+cross-system cleanup itself, so the HTTP request never blocks on unbounded external I/O. Decision
+table, driven by the document's latest `DocumentDeletionJob` and (when relevant) its latest
+`IngestionJob`:
+
+| Condition | Outcome | HTTP |
+| --- | --- | --- |
+| Document doesn't exist | `DOCUMENT_NOT_FOUND` | `404` |
+| Latest deletion job `COMPLETED` | `ALREADY_DELETED` (idempotent; no new job) | `200` |
+| Latest deletion job `PENDING`/`PROCESSING` | `ALREADY_ACTIVE` (existing job returned) | `202` |
+| Latest deletion job `PARTIALLY_FAILED`, or none yet, **and** latest ingestion job is `PENDING`/`PROCESSING` | `INGESTION_ACTIVE` — deletion never races an in-flight ingestion | `409` |
+| Latest deletion job `PARTIALLY_FAILED`, or none yet, and ingestion is not active | `CREATED` — a new `PENDING` `DocumentDeletionJob` is inserted | `202` |
+
+A completed or failed ingestion never blocks deletion — full tracked cleanup is still required
+even for a document whose ingestion never succeeded, since an original object/historical vectors/
+cleanup records may still exist for it.
+
+**Concurrency**: `request_document_deletion()` takes a blocking `SELECT ... FOR UPDATE` on the
+document's existing deletion-job rows before deciding whether to insert, exactly mirroring
+`retry_ingestion()`'s pattern — so two concurrent delete requests for the same document serialize
+instead of racing. The residual insert race (a brand-new row is never covered by a lock on rows
+that already existed) is closed by catching the partial unique index's `IntegrityError` at commit
+time and re-reading/returning the now-existing active job instead of raising.
+
+### Execution: `DocumentDeletionWorker` — out-of-band, mirroring `IngestionWorker`
+
+**Design choice**: this codebase has no deployed background-worker *process* for `IngestionJob`
+either — `IngestionWorker.process_next_job()` is only ever invoked by test fixtures and
+`scripts/`, never inline inside `POST /api/v1/documents`. `DocumentDeletionWorker` mirrors this
+exact architecture rather than introducing a new one: `DELETE /api/v1/documents/{id}` only ever
+schedules (inserts a `PENDING` row); the actual cross-system cleanup is a separate, independently
+testable operation — `DocumentDeletionWorker.process_next_job(session)` — invoked by
+`scripts/process_pending_document_deletions.py` (`make process-pending-document-deletions`,
+optional/manual, mirroring `scripts/recover_stale_ingestion_jobs.py`'s boundary: never run by
+`make verify`/`make test*`/CI) or directly by test code.
+
+`DocumentDeletionWorker.process_next_job(session)`:
+
+1. **Claim**: `SELECT ... WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP
+   LOCKED` — the identical locking pattern `IngestionWorker._claim_next_pending_job()` uses, so
+   multiple worker invocations never claim the same job. Returns `None` if there is no pending job.
+2. Flips the claimed job to `PROCESSING` and **commits immediately**, before any external I/O.
+3. **Vector cleanup, strictly before storage cleanup**: calls
+   `index_registry.delete_all_tracked_document_vectors(document, vector_store, session)` — the
+   full-tracked-collection operation (targets the document's active collection *and* every
+   distinct historical collection still tracked by a pending/failed `VectorCleanupJob`) — **never**
+   `delete_current_document_vectors()` (the deliberately-partial, active-collection-only sibling).
+   If any targeted collection's deletion fails, the job is marked `PARTIALLY_FAILED` with
+   `vector_cleanup_completed=False` and `error_code=DOCUMENT_VECTOR_CLEANUP_FAILED`, and the
+   method returns immediately — **storage cleanup is never attempted in that call**, enforced
+   structurally by the code path (there is no branch reaching storage deletion without first
+   observing `VectorDeletionResult.fully_deleted is True`), not merely as a documented intention.
+4. On full vector-cleanup success, `vector_cleanup_completed` is committed `True`, then
+   `FileStorage.delete(storage_key)` is called. An already-missing object is treated as an
+   idempotent success (per `FileStorage.delete()`'s existing contract — see "Storage Abstraction"
+   above); any other failure (`StorageError` subclass) marks the job `PARTIALLY_FAILED` with
+   `storage_cleanup_completed=False` and `error_code=DOCUMENT_STORAGE_CLEANUP_FAILED`.
+5. Only when both steps succeed is the job marked `COMPLETED` with `completed_at` set — this is
+   the only path a document's public lifecycle status becomes `deleted` (see below).
+
+**Why vectors before storage**: searchable derived content (vectors) must stop being searchable
+before a document is ever reported as deleted; the original object plays no role in retrieval, so
+it can safely be cleaned up afterward (and retried independently) without risking a document that
+looks "deleted" while still being findable through chat/retrieval.
+
+**Retry is append-only, not resumable-in-place.** A `PARTIALLY_FAILED` job's
+`vector_cleanup_completed`/`storage_cleanup_completed` flags describe *that* attempt only.
+Retrying (calling `request_document_deletion()` again) creates a brand-new `PENDING` row that
+re-attempts both steps from scratch — always safe, because `delete_all_tracked_document_vectors()`
+and `FileStorage.delete()` are both independently idempotent (re-deleting already-absent
+vectors/objects is a harmless no-op success), so re-running an already-completed step costs
+nothing but the extra I/O. No cross-job "resume" bookkeeping exists or is needed.
+
+`IngestionWorker._claim_next_pending_job()` itself was reviewed and left **unmodified** — it
+already satisfies every property this phase needed, and `DocumentDeletionWorker` uses its own,
+independent claim query against `document_deletion_jobs`, never touching `ingestion_jobs`.
+
+### Lifecycle precedence — deletion always wins
+
+`derive_lifecycle_status()` (`app/services/document_query_service.py`) now takes the document's
+latest `DocumentDeletionJob` (if any) as an additional input and checks it **first**, before the
+existing ingestion-derived rule:
+
+| Latest deletion job | Status |
+| --- | --- |
+| `PENDING`/`PROCESSING` | `deleting` |
+| `PARTIALLY_FAILED` | `deletion_failed` |
+| `COMPLETED` | `deleted` |
+| none | falls through to the ingestion-derived rule (see "Document read APIs" above) |
+
+Once a document is `deleted`, nothing about its (unchanged) `Document.collection_name`/
+`indexed_at`/`IngestionJob` columns can ever make it look `indexed`/`pending`/etc. again — the
+deletion job, not those columns, is authoritative for lifecycle purposes from that point on. A
+deleted document remains listed/inspectable via `GET /api/v1/documents` and `GET
+/api/v1/documents/{id}` (lifecycle=`deleted`) — read APIs never filter it out.
+
+### Public API
+
+- **`DELETE /api/v1/documents/{document_id}`** — `202` when a new deletion was scheduled
+  (`created=true`) or an existing active job was returned (`created=false`); `200` when the
+  document was already fully deleted (idempotent, `created=false`); `404` if the document does
+  not exist; `409` if the document has an active (`PENDING`/`PROCESSING`) ingestion job. Body:
+  `{document_id, deletion_job_id, status, created}`.
+- **`GET /api/v1/documents/{document_id}/deletion`** — the document's latest deletion attempt:
+  `{document_id, deletion_job_id, status, vector_cleanup_completed, storage_cleanup_completed,
+  safe_message, created_at, updated_at, completed_at}`. `404` if no deletion was ever requested
+  for this document. Never exposes a storage key/bucket, Qdrant collection name, or raw provider
+  exception — `safe_message` is always `sanitize_deletion_error()`'s fixed, generic text (`None`
+  when there is no recorded failure).
+- **`GET /api/v1/documents/{document_id}/download`** on a `deleted` document returns **`410
+  Gone`**, not `404` — the Postgres resource still exists; only its content was intentionally
+  removed. This is checked before any storage I/O is attempted.
+- **`POST /api/v1/documents/{document_id}/ingestion/retry`** rejects with **`409`** whenever *any*
+  `DocumentDeletionJob` exists for the document at all (`deleting`/`deletion_failed`/`deleted`) —
+  checked first, before any of `retry_ingestion()`'s existing ingestion-status branches — so a
+  document is never implicitly resurrected by retrying its ingestion once deletion has begun.
+
+### Error model
+
+Stable, machine-identifiable public error codes (`DeletionErrorCode`, StrEnum):
+`DOCUMENT_VECTOR_CLEANUP_FAILED`, `DOCUMENT_STORAGE_CLEANUP_FAILED`. `sanitize_deletion_error()`
+maps a stored `error_code` to one of two fixed, generic public messages (or a generic fallback for
+an unrecognized code) — the raw `error_message` (which may embed a Qdrant/MinIO connection detail)
+never reaches a client; it stays in Postgres for operator/log inspection only, mirroring
+`sanitize_ingestion_error()`'s existing pattern exactly.
+
+### Explicit exclusions (Phase 2.8.4)
+
+Physical deletion of the `Document` row; cascading deletion of `IngestionJob`/`VectorCleanupJob`/
+`DocumentDeletionJob` history; hash deduplication; orphan reconciliation; version-aware
+re-indexing; re-upload/restore; a deployed background-scheduler process; retention/purge policy;
+tenant/user authorization changes; bulk deletion; a vector-only deletion HTTP endpoint; and a
+stale-`PROCESSING`-deletion-job recovery mechanism (unlike ingestion, deletion execution has no
+analogous `recover_stale_*` operation in this phase — a `PROCESSING` deletion row that never
+resolves stays `PROCESSING` until a future phase adds one, exactly as `IngestionJob` did before
+Phase 2.8.3 introduced stale recovery for ingestion specifically).
+
 ## Ingestion worker
 
 `IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — **no public API**
