@@ -95,33 +95,33 @@ test-rag-engines:
 	pytest -m e2e tests/e2e/backend/test_rag_engine_parity.py -q
 
 test-multilingual-rag:
-	pytest tests/test_embedding_config.py tests/test_index_registry.py tests/test_language_detector.py tests/test_prompt_catalog.py tests/test_prompt_provider_engine_parity.py tests/test_reindex_service.py -q
+	pytest tests/test_embedding_config.py tests/unit/services/indexing/test_collection_registry.py tests/unit/services/indexing/test_vector_deletion_service.py tests/unit/services/indexing/test_cleanup_job_service.py tests/unit/services/indexing/test_reindex_service.py tests/test_language_detector.py tests/test_prompt_catalog.py tests/test_prompt_provider_engine_parity.py -q
 	pytest -m integration tests/integration/test_multilingual_indexing.py -q
 	pytest -m e2e tests/e2e/backend/test_multilingual_matrix.py -q
 
 test-storage:
-	pytest tests/test_storage_contract.py tests/test_local_file_storage.py tests/test_storage_factory.py tests/test_document_text_extractor.py tests/test_document_upload.py tests/test_ingestion_worker.py -q
+	pytest tests/test_storage_contract.py tests/test_local_file_storage.py tests/test_storage_factory.py tests/unit/services/documents/test_text_extractor.py tests/test_document_upload.py tests/unit/services/ingestion/test_worker.py -q
 
 test-storage-integration:
-	pytest -m integration tests/integration/test_minio_storage.py tests/integration/test_ingestion_worker_minio.py -q
+	pytest -m integration tests/integration/test_minio_storage.py tests/integration/ingestion/test_worker_minio.py -q
 
 test-minio:
 	pytest tests/test_minio_file_storage.py -q
-	pytest -m integration tests/integration/test_minio_storage.py tests/integration/test_ingestion_worker_minio.py -q
+	pytest -m integration tests/integration/test_minio_storage.py tests/integration/ingestion/test_worker_minio.py -q
 
 test-document-read:
-	pytest tests/test_document_query_service.py tests/test_document_read_routes.py tests/test_document_download_local_storage.py -q
+	pytest tests/unit/services/documents/test_query_service.py tests/unit/services/documents/test_download_service.py tests/test_document_read_routes.py tests/unit/services/documents/test_download_service_local_storage.py -q
 
 test-document-read-integration:
-	pytest -m integration tests/integration/test_document_read_api.py tests/integration/test_document_download_minio.py -q
-	pytest -m e2e tests/e2e/backend/test_document_read_api.py tests/e2e/backend/test_document_read_api_minio.py -q
+	pytest -m integration tests/integration/documents/read/test_postgres.py tests/integration/documents/download/test_minio.py -q
+	pytest -m e2e tests/e2e/backend/documents/read/test_local.py tests/e2e/backend/documents/read/test_minio.py -q
 
 test-ingestion-retry:
-	pytest tests/test_ingestion_retry_service.py tests/test_ingestion_retry_routes.py -q
+	pytest tests/unit/services/ingestion/test_retry_service.py tests/unit/services/ingestion/test_stale_recovery_service.py tests/test_ingestion_retry_routes.py -q
 
 test-ingestion-retry-integration:
-	pytest -m integration tests/integration/test_ingestion_retry_postgres.py -q
-	pytest -m e2e tests/e2e/backend/test_ingestion_retry_recovery.py -q
+	pytest -m integration tests/integration/ingestion/test_retry_postgres.py tests/integration/ingestion/test_concurrency.py -q
+	pytest -m e2e tests/e2e/backend/ingestion/test_retry_recovery.py -q
 
 test-document-deletion:
 	pytest tests/unit/services/documents tests/test_document_deletion_routes.py -q
