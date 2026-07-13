@@ -100,13 +100,13 @@ test-multilingual-rag:
 	pytest -m e2e tests/e2e/backend/test_multilingual_matrix.py -q
 
 test-storage:
-	pytest tests/test_storage_contract.py tests/test_local_file_storage.py tests/test_storage_factory.py tests/unit/services/documents/test_text_extractor.py tests/unit/api/test_document_upload.py tests/unit/services/ingestion/test_worker.py -q
+	pytest tests/unit/storage/test_storage_contract.py tests/unit/storage/test_local_file_storage.py tests/unit/storage/test_storage_factory.py tests/unit/services/documents/test_text_extractor.py tests/unit/api/test_document_upload.py tests/unit/services/ingestion/test_worker.py -q
 
 test-storage-integration:
 	pytest -m integration tests/integration/test_minio_storage.py tests/integration/ingestion/test_worker_minio.py -q
 
 test-minio:
-	pytest tests/test_minio_file_storage.py -q
+	pytest tests/unit/storage/test_minio_file_storage.py -q
 	pytest -m integration tests/integration/test_minio_storage.py tests/integration/ingestion/test_worker_minio.py -q
 
 test-document-read:
