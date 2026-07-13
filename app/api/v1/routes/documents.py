@@ -130,9 +130,19 @@ def _content_disposition_header(original_filename: str) -> str:
     HTTP headers are Latin-1/ASCII, so a raw Hebrew (or any non-ASCII) filename cannot be
     interpolated directly. Provides both forms browsers actually respect: an ASCII-only
     `filename="..."` fallback (non-ASCII characters replaced) and the percent-encoded
-    `filename*=UTF-8''...` form carrying the exact original name.
+    `filename*=UTF-8''...` form carrying the exact original name. `original_filename` is
+    user-controlled (an uploader picks it, unsanitized) — the `filename*=` form is inherently safe
+    because `quote()` percent-encodes every byte outside its unreserved set (including CR/LF/`"`),
+    but the `filename="..."` fallback is interpolated into a quoted string, so control characters
+    (which could inject a CRLF header-splitting sequence) and quote/backslash characters (which
+    could break out of the quoted string and inject extra header parameters) are stripped from it
+    first — replaced with `_`, matching the existing non-ASCII-replacement character.
     """
-    ascii_fallback = original_filename.encode("ascii", errors="replace").decode("ascii").replace("?", "_")
+    ascii_fallback = original_filename.encode("ascii", errors="replace").decode("ascii")
+    ascii_fallback = "".join(
+        "_" if char in ('"', "\\", "?") or ord(char) < 0x20 or ord(char) == 0x7F else char
+        for char in ascii_fallback
+    )
     encoded = quote(original_filename, safe="")
     return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
 

@@ -261,6 +261,35 @@ def test_download_unicode_filename_content_disposition(tmp_path: Path) -> None:
     assert unquote(encoded) == hebrew_name
 
 
+def test_download_content_disposition_rejects_header_injection(tmp_path: Path) -> None:
+    """A malicious original_filename must never let CRLF or a quote break the header's syntax.
+
+    original_filename is user-controlled (an uploader picks it, unsanitized at upload time) — a
+    filename containing CRLF or an embedded quote must never survive into the raw
+    Content-Disposition header value, since either could inject a spoofed header/cookie or extra
+    Content-Disposition parameter into the response.
+    """
+    session = _override_session()
+    _override_storage(tmp_path)
+
+    evil_name = 'foo"\r\nSet-Cookie: hacked=1'
+    doc = _document(original_filename=evil_name, storage_key="documents/x/stored.pdf")
+    session.add(doc)
+    (tmp_path / "documents" / "x").mkdir(parents=True)
+    (tmp_path / "documents" / "x" / "stored.pdf").write_bytes(b"content")
+
+    response = client.get(f"/api/v1/documents/{doc.id}/download")
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert "\r" not in disposition
+    assert "\n" not in disposition
+    # No stray unescaped quote in the ASCII fallback field that could break out of it.
+    fallback = disposition.split("filename=", 1)[1].split(";", 1)[0]
+    assert fallback.count('"') == 2  # exactly the opening/closing quote of filename="..."
+    assert "hacked" not in response.headers  # no injected header name landed in the response
+
+
 def test_download_missing_object_is_409(tmp_path: Path) -> None:
     session = _override_session()
     _override_storage(tmp_path)
