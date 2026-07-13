@@ -124,11 +124,11 @@ test-ingestion-retry-integration:
 	pytest -m e2e tests/e2e/backend/test_ingestion_retry_recovery.py -q
 
 test-document-deletion:
-	pytest tests/test_document_deletion_service.py tests/test_document_deletion_routes.py -q
+	pytest tests/unit/services/documents tests/test_document_deletion_routes.py -q
 
 test-document-deletion-integration:
-	pytest -m integration tests/integration/test_document_deletion_postgres.py tests/integration/test_document_deletion_qdrant.py tests/integration/test_document_deletion_storage.py -q
-	pytest -m e2e tests/e2e/backend/test_document_deletion.py -q
+	pytest -m integration tests/integration/documents/deletion -q
+	pytest -m e2e tests/e2e/backend/documents/deletion -q
 
 lint:
 	ruff check .

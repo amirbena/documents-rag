@@ -466,6 +466,28 @@ not implement hash deduplication, orphan reconciliation, version-aware re-indexi
 scheduler deployment, retention/purge policy, bulk deletion, or physical row deletion — those
 remain explicitly out of scope.
 
+### Documents service package (`app/services/documents/`)
+
+Deletion service code lives in a small package, split by dependency direction rather than in one
+mixed module:
+
+- `app/services/documents/deletion_service.py` — request-scoped deletion state and scheduling:
+  deletion-status reads (`get_latest_deletion_job()`/`get_latest_deletion_jobs_for_documents()`),
+  `request_document_deletion()`, the `DeletionRequestOutcome`/`DeletionRequestResult` types routes
+  map to HTTP status, and public error sanitization (`DeletionErrorCode`/
+  `sanitize_deletion_error()`). This is what API routes and `document_query_service.py`/
+  `ingestion_retry_service.py` import.
+- `app/services/documents/deletion_worker.py` — background deletion execution:
+  `DocumentDeletionWorker`, the claim/vector-cleanup/storage-cleanup/completion orchestration.
+  This is what `scripts/process_pending_document_deletions.py` and tests exercising execution
+  import.
+
+`deletion_worker.py` depends on `deletion_service.py` (for the shared `DeletionErrorCode`
+constants) — never the reverse. This mirrors the real production dependency direction: API routes
+only ever need scheduling/status, never execution; only the out-of-band script/tests need
+execution, and execution itself needs the shared error-code vocabulary defined on the service
+side.
+
 ### `DocumentDeletionJob` — an append-only deletion-attempt ledger
 
 `app/models/document_deletion_job.py` mirrors `IngestionJob`'s lifecycle style: `id`,
@@ -491,7 +513,7 @@ pre-existing, already-populated table).
 
 ### Scheduling: `request_document_deletion()` — the service behind `DELETE /api/v1/documents/{id}`
 
-`app/services/document_deletion_service.py`'s `request_document_deletion()` only ever schedules a
+`app/services/documents/deletion_service.py`'s `request_document_deletion()` only ever schedules a
 deletion by inserting a `PENDING` `DocumentDeletionJob` row — it never performs the actual
 cross-system cleanup itself, so the HTTP request never blocks on unbounded external I/O. Decision
 table, driven by the document's latest `DocumentDeletionJob` and (when relevant) its latest
@@ -517,6 +539,10 @@ that already existed) is closed by catching the partial unique index's `Integrit
 time and re-reading/returning the now-existing active job instead of raising.
 
 ### Execution: `DocumentDeletionWorker` — out-of-band, mirroring `IngestionWorker`
+
+`app/services/documents/deletion_worker.py`'s `DocumentDeletionWorker` is the execution side —
+kept in a separate module from `deletion_service.py`'s request-scoped scheduling (see "Documents
+service package" below for the full module boundary).
 
 **Design choice**: this codebase has no deployed background-worker *process* for `IngestionJob`
 either — `IngestionWorker.process_next_job()` is only ever invoked by test fixtures and
@@ -1356,7 +1382,12 @@ trade-off:
 - **Unit tests** (`tests/*.py`, unmarked/default) — fakes and mocks only (fake sessions, fake
   providers, mocked `httpx` transports); no real database, no real Qdrant, no real network, no
   Docker. Fast (the whole suite runs in well under a second) and always run by `make test`/
-  `make verify`.
+  `make verify`. **One deliberate exception**: document-deletion unit tests live under
+  `tests/unit/services/documents/` (`test_deletion_service.py`/`test_deletion_worker.py`),
+  mirroring `app/services/documents/`'s module split — this is currently the only nested unit-test
+  directory in the repository; every other unit test file remains flat directly under `tests/`.
+  Extending this nested convention to other features is a deliberate future decision, not
+  something this split silently generalizes.
 - **Integration tests** (`tests/integration/*.py`, `@pytest.mark.integration`, auto-applied by
   `tests/integration/conftest.py`) — real, ephemeral Postgres and Qdrant containers started via
   [Testcontainers for Python](https://testcontainers-python.readthedocs.io/), never the

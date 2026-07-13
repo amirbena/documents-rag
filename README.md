@@ -900,18 +900,18 @@ make test-document-deletion-integration  # deletion Postgres + Qdrant + storage 
   stale-recovery calls never recovering the same row twice, history preservation after a retry)
   plus one real-Postgres-and-Qdrant test forcing a first attempt to fail, confirming zero Qdrant
   points exist, then retrying to a real success — see `make test-ingestion-retry-integration`.
-- **Full document deletion coverage (Phase 2.8.4)** —
-  `tests/integration/test_document_deletion_postgres.py` (real Postgres: the partial unique
-  index, concurrent delete requests via `asyncio.gather` producing exactly one active job,
-  concurrent worker claims never double-processing a row, append-only history, lifecycle
-  derivation after completion/partial failure),
-  `tests/integration/test_document_deletion_qdrant.py` (real Qdrant: full tracked-collection
-  cleanup including a historical pending/failed `VectorCleanupJob` collection, an unrelated
-  document's vectors surviving, idempotent re-deletion, a real forced partial-collection failure
-  blocking storage deletion), and `tests/integration/test_document_deletion_storage.py` (real
-  LocalFileStorage and real Testcontainers MinIO: exact-object deletion, already-missing-object
-  idempotency, provider-failure partial state, identical Local/MinIO contract) — see
-  `make test-document-deletion-integration`.
+- **Full document deletion coverage (Phase 2.8.4)** — `tests/integration/documents/deletion/`:
+  `test_postgres.py` (real Postgres: the partial unique index, append-only history, lifecycle
+  derivation after completion/partial failure, migration correctness),
+  `test_concurrency.py` (concurrent delete requests via `asyncio.gather` producing exactly one
+  active job, concurrent worker claims never double-processing a row — kept separate from
+  ordinary persistence tests, matching `tests/integration/test_ingestion_retry_postgres.py`'s
+  concurrency-stress convention), `test_qdrant.py` (real Qdrant: full tracked-collection cleanup
+  including a historical pending/failed `VectorCleanupJob` collection, an unrelated document's
+  vectors surviving, idempotent re-deletion, a real forced partial-collection failure blocking
+  storage deletion), and `test_storage.py` (real LocalFileStorage and real Testcontainers MinIO:
+  exact-object deletion, already-missing-object idempotency, provider-failure partial state,
+  identical Local/MinIO contract) — see `make test-document-deletion-integration`.
 
 ## Backend E2E tests
 
@@ -961,17 +961,19 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   `POST .../ingestion/retry` over real HTTP after a real forced/transient failure and a
   manufactured stale-`PROCESSING` row, confirming both the retry contract and that history stays
   visible through the existing read APIs.
-- **Full document deletion E2E coverage (Phase 2.8.4)** —
-  `tests/e2e/backend/test_document_deletion.py` drives `DELETE /api/v1/documents/{id}` and `GET
-  .../deletion` over real HTTP, then executes the scheduled job with a real
-  `DocumentDeletionWorker` against the real ephemeral Qdrant container and a real
-  `LocalFileStorage`. Covers all five required scenarios: successful deletion (vectors and object
-  removed, lifecycle becomes `deleted`, download returns `410`, chunks no longer searchable via a
-  real `search_similar()` call); a forced real Qdrant delete failure (lifecycle becomes
-  `deletion_failed`, the object stays downloadable, no false success); a forced storage failure
+- **Full document deletion E2E coverage (Phase 2.8.4)** — `tests/e2e/backend/documents/deletion/`,
+  organized by user-visible workflow rather than infrastructure: `test_successful_deletion.py`
+  drives `DELETE /api/v1/documents/{id}` and `GET .../deletion` over real HTTP, then executes the
+  scheduled job with a real `DocumentDeletionWorker` against the real ephemeral Qdrant container
+  and a real `LocalFileStorage` (vectors and object removed, lifecycle becomes `deleted`, download
+  returns `410`, chunks no longer searchable via a real `search_similar()` call);
+  `test_partial_failures.py` covers a forced real Qdrant delete failure (lifecycle becomes
+  `deletion_failed`, the object stays downloadable, no false success) and a forced storage failure
   followed by a successful retry (vectors removed once, storage cleanup completes on the second
-  attempt); two genuinely concurrent `DELETE` requests (`asyncio.gather`) converging on exactly
-  one active job; and a deleted document rejecting `POST .../ingestion/retry` with `409`.
+  attempt); `test_concurrent_requests.py` covers two genuinely concurrent `DELETE` requests
+  (`asyncio.gather`) converging on exactly one active job; `test_deleted_document_behavior.py`
+  covers a deleted document rejecting `POST .../ingestion/retry` with `409`. Shared
+  upload-and-ingest/execute-deletion helpers live in `support.py` within that same directory.
 
 Run it with:
 

@@ -263,6 +263,14 @@ def get_settings() -> Settings:
 
 ## Full Document Deletion Style (Phase 2.8.4)
 
+- **Request-scoped deletion state and background execution live in separate modules —
+  `app/services/documents/deletion_service.py` and `app/services/documents/deletion_worker.py` —
+  and the dependency direction is one-way.** `deletion_service.py` (status reads, scheduling,
+  error sanitization) is what API routes import; `deletion_worker.py` (claim/vector-cleanup/
+  storage-cleanup/completion) is what the out-of-band script and execution tests import.
+  `deletion_worker.py` may import from `deletion_service.py`; `deletion_service.py` must never
+  import from `deletion_worker.py`. Do not merge these back into one module, and do not add a
+  third file to `app/services/documents/` without an explicit user request.
 - **PostgreSQL remains authoritative; the `Document` row is never physically deleted.** A
   successful deletion never removes the `Document` row, nor any `IngestionJob`/`VectorCleanupJob`/
   `DocumentDeletionJob` history — only a document's external resources (Qdrant vectors, the
