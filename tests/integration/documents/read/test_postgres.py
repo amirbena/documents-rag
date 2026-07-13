@@ -1,4 +1,4 @@
-"""Integration tests for app/services/document_query_service.py against a real, ephemeral
+"""Integration tests for app/services/documents/query_service.py against a real, ephemeral
 Postgres container — covers ordering/pagination/latest-job selection behavior that a fake
 in-memory session cannot faithfully prove (real row storage, real query execution).
 """
@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.document_query_service import (
+from app.services.documents.query_service import (
     build_document_list_response,
     get_document,
     get_latest_failed_ingestion_job,

@@ -1,5 +1,5 @@
 """Backend E2E: upload -> ingestion -> list -> detail -> ingestion-status -> download, over the
-real public HTTP boundary, for FILE_STORAGE_PROVIDER=local (see test_document_read_api_minio.py
+real public HTTP boundary, for FILE_STORAGE_PROVIDER=local (see test_minio.py
 for the MinIO-flavored equivalent). These are read-only document APIs — they touch only
 Document/IngestionJob/FileStorage, never RagEngine, so there is no need to run this under both
 RAG_ENGINE settings (unlike tests/e2e/backend/test_rag_engine_parity.py).

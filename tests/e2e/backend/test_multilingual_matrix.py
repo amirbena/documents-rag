@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import app.rag.retrieval_service as retrieval_service_module
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionStatus
 from app.rag.prompts.provider import PromptProvider

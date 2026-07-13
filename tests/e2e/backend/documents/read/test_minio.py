@@ -1,4 +1,4 @@
-"""Backend E2E: the same document read/download lifecycle as test_document_read_api.py, for
+"""Backend E2E: the same document read/download lifecycle as test_local.py, for
 FILE_STORAGE_PROVIDER=minio — mirrors test_minio_e2e.py's minio_storage_settings/minio_app_client/
 process_pending_job_minio pattern so storage provider selection goes through the app's real
 get_file_storage()/create_file_storage() dependency chain, never a hand-substituted instance.
@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app as fastapi_app
 from app.models.ingestion_job import IngestionStatus
-from app.services.document_query_service import get_document
+from app.services.documents.query_service import get_document
 from app.storage.factory import create_file_storage
 from app.storage.keys import resolve_document_storage_key
 from app.storage.minio_storage import MinioFileStorage

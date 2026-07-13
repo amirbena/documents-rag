@@ -26,13 +26,13 @@ from testcontainers.postgres import PostgresContainer
 import app.rag.engines.langchain_engine as langchain_engine_module
 import app.rag.orchestrator as orchestrator_module
 import app.rag.retrieval_service as retrieval_service_module
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from alembic import command
 from app.api.v1.routes.documents import get_file_storage
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app
-from app.services.ingestion_worker import IngestionWorker
+from app.services.ingestion.worker import IngestionWorker
 from app.storage.factory import create_file_storage
 from app.storage.local_storage import LocalFileStorage
 from tests.e2e.backend.fakes import FakeEmbeddingProvider, FakeStreamingLLMProvider

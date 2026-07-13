@@ -8,7 +8,7 @@ filter/order/limit logic and the partial-unique-index/commit-time IntegrityError
 real locking is covered separately by tests/integration/documents/deletion/test_postgres.py.
 
 Supports the four models app.services.documents.deletion_service/deletion_worker and their
-dependency (`index_registry.delete_all_tracked_document_vectors`) touch: Document, IngestionJob,
+dependency (`vector_deletion_service.delete_all_tracked_document_vectors`) touch: Document, IngestionJob,
 DocumentDeletionJob, VectorCleanupJob.
 """
 

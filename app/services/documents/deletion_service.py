@@ -15,7 +15,7 @@ A successful deletion never removes the `Document` row, nor any `IngestionJob`/`
 `DocumentDeletionJob` history — see module docstrings on those models. Only the document's
 external resources (Qdrant vectors, the stored object) are removed. `Document.collection_name`
 etc. are also left untouched — the lifecycle status derivation in
-`app/services/document_query_service.py` uses the latest `DocumentDeletionJob` to override
+`app/services/documents/query_service.py` uses the latest `DocumentDeletionJob` to override
 whatever the ingestion-derived status would otherwise be, so a completed deletion can never look
 "indexed" again even though the underlying columns are unchanged.
 
@@ -126,7 +126,7 @@ async def get_latest_deletion_jobs_for_documents(
 ) -> dict[str, DocumentDeletionJob]:
     """Return each document_id's latest DocumentDeletionJob in one batched query — avoids N+1.
 
-    Mirrors `document_query_service.get_latest_jobs_for_documents`'s exact shape, for the list
+    Mirrors `query_service.get_latest_jobs_for_documents`'s exact shape, for the list
     endpoint's lifecycle-status derivation.
     """
     if not document_ids:
@@ -161,9 +161,9 @@ async def _latest_active_deletion_job(session: AsyncSession, document_id: str) -
 async def _latest_active_ingestion_job(session: AsyncSession, document_id: str) -> IngestionJob | None:
     """Return document_id's latest ingestion job iff it is PENDING/PROCESSING, else None.
 
-    Queried directly here (not via document_query_service.get_latest_ingestion_job) to avoid a
-    module import cycle: document_query_service imports this module for lifecycle derivation, so
-    this module must not import back from document_query_service.
+    Queried directly here (not via query_service.get_latest_ingestion_job) to avoid a
+    module import cycle: query_service imports this module for lifecycle derivation, so
+    this module must not import back from query_service.
     """
     stmt = (
         select(IngestionJob)

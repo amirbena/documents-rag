@@ -12,13 +12,13 @@ from contextlib import asynccontextmanager
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import Settings, get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
-from app.services.ingestion_worker import IngestionWorker
+from app.services.ingestion.worker import IngestionWorker
 from app.storage.keys import generate_object_key
 from app.storage.minio_storage import MinioFileStorage
 

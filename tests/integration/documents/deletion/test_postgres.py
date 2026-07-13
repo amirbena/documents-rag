@@ -20,12 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.document_query_service import derive_lifecycle_status, get_latest_ingestion_job
 from app.services.documents.deletion_service import (
     DeletionRequestOutcome,
     get_latest_deletion_job,
     request_document_deletion,
 )
+from app.services.documents.query_service import derive_lifecycle_status, get_latest_ingestion_job
 
 
 @pytest.fixture(autouse=True)

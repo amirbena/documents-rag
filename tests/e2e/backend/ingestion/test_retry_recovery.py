@@ -2,7 +2,7 @@
 
 Same real-HTTP, real-Postgres/Qdrant, fake-AI-provider setup as
 test_upload_to_streaming_chat.py/test_backend_failure_paths.py (see conftest.py). Covers what
-tests/integration/test_ingestion_retry_postgres.py cannot: the actual
+tests/integration/ingestion/test_retry_postgres.py cannot: the actual
 POST /api/v1/documents/{id}/ingestion/retry contract, and that retry/recovery preserve visible
 history through GET .../failure and GET .../ingestion.
 """
@@ -14,13 +14,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.ingestion_retry_service import (
-    STALE_RECOVERY_ERROR_PREFIX,
-    recover_stale_ingestion_jobs,
-)
+from app.services.ingestion.stale_recovery_service import recover_stale_ingestion_jobs
+from app.services.ingestion.status import STALE_RECOVERY_ERROR_PREFIX
 from tests.e2e.backend.fakes import FakeEmbeddingProvider
 
 pytestmark = pytest.mark.e2e

@@ -1,7 +1,7 @@
 """Concurrency stress tests for document deletion — real Testcontainers Postgres, genuine races.
 
 Kept separate from test_postgres.py's ordinary persistence/lifecycle tests, per this repo's
-convention (mirrors tests/integration/test_ingestion_retry_postgres.py's equivalent split): these
+convention (mirrors tests/integration/ingestion/test_retry_postgres.py's equivalent split): these
 tests use two independent AsyncSessions (separate connections) racing via `asyncio.gather`, not
 two calls sharing one session/transaction, which would prove nothing about real locking. Each
 scenario is internally parametrized and repeated (5x for scheduling, 3x for worker claims) to

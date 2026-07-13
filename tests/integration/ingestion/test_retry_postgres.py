@@ -1,16 +1,15 @@
-"""Postgres integration tests for retry/stale-recovery — real Testcontainers Postgres, real locks.
+"""Postgres integration tests for ingestion retry — real Testcontainers Postgres, real locks.
 
 Proves the properties a fake session double cannot faithfully represent: the partial unique index
-actually rejecting a second concurrent active row, real `SELECT ... FOR UPDATE`/`SKIP LOCKED`
-serializing genuinely concurrent retry/recovery calls, and that history (old FAILED/stale rows)
+actually rejecting a second concurrent active row, and that history (old FAILED/stale rows)
 survives a retry. Mirrors tests/integration/test_alembic_migrations.py's and
-tests/integration/test_document_read_api.py's fixtures/style.
+tests/integration/documents/read/test_postgres.py's fixtures/style. Concurrent-retry/recovery races are
+covered separately by tests/integration/ingestion/test_concurrency.py.
 """
 
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,18 +17,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
-from app.services.ingestion_retry_service import (
-    RetryOutcome,
-    recover_stale_ingestion_jobs,
-    retry_ingestion,
-)
-from app.services.ingestion_worker import IngestionWorker
+from app.services.ingestion.retry_service import RetryOutcome, retry_ingestion
+from app.services.ingestion.worker import IngestionWorker
 from app.storage.local_storage import LocalFileStorage
 
 STALE_AFTER_SECONDS = 900
@@ -54,7 +49,7 @@ class _FakeEmbeddingProvider:
 
 @pytest.fixture(autouse=True)
 async def _clean_tables(migrated_schema: None, postgres_url: str) -> AsyncIterator[None]:
-    """Truncate documents/ingestion_jobs before each test — see test_ingestion_worker_postgres.py.
+    """Truncate documents/ingestion_jobs before each test — see test_worker_postgres.py.
 
     Every test in this module shares one session-scoped Postgres container with every other
     integration test in the suite. Several tests here deliberately leave a fresh PENDING job
@@ -80,7 +75,7 @@ async def _clean_tables(migrated_schema: None, postgres_url: str) -> AsyncIterat
         # Also truncate afterward (not just before): several tests in this module deliberately
         # create PENDING jobs that are never processed, and this module's tests run alongside
         # unrelated test modules sharing the same session-scoped container — some of which (e.g.
-        # test_ingestion_worker_minio.py) do not truncate before their own tests and would
+        # test_worker_minio.py) do not truncate before their own tests and would
         # otherwise have their worker claim one of this module's leftover PENDING rows.
         await _truncate()
         await engine.dispose()
@@ -220,98 +215,6 @@ async def test_retry_history_preserved_after_creating_new_job(
     assert stored[0].status == "failed"
     assert stored[0].error_message == "boom"
     assert stored[1].status == "pending"
-
-
-async def test_two_concurrent_retries_produce_exactly_one_new_active_job(
-    migrated_schema: None, postgres_url: str, integration_db_session: AsyncSession
-) -> None:
-    """The single most important test: two genuinely concurrent retries -> exactly one new job.
-
-    Uses two independent AsyncSessions (independent connections) so the two `retry_ingestion()`
-    calls run as real, separate Postgres transactions racing each other via `asyncio.gather` —
-    not two calls sharing one session/transaction, which would prove nothing about real locking.
-    """
-    document = await _seed_document(integration_db_session)
-    integration_db_session.add(
-        IngestionJob(id=str(uuid.uuid4()), document_id=document.id, status=IngestionStatus.FAILED)
-    )
-    await integration_db_session.commit()
-
-    engine = create_async_engine(postgres_url, future=True)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-    async def _retry_with_own_session() -> RetryOutcome:
-        async with session_factory() as session:
-            result = await retry_ingestion(
-                session, document.id, stale_after_seconds=STALE_AFTER_SECONDS
-            )
-            return result.outcome
-
-    try:
-        outcomes = await asyncio.gather(_retry_with_own_session(), _retry_with_own_session())
-    finally:
-        await engine.dispose()
-
-    # Exactly one of the two concurrent calls created a new job; the other observed it as active.
-    assert sorted(outcomes) == sorted([RetryOutcome.CREATED, RetryOutcome.ALREADY_ACTIVE])
-
-    active_rows = await integration_db_session.execute(
-        text(
-            "SELECT count(*) FROM ingestion_jobs WHERE document_id = :id "
-            "AND status IN ('pending', 'processing')"
-        ),
-        {"id": document.id},
-    )
-    assert active_rows.scalar_one() == 1
-
-
-async def test_two_concurrent_recoveries_never_recover_the_same_stale_row_twice(
-    migrated_schema: None, postgres_url: str, integration_db_session: AsyncSession
-) -> None:
-    """Two concurrent recovery batches must never both create a replacement for the same stale row."""
-    document = await _seed_document(integration_db_session)
-    stale_updated_at = datetime.now(UTC) - timedelta(seconds=STALE_AFTER_SECONDS + 100)
-    integration_db_session.add(
-        IngestionJob(
-            id=str(uuid.uuid4()),
-            document_id=document.id,
-            status=IngestionStatus.PROCESSING,
-            updated_at=stale_updated_at,
-        )
-    )
-    await integration_db_session.commit()
-    # Force the just-inserted row's server-generated updated_at (onupdate=func.now() only fires
-    # on UPDATE, not INSERT's server_default) back to a genuinely stale timestamp.
-    await integration_db_session.execute(
-        text("UPDATE ingestion_jobs SET updated_at = :ts WHERE document_id = :id"),
-        {"ts": stale_updated_at, "id": document.id},
-    )
-    await integration_db_session.commit()
-
-    engine = create_async_engine(postgres_url, future=True)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-    async def _recover_with_own_session():
-        async with session_factory() as session:
-            return await recover_stale_ingestion_jobs(
-                session, batch_size=10, stale_after_seconds=STALE_AFTER_SECONDS
-            )
-
-    try:
-        results = await asyncio.gather(_recover_with_own_session(), _recover_with_own_session())
-    finally:
-        await engine.dispose()
-
-    total_recovered = sum(result.count for result in results)
-    assert total_recovered == 1
-
-    replacement_count = await integration_db_session.execute(
-        text(
-            "SELECT count(*) FROM ingestion_jobs WHERE document_id = :id AND status = 'pending'"
-        ),
-        {"id": document.id},
-    )
-    assert replacement_count.scalar_one() == 1
 
 
 async def test_retry_after_real_failure_writes_no_orphaned_vectors_then_succeeds(

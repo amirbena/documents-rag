@@ -1,4 +1,4 @@
-"""Integration tests for app.services.document_query_service.download_document() against a real,
+"""Integration tests for app.services.documents.download_service.download_document() against a real,
 ephemeral MinIO container — proves the download path actually round-trips through the MinIO SDK,
 not just a mocked httpx transport (see CLAUDE.md's "Use a real Qdrant/MinIO container" rule).
 """
@@ -9,9 +9,9 @@ import pytest
 
 from app.core.config import Settings
 from app.models.document import Document
-from app.services.document_query_service import download_document
+from app.services.documents.download_service import download_document
 from app.storage.minio_storage import MinioFileStorage
-from tests.support.fake_document_session import FakeDocumentQuerySession
+from tests.support.documents.read.fake_session import FakeDocumentQuerySession
 
 pytestmark = pytest.mark.integration
 
