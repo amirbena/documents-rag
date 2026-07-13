@@ -561,7 +561,7 @@ optional/manual, mirroring `scripts/recover_stale_ingestion_jobs.py`'s boundary:
    multiple worker invocations never claim the same job. Returns `None` if there is no pending job.
 2. Flips the claimed job to `PROCESSING` and **commits immediately**, before any external I/O.
 3. **Vector cleanup, strictly before storage cleanup**: calls
-   `index_registry.delete_all_tracked_document_vectors(document, vector_store, session)` — the
+   `vector_deletion_service.delete_all_tracked_document_vectors(document, vector_store, session)` — the
    full-tracked-collection operation (targets the document's active collection *and* every
    distinct historical collection still tracked by a pending/failed `VectorCleanupJob`) — **never**
    `delete_current_document_vectors()` (the deliberately-partial, active-collection-only sibling).
