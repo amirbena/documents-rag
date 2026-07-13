@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio test-document-read test-document-read-integration lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio verify-document-read verify-document-read-integration smoke-multilingual-real
+.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio test-document-read test-document-read-integration test-ingestion-retry test-ingestion-retry-integration lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio verify-document-read verify-document-read-integration verify-ingestion-retry verify-ingestion-retry-integration smoke-multilingual-real recover-stale-ingestion-jobs
 
 help:
 	@echo "Available commands:"
@@ -47,6 +47,17 @@ help:
 	@echo "                          configured embedding model (default bge-m3) against 5"
 	@echo "                          Hebrew/English scenarios. Needs a local Ollama with the"
 	@echo "                          model already pulled; never run by make verify/test/CI."
+	@echo "  make test-ingestion-retry - run the Phase 2.8.3 retry/stale-recovery unit tests —"
+	@echo "                          no Docker required"
+	@echo "  make test-ingestion-retry-integration - run the Phase 2.8.3 retry/stale-recovery"
+	@echo "                          Postgres integration coverage (needs Docker)"
+	@echo "  make verify-ingestion-retry - run the retry/stale-recovery unit tests plus their own"
+	@echo "                          checks"
+	@echo "  make verify-ingestion-retry-integration - run the retry/stale-recovery integration"
+	@echo "                          coverage plus its own checks"
+	@echo "  make recover-stale-ingestion-jobs - OPTIONAL, MANUAL: run one stale-PROCESSING-job"
+	@echo "                          recovery batch against the configured database and print a"
+	@echo "                          summary; never run by make verify/test/CI."
 	@echo "  make help              - show this message"
 	@echo ""
 	@echo "Install the pre-commit hook that runs 'make verify' automatically:"
@@ -93,6 +104,12 @@ test-document-read-integration:
 	pytest -m integration tests/integration/test_document_read_api.py tests/integration/test_document_download_minio.py -q
 	pytest -m e2e tests/e2e/backend/test_document_read_api.py tests/e2e/backend/test_document_read_api_minio.py -q
 
+test-ingestion-retry:
+	pytest tests/test_ingestion_retry_service.py tests/test_ingestion_retry_routes.py -q
+
+test-ingestion-retry-integration:
+	pytest -m integration tests/integration/test_ingestion_retry_postgres.py -q
+
 lint:
 	ruff check .
 
@@ -135,5 +152,14 @@ verify-document-read: test-document-read
 verify-document-read-integration: test-document-read-integration
 	@echo "Document read/download integration/E2E quality gates passed."
 
+verify-ingestion-retry: test-ingestion-retry
+	@echo "Ingestion retry/stale-recovery quality gates passed."
+
+verify-ingestion-retry-integration: test-ingestion-retry-integration
+	@echo "Ingestion retry/stale-recovery integration quality gates passed."
+
 smoke-multilingual-real:
 	python scripts/smoke_multilingual_real.py
+
+recover-stale-ingestion-jobs:
+	python scripts/recover_stale_ingestion_jobs.py
