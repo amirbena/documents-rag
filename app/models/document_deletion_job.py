@@ -6,7 +6,7 @@ and never deleted — retrying always creates a brand-new row for the same `docu
 one `PENDING`/`PROCESSING` ("active") row may exist per document at a time, enforced by the
 partial unique index `ix_document_deletion_jobs_one_active_per_document`
 (migration `c8f3a2b6d1e7`), not application logic alone — see
-`app/services/document_deletion_service.py`.
+`app/services/documents/deletion_service.py`.
 
 `vector_cleanup_completed`/`storage_cleanup_completed` record this attempt's progress through the
 two-step cleanup order (vectors before storage — see the service module) so a partial failure is

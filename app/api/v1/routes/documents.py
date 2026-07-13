@@ -6,7 +6,7 @@ status, failure, download) are strictly read-only: no mutation of Postgres, obje
 Qdrant, ingestion jobs, or cleanup records happens on any of them. `POST .../ingestion/retry`
 (Phase 2.8.3) only ever inserts a new PENDING IngestionJob row via
 `app.services.ingestion_retry_service`. `DELETE /documents/{id}` and `GET .../deletion` (Phase
-2.8.4) schedule/report full document deletion via `app.services.document_deletion_service` — the
+2.8.4) schedule/report full document deletion via `app.services.documents.deletion_service` — the
 DELETE route only ever inserts a new PENDING DocumentDeletionJob row (or reports an existing one);
 the actual cross-system cleanup runs out-of-band via
 `scripts/process_pending_document_deletions.py` / `DocumentDeletionWorker`, never inline in this
@@ -35,12 +35,6 @@ from app.schemas.documents import (
     IngestionRetryResponse,
     IngestionStatusResponse,
 )
-from app.services.document_deletion_service import (
-    DeletionRequestOutcome,
-    get_latest_deletion_job,
-    request_document_deletion,
-    sanitize_deletion_error,
-)
 from app.services.document_query_service import (
     DEFAULT_LIST_LIMIT,
     MAX_LIST_LIMIT,
@@ -51,6 +45,12 @@ from app.services.document_query_service import (
     get_document_ingestion_result,
 )
 from app.services.document_upload_service import upload_document
+from app.services.documents.deletion_service import (
+    DeletionRequestOutcome,
+    get_latest_deletion_job,
+    request_document_deletion,
+    sanitize_deletion_error,
+)
 from app.services.ingestion_retry_service import RetryOutcome, retry_ingestion
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
@@ -259,8 +259,8 @@ async def delete_document_route(
     with `created=False` when the document was already fully deleted (idempotent); 404 if the
     document does not exist; 409 if the document's latest ingestion job is still PENDING/
     PROCESSING (deletion never races an in-flight ingestion). Never performs the actual
-    cross-system cleanup inline — see `app.services.document_deletion_service.
-    request_document_deletion` and `DocumentDeletionWorker`.
+    cross-system cleanup inline — see `app.services.documents.deletion_service.
+    request_document_deletion` and `app.services.documents.deletion_worker.DocumentDeletionWorker`.
     """
     result = await request_document_deletion(db, document_id)
 

@@ -14,7 +14,7 @@ import asyncio
 from app.core.config import get_settings
 from app.db.session import async_session_factory
 from app.rag.providers.provider_factory import get_vector_store
-from app.services.document_deletion_service import DocumentDeletionWorker
+from app.services.documents.deletion_worker import DocumentDeletionWorker
 from app.storage.factory import create_file_storage
 
 _MAX_JOBS_PER_RUN = 100

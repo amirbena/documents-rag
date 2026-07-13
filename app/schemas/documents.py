@@ -142,7 +142,7 @@ class DocumentDeletionResponse(BaseModel):
 
     `created=True` means a brand-new PENDING DocumentDeletionJob was inserted (202); `created=False`
     means an already-active job was returned unchanged (202), or the document was already fully
-    deleted (200, `status=DELETED`) — see `app.services.document_deletion_service.
+    deleted (200, `status=DELETED`) — see `app.services.documents.deletion_service.
     request_document_deletion` for the full decision table.
     """
 

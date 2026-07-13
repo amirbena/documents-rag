@@ -1,22 +1,13 @@
-"""Schedule and execute full, cross-system document deletion (Phase 2.8.4).
+"""Request-scoped document deletion: scheduling, status reads, and public error sanitization.
 
-Two independent, transactional operations, mirroring `app/services/ingestion_retry_service.py`'s
-established pattern:
-
-- `request_document_deletion()`: the service behind `DELETE /api/v1/documents/{id}`. Schedules a
-  deletion by creating a `PENDING` `DocumentDeletionJob` row — never performs the actual
-  cross-system cleanup itself, so the HTTP request never blocks on unbounded external I/O. A
-  `PARTIALLY_FAILED` row is never reset — retrying always creates a brand-new `PENDING` row for
-  the same `document_id` (append-only, exactly like ingestion retry).
-- `DocumentDeletionWorker.process_next_job()`: the execution side, mirroring `IngestionWorker`
-  (`app/services/ingestion_worker.py`) — claims one `PENDING` row with
-  `SELECT ... FOR UPDATE SKIP LOCKED`, transitions it to `PROCESSING` (committed before any
-  external I/O), then performs vector cleanup strictly before storage cleanup (see "Cleanup
-  order" below). Invoked by `scripts/process_pending_document_deletions.py`, not by any HTTP
-  route or background scheduler — this codebase has no deployed worker process for
-  `IngestionJob` either (`IngestionWorker.process_next_job()` is only ever invoked by test
-  fixtures and `scripts/`), so this mirrors the existing architecture rather than introducing a
-  new one.
+`request_document_deletion()` is the service behind `DELETE /api/v1/documents/{id}`. It schedules
+a deletion by creating a `PENDING` `DocumentDeletionJob` row — it never performs the actual
+cross-system cleanup itself, so the HTTP request never blocks on unbounded external I/O. A
+`PARTIALLY_FAILED` row is never reset — retrying always creates a brand-new `PENDING` row for the
+same `document_id` (append-only, exactly like ingestion retry). Background execution
+(`DocumentDeletionWorker`, the vector/storage cleanup orchestration) lives in the sibling
+`deletion_worker` module — this module must never import from it (see that module's docstring for
+the dependency-direction rule this package enforces).
 
 ## PostgreSQL remains authoritative; the Document row is never physically deleted
 
@@ -38,18 +29,6 @@ insert, and falls back to catching the index's `IntegrityError` (re-reading and 
 now-active job) for the residual race the lock alone cannot close — identical strategy to
 `retry_ingestion()`.
 
-## Cleanup order: vectors before storage, always
-
-`DocumentDeletionWorker` deletes all tracked vectors (`index_registry.delete_all_tracked_document_
-vectors()`) *before* ever calling `FileStorage.delete()`. If vector cleanup does not fully
-succeed, storage cleanup is never attempted in that same job, and the job is marked
-`PARTIALLY_FAILED` with `storage_cleanup_completed` left `False` — enforced structurally by the
-code path (there is no branch that reaches storage deletion without first observing
-`vector_result.fully_deleted is True`), not merely as a documented intention. This ordering
-matters because searchable derived content (vectors) must stop being searchable before the
-document is ever reported as deleted; the original object can safely be cleaned up afterward
-(and retried independently) since it plays no role in retrieval.
-
 ## Retry is append-only, not resumable-in-place
 
 A `PARTIALLY_FAILED` job's `vector_cleanup_completed`/`storage_cleanup_completed` flags describe
@@ -58,14 +37,13 @@ A `PARTIALLY_FAILED` job's `vector_cleanup_completed`/`storage_cleanup_completed
 `delete_all_tracked_document_vectors()` and `FileStorage.delete()` are both independently
 idempotent (re-deleting already-absent vectors/objects is a harmless no-op success), so re-running
 an already-completed step costs nothing but the extra I/O. This keeps the implementation free of
-any cross-job "resume" bookkeeping while still satisfying "retry after interruption" (Part 5.7):
-the interruption scenarios in that section are recovered by scheduling a fresh attempt, not by
-resuming an old row.
+any cross-job "resume" bookkeeping while still satisfying "retry after interruption": the
+interruption scenarios there are recovered by scheduling a fresh attempt, not by resuming an old
+row.
 """
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
 
 from sqlalchemy import select
@@ -75,17 +53,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.rag.providers.vector_store import VectorStore
-from app.services.index_registry import delete_all_tracked_document_vectors
-from app.storage.contract import FileStorage
-from app.storage.errors import StorageError
-from app.storage.keys import resolve_document_storage_key
 
 _ACTIVE_STATUSES = (DocumentDeletionStatus.PENDING, DocumentDeletionStatus.PROCESSING)
 
 
 class DeletionErrorCode(StrEnum):
-    """Stable, machine-identifiable public error codes for a failed deletion step (Part 8)."""
+    """Stable, machine-identifiable public error codes for a failed deletion step."""
 
     DOCUMENT_VECTOR_CLEANUP_FAILED = "document_vector_cleanup_failed"
     DOCUMENT_STORAGE_CLEANUP_FAILED = "document_storage_cleanup_failed"
@@ -262,95 +235,10 @@ async def request_document_deletion(session: AsyncSession, document_id: str) -> 
     return DeletionRequestResult(outcome=DeletionRequestOutcome.CREATED, job=new_job)
 
 
-class DocumentDeletionWorker:
-    """Claims and processes one pending DocumentDeletionJob at a time.
-
-    Mirrors `IngestionWorker`'s claim/process/resolve shape. Depends only on the `VectorStore`/
-    `FileStorage` abstractions injected at construction — never a concrete Qdrant/MinIO/local type.
-    """
-
-    def __init__(self, vector_store: VectorStore, file_storage: FileStorage) -> None:
-        self._vector_store = vector_store
-        self._file_storage = file_storage
-
-    async def _claim_next_pending_job(self, session: AsyncSession) -> DocumentDeletionJob | None:
-        """Select-for-update the oldest pending deletion job, skipping rows locked elsewhere."""
-        stmt = (
-            select(DocumentDeletionJob)
-            .where(DocumentDeletionJob.status == DocumentDeletionStatus.PENDING)
-            .order_by(DocumentDeletionJob.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-        result = await session.execute(stmt)
-        return result.scalar_one_or_none()
-
-    async def process_next_job(self, session: AsyncSession) -> DocumentDeletionJob | None:
-        """Claim one pending deletion job and execute its cleanup order; return the resolved job.
-
-        Returns None if there is no pending job to claim. Cleanup order (Part 5.2): vectors are
-        deleted (via `delete_all_tracked_document_vectors`, the full-tracked-collection operation
-        — never `delete_current_document_vectors`) strictly before the original object is deleted
-        via `FileStorage.delete()`. If vector cleanup does not fully succeed, storage cleanup is
-        never reached in this call: the method returns with the job PARTIALLY_FAILED immediately
-        after recording the vector-cleanup failure, so "vectors clean AND object clean" is the
-        only path that reaches COMPLETED.
-        """
-        job = await self._claim_next_pending_job(session)
-        if job is None:
-            return None
-
-        job.status = DocumentDeletionStatus.PROCESSING
-        await session.commit()
-
-        document = await session.get(Document, job.document_id)
-        if document is None:
-            # Document row is never physically deleted elsewhere in this codebase; defensive only.
-            job.status = DocumentDeletionStatus.PARTIALLY_FAILED
-            job.error_code = DeletionErrorCode.DOCUMENT_VECTOR_CLEANUP_FAILED
-            job.error_message = f"Document {job.document_id} not found during deletion execution."
-            await session.commit()
-            return job
-
-        vector_result = await delete_all_tracked_document_vectors(document, self._vector_store, session)
-        if not vector_result.fully_deleted:
-            failures = [r for r in vector_result.collection_results if not r.succeeded]
-            job.status = DocumentDeletionStatus.PARTIALLY_FAILED
-            job.error_code = DeletionErrorCode.DOCUMENT_VECTOR_CLEANUP_FAILED
-            job.error_message = (
-                "Vector cleanup failed for collection(s): "
-                + ", ".join(f"{r.collection_name}: {r.error}" for r in failures)
-            )
-            await session.commit()
-            return job
-
-        job.vector_cleanup_completed = True
-        await session.commit()
-
-        key = resolve_document_storage_key(document)
-        try:
-            await self._file_storage.delete(key)
-        except StorageError as exc:
-            job.status = DocumentDeletionStatus.PARTIALLY_FAILED
-            job.error_code = DeletionErrorCode.DOCUMENT_STORAGE_CLEANUP_FAILED
-            job.error_message = str(exc)
-            await session.commit()
-            return job
-
-        job.storage_cleanup_completed = True
-        job.status = DocumentDeletionStatus.COMPLETED
-        job.completed_at = datetime.now(UTC)
-        job.error_code = None
-        job.error_message = None
-        await session.commit()
-        return job
-
-
 __all__ = [
     "DeletionErrorCode",
     "DeletionRequestOutcome",
     "DeletionRequestResult",
-    "DocumentDeletionWorker",
     "get_latest_deletion_job",
     "get_latest_deletion_jobs_for_documents",
     "request_document_deletion",

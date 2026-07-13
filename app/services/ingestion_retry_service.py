@@ -63,7 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.document_deletion_service import get_latest_deletion_job
+from app.services.documents.deletion_service import get_latest_deletion_job
 
 # Fixed prefix for a stale-recovery FAILED job's error_message — machine-identifiable in raw
 # Postgres data/logs, but never exposed differently by the public API: `sanitize_ingestion_error()`

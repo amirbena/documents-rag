@@ -61,7 +61,7 @@ from app.schemas.documents import (
     IngestionFailureResponse,
     IngestionStatusResponse,
 )
-from app.services.document_deletion_service import (
+from app.services.documents.deletion_service import (
     get_latest_deletion_job,
     get_latest_deletion_jobs_for_documents,
 )
