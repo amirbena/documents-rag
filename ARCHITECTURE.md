@@ -145,20 +145,74 @@ English equivalent. A question mixing Hebrew and embedded English technical iden
 `איך Qdrant שומר את ה-embeddings לפי המסמך?`) is classified on the Hebrew retrieval-intent phrase
 alone, same as an English question with an embedded Hebrew entity name.
 
+## Storage Abstraction (Phase 2.6/2.7)
+
+`app/storage/` is the provider-neutral storage layer every upload/ingestion/extraction/re-index
+code path depends on — never a filesystem path or a MinIO SDK type directly.
+
+- **`FileStorage`** (`app/storage/contract.py`) — the abstract contract: `save`, `read`,
+  `delete`, `exists`, `get_metadata`, `generate_download_url`. Returns only `StoredFile`/
+  `FileMetadata` (both `app/storage/contract.py`), never a provider SDK response type or a raw
+  filesystem path.
+- **`LocalFileStorage`** (`app/storage/local_storage.py`) — local-disk implementation. Object
+  keys are relative POSIX-style paths resolved safely under a configured root
+  (`LOCAL_STORAGE_ROOT`, default `storage/documents`); `app/storage/keys.py`'s
+  `validate_object_key` rejects absolute paths and `..` traversal before any filesystem call.
+- **`MinioFileStorage`** (`app/storage/minio_storage.py`) — S3-compatible object storage via the
+  official `minio` Python SDK (used directly rather than raw `httpx`, unlike this project's
+  Ollama/Qdrant providers — S3 request signing (SigV4) makes a raw-HTTP reimplementation a much
+  larger, riskier undertaking than this phase calls for). Every SDK/`urllib3` exception is
+  translated to a `StorageError` subclass before leaving this module.
+- **`create_file_storage(settings)`** (`app/storage/factory.py`) — the *only* place a concrete
+  storage class is constructed, mirroring `app/rag/providers/provider_factory.py`'s pattern
+  exactly: one `if` on `FILE_STORAGE_PROVIDER` (`local`/`minio`), one dedicated
+  `StorageConfigurationError` for anything else. No route, worker, or service branches on the
+  provider name itself.
+- **Object keys** (`app/storage/keys.py`) — `generate_object_key(document_id, original_filename)`
+  builds `documents/{document_id}/{uuid-hex}{safe-suffix}`; the storage provider never invents
+  its own key. `resolve_document_storage_key(document)` returns `document.storage_key` if set,
+  else falls back to `document.stored_path` — this is the sole backward-compatibility path for
+  documents written before this migration (see "Document/collection indexing metadata" below).
+- **Storage error hierarchy** (`app/storage/errors.py`) — `StorageError` and subclasses
+  (`StorageUnavailableError`, `StorageObjectNotFoundError`, `StorageWriteError`,
+  `StorageReadError`, `StorageDeleteError`, `StorageMetadataError`,
+  `StorageConfigurationError`, `StorageUrlGenerationError`, `StorageKeyError`). Every
+  implementation translates its own provider-specific failures into one of these before the
+  exception leaves the adapter, preserving the original exception as `__cause__`. Messages
+  include the operation/key where safe; never a credential, connection string, or signed URL.
+- **Download URLs** (`generate_download_url`) — `LocalFileStorage` returns a `file://` URI (an
+  internal representation only — no browser-facing download route exists yet, out of scope for
+  this phase). `MinioFileStorage` returns a time-limited presigned GET URL
+  (`MINIO_PRESIGNED_URL_EXPIRY_SECONDS`, default 3600s). Neither is ever persisted — the
+  persisted identity is always `storage_provider`/`storage_bucket`/`storage_key`, never a URL.
+- **Bucket initialization** (`MinioFileStorage.ensure_bucket()`) — checks whether the configured
+  bucket exists; creates it only if `MINIO_CREATE_BUCKET_IF_MISSING` (default `true`); a
+  `BucketAlreadyOwnedByYou`/`BucketAlreadyExists` race from concurrent startup is treated as
+  success, never a failure. Never recreates or resets an existing bucket.
+
+**Cross-system boundary — storage and PostgreSQL are not one atomic transaction.**
+`app/services/document_upload_service.py`'s `upload_document()` sequence is: save the object to
+`FileStorage` → persist `Document` + `IngestionJob` rows → commit. If the commit fails after the
+object was already saved, a best-effort delete of that object is attempted (failure there is
+logged, never raised) before the *original* DB exception is re-raised unchanged — this is not
+described as atomic anywhere, and a partially-completed attempt is not indistinguishable from one
+that never ran (the orphaned object may still exist in storage until a future cleanup pass; no
+orphan-cleanup worker exists yet — out of scope for this phase).
+
 ## Document upload and ingestion job skeleton
 
 `POST /api/v1/documents` (`app/api/v1/routes/documents.py`) is the first public endpoint that
-touches the database. It accepts a multipart file upload and does exactly three things, all
-inside one request:
+touches the database. The route is a thin controller — it reads the upload, rejects an empty
+file with `400`, and delegates the save/persist/commit sequence to
+`app/services/document_upload_service.py`'s `upload_document()`, which:
 
-1. Saves the file via `LocalFileStorage` (`app/services/local_file_storage.py`) under
-   `storage/documents/`, using a **generated, filesystem-safe stored filename** (a UUID plus a
-   sanitized extension) — never the raw original filename, which may contain Unicode, spaces, or
-   path-unsafe characters. No S3 or other remote backend exists yet.
+1. Generates an object key (`generate_object_key`) and saves the file via the injected
+   `FileStorage` (resolved once per request through `create_file_storage()` — see "Storage
+   Abstraction" above; the route depends on the abstract `FileStorage`, never a concrete class).
 2. Inserts a `Document` row (`app/models/document.py`): `original_filename` (stored exactly as
-   received — Hebrew or any other Unicode text is preserved verbatim, since Postgres/SQLAlchemy
-   `String` columns are UTF-8 natively), `stored_filename`, `content_type`, `file_size`,
-   `stored_path`.
+   received — Hebrew or any other Unicode text is preserved verbatim), `stored_filename`,
+   `content_type`, `file_size`, `stored_path` (legacy, kept for backward read compatibility),
+   plus the provider-neutral `storage_provider`/`storage_bucket`/`storage_key`/`storage_etag`.
 3. Inserts an `IngestionJob` row (`app/models/ingestion_job.py`) with `status=PENDING`,
    referencing the `Document` via `document_id`. `IngestionStatus` (a `StrEnum`): `PENDING`,
    `PROCESSING`, `COMPLETED`, `FAILED` — stored in Postgres as their lowercase `.value`
@@ -189,7 +243,10 @@ picks up and resolves the `pending` job it creates.
    `error_message` set to `str(exception)`, committed.
 
 The processing step is injected via the constructor (`IngestionWorker(process_document=...)`) so
-tests can substitute a fake pipeline without changing the claim/lock/transition logic.
+tests can substitute a fake pipeline without changing the claim/lock/transition logic. A
+`FileStorage` is also injected (`IngestionWorker(file_storage=...)`, defaulting to
+`create_file_storage()` if omitted) and threaded into the default processing step's
+`DocumentTextExtractor` — the worker never resolves a filesystem path itself.
 `IngestionWorker` never imports or calls `LLMProvider` itself — ingestion embeds and indexes
 chunks, it never generates text.
 
@@ -205,10 +262,15 @@ double that faithfully simulates the pending-job filter and `Document` lookup in
 ## Document text extraction
 
 `DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
-default processing step: it loads a `Document`'s `stored_path` file and extracts its raw text —
-**no chunking, embedding, or Qdrant upsert**. It routes by file extension, then validates the
-file's basic structure/content against what that extension claims before attempting to parse it
-(see "Routing and validation" below). It supports exactly five file types:
+default processing step: given an injected `FileStorage`, it reads a `Document`'s content via
+`storage.read(resolve_document_storage_key(document))` and extracts its raw text entirely in
+memory — **no chunking, embedding, or Qdrant upsert, and no temporary file materialization**.
+pypdf/python-docx/openpyxl all accept an in-memory `io.BytesIO` stream directly, so bytes read
+from `FileStorage` are parsed without ever touching a local path — this is true regardless of
+which `FileStorage` implementation is configured (local or MinIO). It routes by file extension
+(from `original_filename`), then validates the file's basic structure/content against what that
+extension claims before attempting to parse it (see "Routing and validation" below). It supports
+exactly five file types:
 
 - `.txt` / `.md` — read as UTF-8 text and returned as a single `ExtractedPage` with
   `page_number=None`, `sheet_name=None`. Hebrew and other non-ASCII Unicode content is preserved
@@ -592,21 +654,42 @@ index/re-index — a failed attempt never updates them. `is_document_stale(docum
 compares `document.collection_name` against the active config's collection name — a document
 with vectors sitting in some collection is not "current" merely because vectors exist somewhere;
 it is current only if its stored configuration matches the active one exactly. Migration:
-`alembic/versions/07f849bf2b95_...py`.
+`alembic/versions/07f849bf2b95_...py`. `Document` also carries the provider-neutral storage
+identity added by Phase 2.6/2.7 (`storage_provider`/`storage_bucket`/`storage_key`/
+`storage_etag`), migration `alembic/versions/a3f9c7d2e1b5_add_document_storage_identity_
+columns.py` — see "Storage Abstraction" above and "Backward compatibility for pre-migration
+documents" below.
 
-PostgreSQL remains the source-of-truth for document lifecycle/metadata and active
-versions; local disk (`LocalFileStorage`) holds the original file content; Qdrant is a **derived**
-index, rebuildable at any time from the persisted file + the active `EmbeddingIndexConfig` via
-re-index (below) — never itself the source of truth for what a document "is."
+PostgreSQL remains the source-of-truth for document lifecycle/metadata, storage identity, and
+active versions; `FileStorage` (local disk or MinIO, per `FILE_STORAGE_PROVIDER`) holds the
+original file content; Qdrant is a **derived** index, rebuildable at any time from the persisted
+file + the active `EmbeddingIndexConfig` via re-index (below) — never itself the source of truth
+for what a document "is." MinIO is object storage, not the lifecycle source of truth either —
+`Document`'s Postgres row is what determines a document's lifecycle state.
+
+### Backward compatibility for pre-migration documents
+
+A `Document` row written before Phase 2.6/2.7 has `storage_key IS NULL`. Migration
+`a3f9c7d2e1b5` backfills `storage_provider='local'` and `storage_key=stored_filename` for every
+existing row at upgrade time — the pre-migration `LocalFileStorage` always wrote files flat under
+its configured root, keyed by `stored_filename`, so that value is exactly the object key the new
+`LocalFileStorage` needs to locate the same file; no file content is read and no data is moved
+during the migration. `stored_path`/`stored_filename` are kept (not dropped, not renamed) for
+this reason. Any code addressing a document's content calls
+`app.storage.keys.resolve_document_storage_key(document)`, which returns `storage_key` if set,
+else falls back to `stored_path` — so a pre-migration row remains fully readable without any
+special-casing at the call site.
 
 ### Re-index (`app/services/reindex_service.py`)
 
-`reindex_document(document, session, settings) -> ReindexResult` re-derives a document's vectors
-from its already-persisted stored file — no new upload required. Flow: re-extract
-(`DocumentTextExtractor`, unchanged) -> re-chunk (`DocumentChunker`, active `chunking_version`) ->
-re-embed (active `EmbeddingIndexConfig`) -> validate real vector dimensions
-(`app/rag/embedding_validation.py`) -> `ensure_active_collection()` -> upsert into the new
-collection -> `mark_document_indexed()` + commit -> attempt to delete the document's vectors from
+`reindex_document(document, session, settings, file_storage=None) -> ReindexResult` re-derives a
+document's vectors from its already-persisted stored content — no new upload required (`
+file_storage` defaults to `create_file_storage(settings)` if omitted). Flow: re-extract
+(`DocumentTextExtractor`, reading via the injected `FileStorage`) -> re-chunk (`DocumentChunker`,
+active `chunking_version`) -> re-embed (active `EmbeddingIndexConfig`) -> validate real vector
+dimensions (`app/rag/embedding_validation.py`) -> `ensure_active_collection()` -> upsert into the
+new collection -> `mark_document_indexed()` + commit -> attempt to delete the document's vectors
+from
 its *previous* tracked collection (if any, and if different from the new one).
 
 `ReindexResult` (`outcome: ReindexOutcome`, `document`) replaces the old plain-`bool` return —
@@ -963,6 +1046,7 @@ polled at different rates by different consumers.
 | `ollama` | Reuses `OllamaClient.check_health()` (reachability) | Yes |
 | `ollama_chat_model` | Same call, `chat_model_available` | Yes |
 | `ollama_embedding_model` | Same call, `embedding_model_available` | Yes |
+| `file_storage` | Local: writes+deletes a small probe object under the configured root. MinIO: `ensure_bucket()` (endpoint reachable, credentials accepted, bucket exists/creatable) | Yes |
 
 Every check runs concurrently (`asyncio.gather`) with its own `CHECK_TIMEOUT_SECONDS` (3s)
 timeout, wrapping `asyncio.timeout(...)` around the actual I/O — no automatic retries beyond
@@ -1035,16 +1119,25 @@ service name (Docker's embedded DNS). The app reaches its dependencies at:
 - `redis:6379`
 - `qdrant:6333` (HTTP)
 - `ollama:11434` (HTTP)
+- `minio:9000` (S3 API), `minio:9001` (console) — only reached when `FILE_STORAGE_PROVIDER=minio`
 
 Only the ports needed for host-side debugging are published (`8000`, `5432`, `6379`, `6333`,
-`11434`). In a production deployment, only `app`'s port would typically be exposed.
+`11434`, `9000`, `9001`). In a production deployment, only `app`'s port would typically be
+exposed.
 
 ```
 host:8000 ──► app ──► postgres:5432
                  ├──► redis:6379
                  ├──► qdrant:6333
-                 └──► ollama:11434
+                 ├──► ollama:11434
+                 └──► minio:9000 (only when FILE_STORAGE_PROVIDER=minio)
 ```
+
+`minio` is a local/dev-only service — the app does not require it while
+`FILE_STORAGE_PROVIDER` stays `local` (the default). Start it explicitly with
+`docker compose up -d minio`, or switch `FILE_STORAGE_PROVIDER=minio` in the `app` service's
+environment to use it. Credentials in `docker-compose.yml`/`.env.example` (`minioadmin`/
+`minioadmin`) are for local development only — never reuse them anywhere else.
 
 ## Environment variables
 
@@ -1077,6 +1170,16 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `CHUNKING_VERSION`         | `v1`                                                                   | Part of the active `EmbeddingIndexConfig` — bump whenever `CHUNK_SIZE`/`CHUNK_OVERLAP`/the chunking algorithm changes meaningfully |
 | `DEFAULT_RESPONSE_LANGUAGE`| `en`                                                                   | Fallback language `ScriptBasedLanguageDetector` resolves to when a question has no Hebrew/Latin words at all, or an exact word-count tie; must be `he` or `en` |
 | `PROMPT_CATALOG_VERSION`   | `v2`                                                                   | Stamped onto every `ResolvedPrompt.prompt_version` — see "Multilingual RAG Foundation" |
+| `FILE_STORAGE_PROVIDER`    | `local`                                                                | Selects the `FileStorage` implementation via `create_file_storage()`; `minio` is the only other recognized value — anything else raises `StorageConfigurationError` |
+| `LOCAL_STORAGE_ROOT`       | `storage/documents`                                                    | Root directory `LocalFileStorage` resolves object keys under; only read when `FILE_STORAGE_PROVIDER=local` |
+| `MINIO_ENDPOINT`           | *(unset)*                                                              | `host:port` of the MinIO/S3-compatible endpoint; required when `FILE_STORAGE_PROVIDER=minio` |
+| `MINIO_ACCESS_KEY`         | *(unset)*                                                              | Only read when `FILE_STORAGE_PROVIDER=minio` |
+| `MINIO_SECRET_KEY`         | *(unset)*                                                              | Only read when `FILE_STORAGE_PROVIDER=minio`; never logged |
+| `MINIO_BUCKET`             | *(unset)*                                                              | Bucket name; required when `FILE_STORAGE_PROVIDER=minio` |
+| `MINIO_SECURE`             | `false`                                                                | Whether to use HTTPS against the MinIO endpoint |
+| `MINIO_REGION`             | *(unset)*                                                              | Optional S3 region hint passed to the `minio` SDK client |
+| `MINIO_PRESIGNED_URL_EXPIRY_SECONDS` | `3600`                                                       | Expiry for `MinioFileStorage.generate_download_url()`'s presigned GET URLs |
+| `MINIO_CREATE_BUCKET_IF_MISSING` | `true`                                                           | Whether `ensure_bucket()` creates the configured bucket when missing, vs. failing readiness |
 
 ## Current boundaries
 
@@ -1098,24 +1201,29 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   cleanup" above). `Document` also carries `embedding_*`/`chunking_version`/`collection_name`/
   `indexed_at` columns.
 - `app/schemas` — Pydantic request/response schemas.
+- `app/storage` — the provider-neutral storage layer (see "Storage Abstraction" above):
+  `FileStorage`/`StoredFile`/`FileMetadata` (`contract.py`), `LocalFileStorage`
+  (`local_storage.py`), `MinioFileStorage` (`minio_storage.py`), `create_file_storage()`
+  (`factory.py`), object-key generation/validation (`keys.py`), and the `StorageError` hierarchy
+  (`errors.py`).
 - `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
   async HTTP client scoped strictly to reachability and model-availability checks — it
-  intentionally does not call generation or embedding endpoints; `LocalFileStorage`
-  (`app/services/local_file_storage.py`), which saves uploaded files to local disk under a
-  generated safe filename (see "Document upload and ingestion job skeleton" above); and
-  `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and resolves pending
-  ingestion jobs (see "Ingestion worker" above) — no public API — and whose default pipeline now
-  calls the embedding/vector-store providers (see "Chunk embedding and Qdrant indexing" above),
-  the only place in this layer that does; `DocumentTextExtractor`
+  intentionally does not call generation or embedding endpoints;
+  `document_upload_service.py`'s `upload_document()`, which saves content via the injected
+  `FileStorage` and persists `Document`/`IngestionJob` (see "Document upload and ingestion job
+  skeleton" above); and `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and
+  resolves pending ingestion jobs (see "Ingestion worker" above) — no public API — and whose
+  default pipeline now calls the embedding/vector-store providers (see "Chunk embedding and
+  Qdrant indexing" above), the only place in this layer that does; `DocumentTextExtractor`
   (`app/services/document_text_extractor.py`), which extracts text from a document's stored
-  `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` file (see "Document text extraction" above); and
-  `DocumentChunker` (`app/services/document_chunker.py`), which splits an `ExtractedDocument`
-  into `DocumentChunk`s (see "Document chunking" above); `platform_health.py`, the dependency
-  checks backing `GET /health/ready`/`/health/dependencies` (see "Operational Health Contract"
-  above) — reuses `OllamaClient` for the Ollama check rather than duplicating it;
-  `index_registry.py`, the collection-safety and document-indexing-metadata service (see
-  "Multilingual RAG Foundation" above) — `ensure_active_collection()`, `mark_document_indexed()`,
-  `is_document_stale()`, `get_stale_documents()`, `retire_collection()`,
+  `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` content, read via the injected `FileStorage` (see "Document
+  text extraction" above); and `DocumentChunker` (`app/services/document_chunker.py`), which
+  splits an `ExtractedDocument` into `DocumentChunk`s (see "Document chunking" above);
+  `platform_health.py`, the dependency checks backing `GET /health/ready`/`/health/dependencies`
+  (see "Operational Health Contract" above) — reuses `OllamaClient` for the Ollama check rather
+  than duplicating it; `index_registry.py`, the collection-safety and document-indexing-metadata
+  service (see "Multilingual RAG Foundation" above) — `ensure_active_collection()`,
+  `mark_document_indexed()`, `is_document_stale()`, `get_stale_documents()`, `retire_collection()`,
   `delete_document_vectors()`; and `reindex_service.py`'s `reindex_document()`, the backend
   re-index capability.
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
@@ -1203,8 +1311,14 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - An LLM-based (as opposed to rule-based) question router
 - Conversation memory / multi-turn context (in prompt building or the orchestrator)
 - A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
-- MinIO / any S3-compatible object storage, and a `FileStorage` provider factory —
-  `LocalFileStorage` remains the only implementation
+- A document-deletion endpoint, document lifecycle/list/download API, orphan-object cleanup
+  worker, or hash-based content deduplication — `FileStorage`/`MinioFileStorage` exist (Phase
+  2.6/2.7), but no public route uses `delete()`/`generate_download_url()` yet; this is deferred
+  to a future Phase 2.8
+  ("Document Lifecycle APIs")
+- AWS S3 or Cloudflare R2 as a `FileStorage` implementation, and presigned multipart uploads —
+  `MinioFileStorage` covers MinIO/S3-compatible storage generically, but a dedicated S3/R2
+  implementation and multipart upload support are future work, not implemented in this phase
 - Frontend E2E tests — no frontend exists yet in this repository
 - A real-Ollama smoke suite — deliberately kept separate/manual/nightly, not part of the default
   integration run (see "Test architecture" above)

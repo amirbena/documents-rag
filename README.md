@@ -311,11 +311,37 @@ Returns `202 Accepted`:
 {"document_id": "...", "job_id": "...", "status": "pending"}
 ```
 
-This saves the file under `storage/documents/` (with a generated, filesystem-safe stored
-filename — never the raw original name), creates a `Document` row (with the original filename
-preserved exactly, Hebrew/Unicode included), and creates an `IngestionJob` row with
-`status=pending`. **Nothing is parsed, chunked, embedded, or upserted into Qdrant inside the
-request.** An empty (zero-byte) file is rejected with `400` before any row is created.
+This saves the file via the configured `FileStorage` implementation (`local` by default —
+`storage/documents/` under a generated object key; `minio` if `FILE_STORAGE_PROVIDER=minio`, see
+"Storage abstraction" below), creates a `Document` row (with the original filename preserved
+exactly, Hebrew/Unicode included, plus the provider-neutral storage identity), and creates an
+`IngestionJob` row with `status=pending`. **Nothing is parsed, chunked, embedded, or upserted
+into Qdrant inside the request.** An empty (zero-byte) file is rejected with `400` before any row
+is created.
+
+### Storage abstraction
+
+`app/storage/` (see "Storage Abstraction (Phase 2.6/2.7)" in [ARCHITECTURE.md](ARCHITECTURE.md))
+is the provider-neutral `FileStorage` contract every upload/ingestion/extraction code path
+depends on. Two implementations exist:
+
+- **`local`** (default) — `LocalFileStorage`, storing files under `LOCAL_STORAGE_ROOT`
+  (`storage/documents` by default). No extra setup required.
+- **`minio`** — `MinioFileStorage`, an S3-compatible object store. Start it locally with:
+
+  ```bash
+  docker compose up -d minio
+  ```
+
+  Then set `FILE_STORAGE_PROVIDER=minio` (plus `MINIO_ENDPOINT`/`MINIO_ACCESS_KEY`/
+  `MINIO_SECRET_KEY`/`MINIO_BUCKET`, already defaulted in `.env.example`/`docker-compose.yml` for
+  local dev) in the `app` service's environment. The MinIO console is at
+  `http://localhost:9001` (credentials: `minioadmin`/`minioadmin`, local dev only).
+
+Switching `FILE_STORAGE_PROVIDER` is a deployment-time choice, not something a document's own
+row carries a preference for beyond its own already-persisted `storage_provider` value — see
+"Backward compatibility for pre-migration documents" in ARCHITECTURE.md for how documents
+written before this feature remain readable.
 
 ### Ingestion worker
 
@@ -340,8 +366,9 @@ it never generates text.
 
 ### Document text extraction
 
-`DocumentTextExtractor` (`app/services/document_text_extractor.py`) loads a document's stored
-file and extracts its raw text. **It routes by file extension and validates each file's basic
+`DocumentTextExtractor` (`app/services/document_text_extractor.py`) reads a document's content
+via the injected `FileStorage` and extracts its raw text entirely in memory (no local path, no
+temporary file). **It routes by file extension and validates each file's basic
 structure/content before extraction** — a mismatched or corrupt file fails clearly instead of
 being handed to the wrong parser:
 
@@ -749,8 +776,14 @@ fast unit suite never needs Docker beyond `docker compose config`.
   deterministically) are all exercised against real services, but embeddings come from a small
   fake, deterministic provider — **no real Ollama container runs and no model is pulled** as
   part of this first suite.
-- **MinIO and a real-Ollama smoke suite are not part of this first suite** — real-Ollama
-  verification is left for a future manual/nightly smoke suite, not the everyday integration run.
+- **MinIO integration coverage** — `tests/integration/test_minio_storage.py` and
+  `tests/integration/test_ingestion_worker_minio.py` run against a real, ephemeral MinIO
+  container (Testcontainers, dynamic port, no persistent volume — same pattern as
+  Postgres/Qdrant): bucket initialization, save/read/delete/exists/metadata, presigned download
+  URLs, missing-object/error-translation behavior, and a full upload → Postgres → MinIO →
+  extraction → chunking → fake-embeddings → Qdrant chain. A real-Ollama smoke suite is still not
+  part of this first suite — real-Ollama verification is left for a future manual/nightly smoke
+  suite, not the everyday integration run.
 - **Containers and all state are removed after the test session** — nothing persists between
   runs, and nothing is written outside the ephemeral containers themselves.
 
@@ -759,6 +792,9 @@ Run it with:
 ```bash
 make test-integration     # pytest -m integration -q
 make verify-integration   # runs the integration suite (room for future integration-specific checks)
+make test-storage          # storage-abstraction unit tests only (no Docker)
+make test-storage-integration  # MinIO integration suite only (needs Docker)
+make test-minio             # MinIO unit + integration tests (needs Docker for the latter)
 ```
 
 ## Backend E2E tests
@@ -929,7 +965,14 @@ embeddings can never share a collection, `Document` rows track exactly which con
 were indexed with (staleness detection + a backend re-index capability), a deterministic
 `ScriptBasedLanguageDetector` resolves Hebrew/English from a question, and a shared
 `PromptCatalog`/`PromptProvider` resolves every fixed/governed prompt through both `RagEngine`
-implementations — see "Multilingual RAG foundation" above. Frontend E2E, a real-Ollama smoke
-suite, and a real multilingual-model evaluation run remain future milestones — see "Integration
-tests" above, and "Test architecture" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
-what's intentionally deferred.
+implementations — see "Multilingual RAG foundation" above. A provider-neutral `FileStorage`
+abstraction (`app/storage/`) now sits behind upload/ingestion/extraction/re-index: `save`/`read`/
+`delete`/`exists`/`get_metadata`/`generate_download_url`, backed by `LocalFileStorage` (default)
+or `MinioFileStorage` (S3-compatible, selected via `FILE_STORAGE_PROVIDER=minio`), resolved
+through one factory (`create_file_storage()`) exactly like the AI provider factory — see "Storage
+abstraction" above and "Storage Abstraction (Phase 2.6/2.7)" in ARCHITECTURE.md. Document
+lifecycle APIs (deletion, download, listing), orphan-object cleanup, hash-based deduplication,
+frontend E2E, a real-Ollama smoke suite, and a real multilingual-model evaluation run remain
+future milestones — see "Integration tests" above, and "Test architecture"/"What is intentionally
+not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
+intentionally deferred.
