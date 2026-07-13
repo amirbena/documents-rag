@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.core.config import Settings
 
-_ENV_EXAMPLE_PATH = Path(__file__).resolve().parents[1] / ".env.example"
+_ENV_EXAMPLE_PATH = Path(__file__).resolve().parents[3] / ".env.example"
 
 
 def _env_example_keys() -> set[str]:
