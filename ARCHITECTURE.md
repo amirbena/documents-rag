@@ -23,7 +23,7 @@ Qdrant upsert all succeed.
 
 | Service    | Image                    | Purpose (current)                                             | Purpose (future) |
 |------------|--------------------------|------------------------------------------------------------------|-------------------|
-| `app`      | built from `Dockerfile`  | FastAPI process: `/api/v1/health`, `/api/v1/providers/ollama/health`, `POST /api/v1/documents` | RAG API: ingestion processing, retrieval, chat |
+| `app`      | built from `Dockerfile`  | FastAPI process: `/health`, `/api/v1/providers/ollama/health`, `POST /api/v1/documents` | RAG API: ingestion processing, retrieval, chat |
 | `postgres` | `postgres:16-alpine`     | Stores `documents`/`ingestion_jobs` rows via async SQLAlchemy     | Session/metadata storage |
 | `redis`    | `redis:7-alpine`         | Available on the network                                         | Caching, task queues |
 | `qdrant`   | `qdrant/qdrant:latest`   | Collection create/upsert/search via `QdrantVectorStore`           | Backing document retrieval in a future RAG flow |
@@ -195,7 +195,7 @@ code path depends on — never a filesystem path or a MinIO SDK type directly.
   success, never a failure. Never recreates or resets an existing bucket.
 
 **Cross-system boundary — storage and PostgreSQL are not one atomic transaction.**
-`app/services/document_upload_service.py`'s `upload_document()` sequence is: save the object to
+`app/services/documents/upload_service.py`'s `upload_document()` sequence is: save the object to
 `FileStorage` → persist `Document` + `IngestionJob` rows → commit. If the commit fails after the
 object was already saved, a best-effort delete of that object is attempted (failure there is
 logged, never raised) before the *original* DB exception is re-raised unchanged — this is not
@@ -208,7 +208,7 @@ orphan-cleanup worker exists yet — out of scope for this phase).
 `POST /api/v1/documents` (`app/api/v1/routes/documents.py`) is the first public endpoint that
 touches the database. The route is a thin controller — it reads the upload, rejects an empty
 file with `400`, and delegates the save/persist/commit sequence to
-`app/services/document_upload_service.py`'s `upload_document()`, which:
+`app/services/documents/upload_service.py`'s `upload_document()`, which:
 
 1. Generates an object key (`generate_object_key`) and saves the file via the injected
    `FileStorage` (resolved once per request through `create_file_storage()` — see "Storage
@@ -273,8 +273,8 @@ reconciliation endpoint.
   endpoint/bucket/credential is never exposed to a client this way, and `generate_download_url()`
   is not called by this endpoint at all.
 
-**Query layer**: `app/services/document_query_service.py` owns every read query behind these
-routes, following the flat function-based style of `app/services/index_registry.py` (no
+**Query layer**: `app/services/documents/query_service.py` owns every read query behind these
+routes, following the flat function-based style of `app/services/indexing/collection_registry.py` (no
 `app/repositories/` abstraction exists in this codebase). Routes stay thin per CLAUDE.md's
 "Route Layer Style": parse query params, inject `AsyncSession`/`FileStorage` via `Depends`, call
 one service function, copy its typed result's `status_code` (`DocumentDetailResult`/
@@ -284,7 +284,7 @@ module, and no route ever returns a SQLAlchemy `Document`/`IngestionJob` directl
 a Pydantic response schema in `app/schemas/documents.py`).
 
 **Lifecycle status derivation** (`DocumentLifecycleStatus`, `app/schemas/documents.py`; computed
-by `derive_lifecycle_status()` in `document_query_service.py`) is sourced from a document's
+by `derive_lifecycle_status()` in `query_service.py`) is sourced from a document's
 *latest* `IngestionJob` (`created_at` DESC, `id` DESC tiebreaker) plus `Document.indexed_at`:
 
 | Latest job | `indexed_at` | Status |
@@ -326,9 +326,9 @@ batched query (`get_latest_jobs_for_documents()` — `WHERE document_id IN (...)
 
 ## Ingestion retry and stale-job recovery (Phase 2.8.3)
 
-`app/services/ingestion_retry_service.py` adds two Postgres-only, transactional operations on top
-of the existing `IngestionWorker`/`IngestionJob` model — neither touches `FileStorage` or a vector
-store directly:
+`app/services/ingestion/retry_service.py` and `app/services/ingestion/stale_recovery_service.py`
+add two Postgres-only, transactional operations on top of the existing `IngestionWorker`/
+`IngestionJob` model — neither touches `FileStorage` or a vector store directly:
 
 - **`retry_ingestion()`** — the service behind `POST /api/v1/documents/{document_id}/ingestion/retry`.
 - **`recover_stale_ingestion_jobs()`** — an internal maintenance operation with no HTTP endpoint,
@@ -388,7 +388,7 @@ is `FAILED`/absent/stale-`PROCESSING` — inserting a brand-new row is never cov
 on rows that already existed when the lock was acquired — closed by catching the unique index's
 `IntegrityError` at commit time and re-reading/returning the now-existing active job instead of
 raising. Proven against real Postgres (not a fake session) by
-`tests/integration/test_ingestion_retry_postgres.py::test_two_concurrent_retries_produce_exactly_one_new_active_job`,
+`tests/integration/ingestion/test_concurrency.py::test_two_concurrent_retries_produce_exactly_one_new_active_job`,
 which runs two independent `AsyncSession`s racing via `asyncio.gather()`.
 
 ### `recover_stale_ingestion_jobs()`
@@ -423,16 +423,16 @@ out of scope for this phase.
 exactly one `vector_store.upsert_vectors()` call; if extraction/chunking/embedding raises, that
 happens strictly before `upsert_vectors()` is ever reached — **a `FAILED` (or stale-recovered) job
 never wrote any vectors to Qdrant.** Chunk IDs (`f"{document.id}-{chunk_index}"`,
-`app/services/document_chunker.py`) and their derived Qdrant point IDs
+`app/services/documents/chunker.py`) and their derived Qdrant point IDs
 (`uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)`, `to_vector_point()` in
-`app/services/ingestion_worker.py`) are fully deterministic for a given document, so a retry's
+`app/services/ingestion/worker.py`) are fully deterministic for a given document, so a retry's
 eventual successful upsert naturally overwrites the same point IDs a first successful attempt
 would have used — Qdrant's own upsert-by-ID semantics make this idempotent with no extra
 mechanism. No delete-before-retry step, temporary-collection-swap, or new cleanup logic was added
 for this phase, and none is needed.
 
 This was verified against real Qdrant, not just asserted:
-`tests/integration/test_ingestion_retry_postgres.py::
+`tests/integration/ingestion/test_retry_postgres.py::
 test_retry_after_real_failure_writes_no_orphaned_vectors_then_succeeds` forces a real first
 attempt to fail (an embedding-provider error injected before `upsert_vectors()`), confirms zero
 points exist in the real ephemeral Qdrant container for that document, then retries and lets the
@@ -466,6 +466,28 @@ not implement hash deduplication, orphan reconciliation, version-aware re-indexi
 scheduler deployment, retention/purge policy, bulk deletion, or physical row deletion — those
 remain explicitly out of scope.
 
+### Documents service package (`app/services/documents/`)
+
+Deletion service code lives in a small package, split by dependency direction rather than in one
+mixed module:
+
+- `app/services/documents/deletion_service.py` — request-scoped deletion state and scheduling:
+  deletion-status reads (`get_latest_deletion_job()`/`get_latest_deletion_jobs_for_documents()`),
+  `request_document_deletion()`, the `DeletionRequestOutcome`/`DeletionRequestResult` types routes
+  map to HTTP status, and public error sanitization (`DeletionErrorCode`/
+  `sanitize_deletion_error()`). This is what API routes and `query_service.py`/`retry_service.py`/
+  `stale_recovery_service.py` import.
+- `app/services/documents/deletion_worker.py` — background deletion execution:
+  `DocumentDeletionWorker`, the claim/vector-cleanup/storage-cleanup/completion orchestration.
+  This is what `scripts/process_pending_document_deletions.py` and tests exercising execution
+  import.
+
+`deletion_worker.py` depends on `deletion_service.py` (for the shared `DeletionErrorCode`
+constants) — never the reverse. This mirrors the real production dependency direction: API routes
+only ever need scheduling/status, never execution; only the out-of-band script/tests need
+execution, and execution itself needs the shared error-code vocabulary defined on the service
+side.
+
 ### `DocumentDeletionJob` — an append-only deletion-attempt ledger
 
 `app/models/document_deletion_job.py` mirrors `IngestionJob`'s lifecycle style: `id`,
@@ -491,7 +513,7 @@ pre-existing, already-populated table).
 
 ### Scheduling: `request_document_deletion()` — the service behind `DELETE /api/v1/documents/{id}`
 
-`app/services/document_deletion_service.py`'s `request_document_deletion()` only ever schedules a
+`app/services/documents/deletion_service.py`'s `request_document_deletion()` only ever schedules a
 deletion by inserting a `PENDING` `DocumentDeletionJob` row — it never performs the actual
 cross-system cleanup itself, so the HTTP request never blocks on unbounded external I/O. Decision
 table, driven by the document's latest `DocumentDeletionJob` and (when relevant) its latest
@@ -518,6 +540,10 @@ time and re-reading/returning the now-existing active job instead of raising.
 
 ### Execution: `DocumentDeletionWorker` — out-of-band, mirroring `IngestionWorker`
 
+`app/services/documents/deletion_worker.py`'s `DocumentDeletionWorker` is the execution side —
+kept in a separate module from `deletion_service.py`'s request-scoped scheduling (see "Documents
+service package" below for the full module boundary).
+
 **Design choice**: this codebase has no deployed background-worker *process* for `IngestionJob`
 either — `IngestionWorker.process_next_job()` is only ever invoked by test fixtures and
 `scripts/`, never inline inside `POST /api/v1/documents`. `DocumentDeletionWorker` mirrors this
@@ -535,7 +561,7 @@ optional/manual, mirroring `scripts/recover_stale_ingestion_jobs.py`'s boundary:
    multiple worker invocations never claim the same job. Returns `None` if there is no pending job.
 2. Flips the claimed job to `PROCESSING` and **commits immediately**, before any external I/O.
 3. **Vector cleanup, strictly before storage cleanup**: calls
-   `index_registry.delete_all_tracked_document_vectors(document, vector_store, session)` — the
+   `vector_deletion_service.delete_all_tracked_document_vectors(document, vector_store, session)` — the
    full-tracked-collection operation (targets the document's active collection *and* every
    distinct historical collection still tracked by a pending/failed `VectorCleanupJob`) — **never**
    `delete_current_document_vectors()` (the deliberately-partial, active-collection-only sibling).
@@ -571,7 +597,7 @@ independent claim query against `document_deletion_jobs`, never touching `ingest
 
 ### Lifecycle precedence — deletion always wins
 
-`derive_lifecycle_status()` (`app/services/document_query_service.py`) now takes the document's
+`derive_lifecycle_status()` (`app/services/documents/query_service.py`) now takes the document's
 latest `DocumentDeletionJob` (if any) as an additional input and checks it **first**, before the
 existing ingestion-derived rule:
 
@@ -631,7 +657,7 @@ Phase 2.8.3 introduced stale recovery for ingestion specifically).
 
 ## Ingestion worker
 
-`IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — **no public API**
+`IngestionWorker` (`app/services/ingestion/worker.py`) is an internal service — **no public API**
 — that claims and resolves one pending `IngestionJob` at a time via `process_next_job(session)`:
 
 1. **Claim**: `SELECT ... WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP
@@ -667,7 +693,7 @@ double that faithfully simulates the pending-job filter and `Document` lookup in
 
 ## Document text extraction
 
-`DocumentTextExtractor` (`app/services/document_text_extractor.py`) is the ingestion worker's
+`DocumentTextExtractor` (`app/services/documents/text_extractor.py`) is the ingestion worker's
 default processing step: given an injected `FileStorage`, it reads a `Document`'s content via
 `storage.read(resolve_document_storage_key(document))` and extracts its raw text entirely in
 memory — **no chunking, embedding, or Qdrant upsert, and no temporary file materialization**.
@@ -735,7 +761,7 @@ persists the raw extracted text itself.
 
 ## Document chunking
 
-`DocumentChunker` (`app/services/document_chunker.py`) is the ingestion worker's second
+`DocumentChunker` (`app/services/documents/chunker.py`) is the ingestion worker's second
 processing step: it takes the `ExtractedDocument` that `DocumentTextExtractor` produced and
 splits each page's text into fixed-size, overlapping chunks — **no embedding generation, no
 Qdrant upsert, no retrieval**.
@@ -771,7 +797,7 @@ the system of record for chunk vectors and their metadata.
 
 ## Chunk embedding and Qdrant indexing
 
-The ingestion worker's third and fourth processing steps (`app/services/ingestion_worker.py`)
+The ingestion worker's third and fourth processing steps (`app/services/ingestion/worker.py`)
 turn each `DocumentChunk` into an indexed vector — **no retrieval, chat, or SSE endpoint reads
 these back out yet**:
 
@@ -1025,7 +1051,7 @@ documents" — `collection_prefix`, `provider`, `model`, `dimension`, `embedding
 `chunking_version`. `get_active_embedding_config(settings)` is the *only* place that reads
 `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` (or `OLLAMA_EMBEDDING_MODEL`)/`VECTOR_SIZE`/
 `EMBEDDING_VERSION`/`CHUNKING_VERSION` for indexing purposes — `IngestionWorker` (write side),
-`RetrievalService` (read side), and `app/services/reindex_service.py` all call this function
+`RetrievalService` (read side), and `app/services/indexing/reindex_service.py` all call this function
 rather than reading those settings directly, so they can never resolve to different
 configurations. Every field is validated non-empty/positive at construction — see "Configuration
 Must Be Explicit" below.
@@ -1039,7 +1065,7 @@ identity, not a literal collection name by itself.
 
 ### Why incompatible dimensions cannot share a collection
 
-`app/services/index_registry.py`'s `ensure_active_collection()` is the one gate every
+`app/services/indexing/collection_registry.py`'s `ensure_active_collection()` is the one gate every
 write/search path passes through before touching Qdrant: it calls
 `VectorStore.get_collection_vector_size()` (new on the `VectorStore`/`QdrantVectorStore`
 contract, alongside `delete_by_document_id()`) and raises `IncompatibleIndexConfigurationError`
@@ -1055,7 +1081,7 @@ created: `collection_name` (primary key), `embedding_provider`, `embedding_model
 `embedding_dimension`, `embedding_version`, `chunking_version`, `status` (`active`/`retired`),
 `created_at`. `Document` (`app/models/document.py`) gained matching `embedding_*`/
 `chunking_version`/`collection_name`/`indexed_at` columns, populated only by
-`app/services/index_registry.py`'s `mark_document_indexed()` **after** a successful
+`app/services/indexing/collection_registry.py`'s `mark_document_indexed()` **after** a successful
 index/re-index — a failed attempt never updates them. `is_document_stale(document, config)`
 compares `document.collection_name` against the active config's collection name — a document
 with vectors sitting in some collection is not "current" merely because vectors exist somewhere;
@@ -1086,7 +1112,7 @@ this reason. Any code addressing a document's content calls
 else falls back to `stored_path` — so a pre-migration row remains fully readable without any
 special-casing at the call site.
 
-### Re-index (`app/services/reindex_service.py`)
+### Re-index (`app/services/indexing/reindex_service.py`)
 
 `reindex_document(document, session, settings, file_storage=None) -> ReindexResult` re-derives a
 document's vectors from its already-persisted stored content — no new upload required (`
@@ -1110,7 +1136,7 @@ its *previous* tracked collection (if any, and if different from the new one).
   re-index itself is **not** reported as a failure.
 
 Idempotent: point IDs are derived identically to the initial-ingest path
-(`app.services.ingestion_worker.to_vector_point`, made public specifically so
+(`app.services.ingestion.worker.to_vector_point`, made public specifically so
 `reindex_service.py` can reuse it), so re-running against the same active collection overwrites
 rather than duplicates.
 
@@ -1152,12 +1178,12 @@ collection_name)`, with `status` (`pending`/`failed`/`completed`), `attempts`, `
 `created_at`, `completed_at`. Multiple pending rows for the same document (different historical
 collections) are supported and never overwrite each other.
 
-`app/services/index_registry.py` provides: `create_cleanup_job()` (called by `reindex_document()`
-immediately after a failed delete, recording the first attempt's error), `get_pending_cleanup_jobs()`
-(every `pending`/`failed` row, optionally scoped to one document), and `retry_cleanup_job()`
-(retries the delete; marks `completed` on success or increments `attempts`/records `last_error`
-and stays `failed` otherwise — idempotent, since retrying a delete against already-empty vectors
-is a harmless no-op).
+`app/services/indexing/cleanup_job_service.py` provides: `create_cleanup_job()` (called by
+`reindex_document()` immediately after a failed delete, recording the first attempt's error),
+`get_pending_cleanup_jobs()` (every `pending`/`failed` row, optionally scoped to one document),
+and `retry_cleanup_job()` (retries the delete; marks `completed` on success or increments
+`attempts`/records `last_error` and stays `failed` otherwise — idempotent, since retrying a delete
+against already-empty vectors is a harmless no-op).
 
 **Two separate vector-deletion operations, deliberately not one.**
 `delete_current_document_vectors(document, vector_store)` targets only the document's
@@ -1186,7 +1212,7 @@ object-storage file, or ingestion job — those remain separate, deliberate oper
 future document-deletion endpoint. Completed cleanup jobs are retained (audit trail), never
 auto-deleted.
 
-`app/services/index_registry.py` additionally provides `get_stale_documents()` (list every
+`app/services/indexing/collection_registry.py` additionally provides `get_stale_documents()` (list every
 document whose `collection_name` isn't the active one) and `retire_collection()`
 (bookkeeping-only status flip, never deletes Qdrant data). Migrating to a new embedding/chunking
 version is therefore: bump `EMBEDDING_VERSION`/`CHUNKING_VERSION` -> the next re-index run creates
@@ -1356,7 +1382,12 @@ trade-off:
 - **Unit tests** (`tests/*.py`, unmarked/default) — fakes and mocks only (fake sessions, fake
   providers, mocked `httpx` transports); no real database, no real Qdrant, no real network, no
   Docker. Fast (the whole suite runs in well under a second) and always run by `make test`/
-  `make verify`.
+  `make verify`. **One deliberate exception**: document-deletion unit tests live under
+  `tests/unit/services/documents/` (`test_deletion_service.py`/`test_deletion_worker.py`),
+  mirroring `app/services/documents/`'s module split — this is currently the only nested unit-test
+  directory in the repository; every other unit test file remains flat directly under `tests/`.
+  Extending this nested convention to other features is a deliberate future decision, not
+  something this split silently generalizes.
 - **Integration tests** (`tests/integration/*.py`, `@pytest.mark.integration`, auto-applied by
   `tests/integration/conftest.py`) — real, ephemeral Postgres and Qdrant containers started via
   [Testcontainers for Python](https://testcontainers-python.readthedocs.io/), never the
@@ -1405,8 +1436,9 @@ tiers as a convenience — they are not a substitute for `make verify`/`verify-i
 `verify-e2e-backend`, which still cover everything including this layer.
 
 The Phase 2.5 multilingual RAG foundation's tests follow the same span-all-three-tiers pattern:
-`tests/test_embedding_config.py`/`test_index_registry.py`/`test_language_detector.py`/
-`test_prompt_catalog.py`/`test_reindex_service.py` (plus the shared
+`tests/test_embedding_config.py`/`tests/unit/services/indexing/test_collection_registry.py`/
+`test_vector_deletion_service.py`/`test_cleanup_job_service.py`/`test_reindex_service.py`/
+`tests/test_language_detector.py`/`test_prompt_catalog.py` (plus the shared
 `test_prompt_provider_engine_parity.py` above) are unit tests,
 `tests/integration/test_multilingual_indexing.py` is an integration test (real ephemeral
 Postgres/Qdrant — indexing metadata persistence, dimension-mismatch rejection, staleness
@@ -1423,7 +1455,7 @@ tests already cover the provider-neutral seams without a real object store). Rea
 real-pipeline coverage: `tests/integration/test_minio_storage.py` exercises `MinioFileStorage`
 directly against a real, ephemeral MinIO container (bucket init, save/read/delete/exists/metadata,
 presigned URLs, not-found/error translation), and
-`tests/integration/test_ingestion_worker_minio.py` runs the real `IngestionWorker` pipeline
+`tests/integration/ingestion/test_worker_minio.py` runs the real `IngestionWorker` pipeline
 (extraction → chunking → fake embeddings → real Qdrant upsert) reading content that only ever
 lived in MinIO. Public-contract coverage: `tests/e2e/backend/test_minio_e2e.py` runs the same
 upload → ingestion → retrieval → streaming chat flow as `test_upload_to_streaming_chat.py`, but
@@ -1447,7 +1479,7 @@ deletion, or production storage benchmarking — see "What is intentionally not 
 No tier pulls or calls a real LLM/embedding model. Unit tests use hand-written fake provider
 doubles (see e.g. `tests/test_retrieval_service.py`, `tests/test_rag_orchestrator.py`). The
 integration suite's one end-to-end pipeline test
-(`tests/integration/test_ingestion_worker_postgres.py`) runs the real `IngestionWorker` default
+(`tests/integration/ingestion/test_worker_postgres.py`) runs the real `IngestionWorker` default
 pipeline against real Postgres and real Qdrant, but with `get_embedding_provider` monkeypatched
 to a small fixed-vector fake. The backend E2E suite goes one step further and exercises the real
 HTTP/chat surface too, with `FakeEmbeddingProvider` (deterministic bag-of-words hashing, so a
@@ -1544,10 +1576,6 @@ monitoring/alerting systems polling `/health/dependencies` for per-dependency st
 future backend E2E suite's own startup check (poll `/health/ready` before running E2E tests
 against a freshly started stack, instead of a fixed sleep).
 
-**Legacy**: `GET /api/v1/health` (`app/api/v1/routes/health.py`, `HealthResponse`) is unchanged
-and still works — kept for backward compatibility with any existing client — but is superseded by
-`GET /health` for anything operational going forward.
-
 ## Future LLM provider stubs
 
 `OpenAIProvider`, `GeminiProvider`, and `AnthropicProvider`
@@ -1600,7 +1628,7 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 
 | Variable                  | Default                                                              | Notes |
 |----------------------------|-----------------------------------------------------------------------|-------|
-| `APP_ENV`                 | `local`                                                                | Echoed by the legacy `GET /api/v1/health`'s `environment` field |
+| `APP_ENV`                 | `local`                                                                | Read by application/provider configuration |
 | `LOG_LEVEL`                | `INFO`                                                                 | Not yet wired to a logger |
 | `DATABASE_URL`             | `postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db`         | Async SQLAlchemy engine; stores `documents`/`ingestion_jobs`; also `SELECT 1`-checked by `GET /health/ready`/`/health/dependencies` |
 | `REDIS_URL`                | `redis://redis:6379/0`                                                | Not yet consumed by any business code path; `PING`-checked (not required) by `GET /health/ready`/`/health/dependencies` |
@@ -1642,13 +1670,15 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `app/api/routes` — **unversioned** operational routes: `GET /health`, `/health/live`,
   `/health/ready`, `/health/dependencies` (see "Operational Health Contract" above). Registered
   on `app` with no prefix — never move these under `app/api/v1`.
-- `app/api/v1/routes` — versioned business API routers: `GET /health` (legacy, see "Operational
-  Health Contract" above), `GET /providers/ollama/health`, `POST /documents` plus the five
-  read-only `GET /documents*` routes (see "Document upload and ingestion job skeleton" and
-  "Document read APIs and original download (Phase 2.8.2)" above), `POST
-  /documents/{document_id}/ingestion/retry` (see "Ingestion retry and stale-job recovery (Phase
-  2.8.3)" above — the one mutating route in `documents.py`), and `POST /chat` (see "Streaming
-  chat endpoint" above) — `chat.py` is the only router that depends on `app/rag`.
+- `app/api/v1/routes` — versioned business API routers: `GET /providers/ollama/health`,
+  `POST /documents` plus the five read-only `GET /documents*` routes (see "Document upload and
+  ingestion job skeleton" and "Document read APIs and original download (Phase 2.8.2)" above),
+  `POST /documents/{document_id}/ingestion/retry` (see "Ingestion retry and stale-job recovery
+  (Phase 2.8.3)" above), `DELETE /documents/{document_id}` / `GET .../deletion` (Phase 2.8.4),
+  and `POST /chat` (see "Streaming chat endpoint" above) — `chat.py` is the only router that
+  depends on `app/rag`. The duplicate versioned `GET /health` route was removed in the
+  Phase 2.8.4 structural refactor; `app/api/routes/health.py`'s unversioned endpoints (above)
+  are the only supported health API.
 - `app/core` — configuration and cross-cutting concerns, plus `version.py` (`SERVICE_NAME`/
   `SERVICE_VERSION` — the single source of truth for both the FastAPI app's own metadata and the
   unversioned platform health responses).
@@ -1665,32 +1695,41 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`local_storage.py`), `MinioFileStorage` (`minio_storage.py`), `create_file_storage()`
   (`factory.py`), object-key generation/validation (`keys.py`), and the `StorageError` hierarchy
   (`errors.py`).
-- `app/services` — business logic layer: `OllamaClient` (`app/services/ollama_client.py`), a thin
-  async HTTP client scoped strictly to reachability and model-availability checks — it
-  intentionally does not call generation or embedding endpoints;
-  `document_upload_service.py`'s `upload_document()`, which saves content via the injected
-  `FileStorage` and persists `Document`/`IngestionJob` (see "Document upload and ingestion job
-  skeleton" above); and `IngestionWorker` (`app/services/ingestion_worker.py`), which claims and
-  resolves pending ingestion jobs (see "Ingestion worker" above) — no public API — and whose
-  default pipeline now calls the embedding/vector-store providers (see "Chunk embedding and
-  Qdrant indexing" above), the only place in this layer that does; `DocumentTextExtractor`
-  (`app/services/document_text_extractor.py`), which extracts text from a document's stored
-  `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` content, read via the injected `FileStorage` (see "Document
-  text extraction" above); and `DocumentChunker` (`app/services/document_chunker.py`), which
-  splits an `ExtractedDocument` into `DocumentChunk`s (see "Document chunking" above);
-  `platform_health.py`, the dependency checks backing `GET /health/ready`/`/health/dependencies`
-  (see "Operational Health Contract" above) — reuses `OllamaClient` for the Ollama check rather
-  than duplicating it; `index_registry.py`, the collection-safety and document-indexing-metadata
-  service (see "Multilingual RAG Foundation" above) — `ensure_active_collection()`,
-  `mark_document_indexed()`, `is_document_stale()`, `get_stale_documents()`, `retire_collection()`,
-  `delete_current_document_vectors()`, `delete_all_tracked_document_vectors()`;
-  `reindex_service.py`'s `reindex_document()`, the backend re-index capability; and
-  `document_query_service.py`, the read-only query/lifecycle-derivation layer backing the five
-  `GET /documents*` routes (see "Document read APIs and original download (Phase 2.8.2)" above)
-  — never writes to Postgres, object storage, or Qdrant; and `ingestion_retry_service.py`'s
-  `retry_ingestion()`/`recover_stale_ingestion_jobs()` (see "Ingestion retry and stale-job
-  recovery (Phase 2.8.3)" above) — the one write path in this file's list that touches
-  `IngestionJob`, and strictly Postgres-only (never `FileStorage`, never a vector store).
+- `app/services` — business logic layer, split into three feature packages plus two flat
+  cross-cutting modules (see "Documents service package"/CLAUDE.md's package map for the full
+  ownership rationale):
+  - `app/services/documents/` — `upload_service.py`'s `upload_document()` (saves content via the
+    injected `FileStorage`, persists `Document`/`IngestionJob`); `query_service.py`, the
+    read-only query/lifecycle-derivation layer backing the five `GET /documents*` routes — never
+    writes to Postgres, object storage, or Qdrant, and never calls `FileStorage`;
+    `download_service.py`, the original-content download path (the only module in this package
+    that calls `FileStorage.read()`); `text_extractor.py`'s `DocumentTextExtractor`, which
+    extracts text from a document's stored `.txt`/`.md`/`.pdf`/`.docx`/`.xlsx` content, read via
+    the injected `FileStorage`; `chunker.py`'s `DocumentChunker`, which splits an
+    `ExtractedDocument` into `DocumentChunk`s; and `deletion_service.py`/`deletion_worker.py`
+    (Phase 2.8.4 scheduling/execution split — see "Documents service package" above).
+  - `app/services/ingestion/` — `worker.py`'s `IngestionWorker`, which claims and resolves
+    pending ingestion jobs — no public API — and whose default pipeline calls the
+    embedding/vector-store providers (see "Chunk embedding and Qdrant indexing" above), the only
+    place in this layer that does; `retry_service.py`'s `retry_ingestion()` and
+    `stale_recovery_service.py`'s `recover_stale_ingestion_jobs()` (see "Ingestion retry and
+    stale-job recovery (Phase 2.8.3)" above) — the write paths in this package that touch
+    `IngestionJob`, strictly Postgres-only (never `FileStorage`, never a vector store); and
+    `status.py`, the small shared constants/helpers both of those two modules require.
+  - `app/services/indexing/` — `collection_registry.py`, the collection-safety and
+    document-indexing-metadata service (see "Multilingual RAG Foundation" above) —
+    `ensure_active_collection()`, `mark_document_indexed()`, `is_document_stale()`,
+    `get_stale_documents()`, `retire_collection()`; `vector_deletion_service.py` —
+    `delete_current_document_vectors()`, `delete_all_tracked_document_vectors()`;
+    `cleanup_job_service.py` — `create_cleanup_job()`, `get_pending_cleanup_jobs()`,
+    `retry_cleanup_job()`; and `reindex_service.py`'s `reindex_document()`, the backend re-index
+    capability.
+  - `app/services/ollama_client.py` — `OllamaClient`, a thin async HTTP client scoped strictly to
+    reachability and model-availability checks — it intentionally does not call generation or
+    embedding endpoints.
+  - `app/services/platform_health.py` — the dependency checks backing `GET /health/ready`/
+    `/health/dependencies` (see "Operational Health Contract" above) — reuses `OllamaClient` for
+    the Ollama check rather than duplicating it.
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
@@ -1757,9 +1796,9 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `tests/integration/` — the Testcontainers-based integration suite (see "Test architecture"
   above): `conftest.py` (ephemeral Postgres/Qdrant/MinIO fixtures, the production-environment
   guard, the Alembic-migration helpers), `test_alembic_migrations.py`,
-  `test_ingestion_worker_postgres.py`, `test_qdrant_vector_store_integration.py`,
+  `test_worker_postgres.py`, `test_qdrant_vector_store_integration.py`,
   `test_langchain_rag_engine_integration.py`, `test_minio_storage.py`,
-  `test_ingestion_worker_minio.py`. Entirely separate from `tests/*.py` (unit tests); auto-marked
+  `test_worker_minio.py`. Entirely separate from `tests/*.py` (unit tests); auto-marked
   `@pytest.mark.integration` and excluded from `make test`/`make verify`.
 - `tests/support/` — small, non-test helper modules reused by more than one test tier;
   `minio_containers.py` holds the one ephemeral-MinIO-container startup routine

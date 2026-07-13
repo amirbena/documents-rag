@@ -62,7 +62,7 @@ First-time onboarding, in order — later sections below go into more detail on 
    # {"status":"ok","service":"documents-rag","version":"0.1.0"}
    ```
    (see "Platform health and readiness" below for the full unversioned health/liveness/readiness
-   contract, and "legacy" note on `/api/v1/health`)
+   contract)
 8. **Pull the required Ollama models** (see "Running with Docker Compose" below):
    ```bash
    docker compose exec ollama ollama pull llama3.1
@@ -101,8 +101,8 @@ docker compose up --build
 Verify it's up with:
 
 ```bash
-curl http://localhost:8000/api/v1/health
-# {"status":"ok","environment":"local"}
+curl http://localhost:8000/health
+# {"status":"ok","service":"documents-rag","version":"0.1.0"}
 ```
 
 See "Running with Docker Compose" below for the full walkthrough (pulling Ollama models,
@@ -137,8 +137,8 @@ docker compose up --build
 (If you haven't already, copy `.env.example` to `.env` first — see "Local setup" above.)
 
 This starts `app`, `postgres`, `redis`, `qdrant`, and `ollama`. The app is available at
-http://localhost:8000, with health check at `GET /api/v1/health`. Verified working end-to-end:
-all five containers start, the health endpoint responds `{"status":"ok","environment":"local"}`
+http://localhost:8000, with health check at `GET /health`. Verified working end-to-end: all
+five containers start, the health endpoint responds `{"status":"ok","service":"documents-rag","version":"0.1.0"}`
 from the host, and the `app` container can reach `postgres:5432`, `redis:6379`, `qdrant:6333`,
 and `ollama:11434` over the internal Compose network.
 
@@ -267,11 +267,6 @@ curl http://localhost:8000/health/live
 curl http://localhost:8000/health/ready
 curl http://localhost:8000/health/dependencies
 ```
-
-**Legacy**: `GET /api/v1/health` (`{"status": "ok", "environment": "..."}`) still exists and
-still works exactly as before — nothing about it changed — but it's superseded by the endpoints
-above for anything operational (probes, load balancers, monitoring). Prefer `GET /health` for new
-integrations; `/api/v1/health` is kept only for backward compatibility with existing clients.
 
 ## Database migrations
 
@@ -430,11 +425,11 @@ resurrected once deletion has begun.
 
 ### Ingestion worker
 
-`IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — no public API —
+`IngestionWorker` (`app/services/ingestion/worker.py`) is an internal service — no public API —
 that claims and resolves one `pending` `IngestionJob` at a time:
 
 ```python
-from app.services.ingestion_worker import IngestionWorker
+from app.services.ingestion.worker import IngestionWorker
 
 worker = IngestionWorker()
 job = await worker.process_next_job(session)  # None if there's nothing pending
@@ -451,7 +446,7 @@ it never generates text.
 
 ### Document text extraction
 
-`DocumentTextExtractor` (`app/services/document_text_extractor.py`) reads a document's content
+`DocumentTextExtractor` (`app/services/documents/text_extractor.py`) reads a document's content
 via the injected `FileStorage` and extracts its raw text entirely in memory (no local path, no
 temporary file). **It routes by file extension and validates each file's basic
 structure/content before extraction** — a mismatched or corrupt file fails clearly instead of
@@ -469,7 +464,7 @@ This is lightweight structural validation, not deep content sanitization — it 
 upload's `content_type` header or scan for malicious payloads.
 
 ```python
-from app.services.document_text_extractor import DocumentTextExtractor
+from app.services.documents.text_extractor import DocumentTextExtractor
 
 extracted = await DocumentTextExtractor().extract(document)
 for page in extracted.pages:
@@ -484,12 +479,12 @@ its output feeds directly into chunking below.
 
 ### Document chunking
 
-`DocumentChunker` (`app/services/document_chunker.py`) takes an `ExtractedDocument` and splits
+`DocumentChunker` (`app/services/documents/chunker.py`) takes an `ExtractedDocument` and splits
 it into fixed-size, overlapping, word-boundary-aware chunks — no embedding, no Qdrant upsert, no
 retrieval:
 
 ```python
-from app.services.document_chunker import DocumentChunker
+from app.services.documents.chunker import DocumentChunker
 
 chunker = DocumentChunker(chunk_size=1000, chunk_overlap=200)  # or read from Settings
 chunks = chunker.chunk(extracted)  # list[DocumentChunk]
@@ -698,7 +693,7 @@ Question -> LanguageDetector -> PromptProvider -> PromptCatalog -> ResolvedPromp
   sanitized Qdrant collection name. Changing any one of them always produces a different
   collection — incompatible vectors can never land in the same collection, and `IngestionWorker`/
   `RetrievalService` always resolve the same active configuration.
-- **Collection safety** (`app/services/index_registry.py`) — an existing collection with the
+- **Collection safety** (`app/services/indexing/collection_registry.py`) — an existing collection with the
   wrong vector dimension is rejected explicitly (`IncompatibleIndexConfigurationError`), never
   silently reused, recreated, or deleted.
 - **Document indexing metadata** — `Document` rows record exactly which embedding
@@ -710,13 +705,13 @@ Question -> LanguageDetector -> PromptProvider -> PromptCatalog -> ResolvedPromp
   the active configuration's expected count/dimension *before* any Qdrant write/search, catching a
   misconfigured `EMBEDDING_MODEL`/`VECTOR_SIZE` pair immediately instead of only once an existing
   collection happens to disagree.
-- **Re-index** (`app/services/reindex_service.py`) — re-derives a document's vectors from its
+- **Re-index** (`app/services/indexing/reindex_service.py`) — re-derives a document's vectors from its
   already-persisted stored file (no new upload) when its configuration changes; idempotent, and
   returns a typed `ReindexResult`/`ReindexOutcome` (`ALREADY_CURRENT`/`REINDEXED`/
   `REINDEXED_EMPTY`/`REINDEXED_WITH_CLEANUP_PENDING`) rather than a plain bool, since a bool can't
   represent "zero-chunk document" or "the new collection committed but cleaning up the old one
   failed" distinctly. A Postgres commit failure after a successful Qdrant write rolls back and
-  expires the `Document` — see "Re-index (`app/services/reindex_service.py`)" in
+  expires the `Document` — see "Re-index (`app/services/indexing/reindex_service.py`)" in
   [ARCHITECTURE.md](ARCHITECTURE.md) for the full non-atomic-transaction contract. A failed
   legacy-collection cleanup is tracked as a retryable `VectorCleanupJob`, never silently dropped.
 - **Language detection** (`app/rag/language.py`) — deterministic, word-level Hebrew/Latin
@@ -844,6 +839,32 @@ before committing. `make verify` never runs the Testcontainers-based integration
 
 Run `make help` any time for a quick summary of these commands.
 
+## Unit tests
+
+Every unit test lives under `tests/unit/` — nothing sits directly under `tests/*.py` anymore.
+The layout mirrors `app/`'s own package structure, one directory per top-level concern:
+
+```
+tests/unit/
+├── configuration/   # Settings/.env.example consistency
+├── core/            # app.core.config
+├── api/             # route-level tests (dependency-override style, fake DB session)
+├── services/
+│   ├── documents/   # mirrors app/services/documents/ 1:1
+│   ├── ingestion/   # mirrors app/services/ingestion/ 1:1
+│   └── indexing/    # mirrors app/services/indexing/ 1:1
+├── rag/             # app.rag.decision/orchestrator/prompt_builder/retrieval_service/etc.
+│   ├── engines/     # mirrors app/rag/engines/ 1:1
+│   ├── prompts/     # mirrors app/rag/prompts/ 1:1
+│   └── providers/   # mirrors app/rag/providers/ 1:1
+├── storage/         # mirrors app/storage/ 1:1
+└── scripts/         # tests for scripts/*.py contracts
+```
+
+Fakes/mocks only — no Docker, no Testcontainers, no real Postgres/Qdrant/MinIO/Ollama. This is
+what `make test`/`make verify` run (`pytest -m "not integration and not e2e and not slow" -q`,
+which still discovers everything under `tests/unit/` via `testpaths = ["tests"]`).
+
 ## Integration tests
 
 A separate, Testcontainers-based integration suite lives under `tests/integration/` (marked
@@ -862,17 +883,17 @@ fast unit suite never needs Docker beyond `docker compose config`.
   fake, deterministic provider — **no real Ollama container runs and no model is pulled** as
   part of this first suite.
 - **MinIO integration coverage** — `tests/integration/test_minio_storage.py` and
-  `tests/integration/test_ingestion_worker_minio.py` run against a real, ephemeral MinIO
+  `tests/integration/ingestion/test_worker_minio.py` run against a real, ephemeral MinIO
   container (Testcontainers, dynamic port, no persistent volume — same pattern as
   Postgres/Qdrant): bucket initialization, save/read/delete/exists/metadata, presigned download
   URLs, missing-object/error-translation behavior, and a full upload → Postgres → MinIO →
   extraction → chunking → fake-embeddings → Qdrant chain. A real-Ollama smoke suite is still not
   part of this first suite — real-Ollama verification is left for a future manual/nightly smoke
   suite, not the everyday integration run.
-- **Document read API coverage (Phase 2.8.2)** — `tests/integration/test_document_read_api.py`
+- **Document read API coverage (Phase 2.8.2)** — `tests/integration/documents/read/test_postgres.py`
   (real Postgres: ordering/pagination, latest-job selection with multiple jobs, a document with
   no job, latest-failed-job selection, isolation between documents) and
-  `tests/integration/test_document_download_minio.py` (real MinIO: exact-byte download,
+  `tests/integration/documents/download/test_minio.py` (real MinIO: exact-byte download,
   missing-object → 409) — see `make test-document-read-integration`.
 - **Containers and all state are removed after the test session** — nothing persists between
   runs, and nothing is written outside the ephemeral containers themselves.
@@ -894,24 +915,25 @@ make test-document-deletion-integration  # deletion Postgres + Qdrant + storage 
 ```
 
 - **Ingestion retry/stale-recovery coverage (Phase 2.8.3)** —
-  `tests/integration/test_ingestion_retry_postgres.py` (real Postgres: the partial unique index
-  actually rejecting a second active job, two genuinely concurrent retry requests via
-  `asyncio.gather` over independent sessions producing exactly one new active job, two concurrent
-  stale-recovery calls never recovering the same row twice, history preservation after a retry)
-  plus one real-Postgres-and-Qdrant test forcing a first attempt to fail, confirming zero Qdrant
-  points exist, then retrying to a real success — see `make test-ingestion-retry-integration`.
-- **Full document deletion coverage (Phase 2.8.4)** —
-  `tests/integration/test_document_deletion_postgres.py` (real Postgres: the partial unique
-  index, concurrent delete requests via `asyncio.gather` producing exactly one active job,
-  concurrent worker claims never double-processing a row, append-only history, lifecycle
-  derivation after completion/partial failure),
-  `tests/integration/test_document_deletion_qdrant.py` (real Qdrant: full tracked-collection
-  cleanup including a historical pending/failed `VectorCleanupJob` collection, an unrelated
-  document's vectors surviving, idempotent re-deletion, a real forced partial-collection failure
-  blocking storage deletion), and `tests/integration/test_document_deletion_storage.py` (real
-  LocalFileStorage and real Testcontainers MinIO: exact-object deletion, already-missing-object
-  idempotency, provider-failure partial state, identical Local/MinIO contract) — see
-  `make test-document-deletion-integration`.
+  `tests/integration/ingestion/test_retry_postgres.py` (real Postgres: the partial unique index
+  actually rejecting a second active job, history preservation after a retry, plus one
+  real-Postgres-and-Qdrant test forcing a first attempt to fail, confirming zero Qdrant points
+  exist, then retrying to a real success) and `tests/integration/ingestion/test_concurrency.py`
+  (two genuinely concurrent retry requests via `asyncio.gather` over independent sessions
+  producing exactly one new active job, two concurrent stale-recovery calls never recovering
+  the same row twice) — see `make test-ingestion-retry-integration`.
+- **Full document deletion coverage (Phase 2.8.4)** — `tests/integration/documents/deletion/`:
+  `test_postgres.py` (real Postgres: the partial unique index, append-only history, lifecycle
+  derivation after completion/partial failure, migration correctness),
+  `test_concurrency.py` (concurrent delete requests via `asyncio.gather` producing exactly one
+  active job, concurrent worker claims never double-processing a row — kept separate from
+  ordinary persistence tests, matching `tests/integration/ingestion/test_concurrency.py`'s
+  concurrency-stress convention), `test_qdrant.py` (real Qdrant: full tracked-collection cleanup
+  including a historical pending/failed `VectorCleanupJob` collection, an unrelated document's
+  vectors surviving, idempotent re-deletion, a real forced partial-collection failure blocking
+  storage deletion), and `test_storage.py` (real LocalFileStorage and real Testcontainers MinIO:
+  exact-object deletion, already-missing-object idempotency, provider-failure partial state,
+  identical Local/MinIO contract) — see `make test-document-deletion-integration`.
 
 ## Backend E2E tests
 
@@ -948,8 +970,8 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   storage provider, and that no MinIO implementation detail (bucket name, endpoint, credentials)
   leaks into the public response. Runs under both `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`.
 - **Document read API backend E2E coverage (Phase 2.8.2)** —
-  `tests/e2e/backend/test_document_read_api.py` (local storage) and
-  `tests/e2e/backend/test_document_read_api_minio.py` (real MinIO) drive
+  `tests/e2e/backend/documents/read/test_local.py` (local storage) and
+  `tests/e2e/backend/documents/read/test_minio.py` (real MinIO) drive
   upload → ingestion → list → detail → ingestion-status → download over the real HTTP boundary,
   including a forced-failure scenario asserted through `GET .../failure`, exact-byte download
   comparison, and a Hebrew filename round-trip through `Content-Disposition`. These are read-only
@@ -957,21 +979,23 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   — unlike the RAG-engine-parity/multilingual E2E suites — they do not need to run under both
   `RAG_ENGINE` settings.
 - **Ingestion retry/stale-recovery E2E coverage (Phase 2.8.3)** —
-  `tests/e2e/backend/test_ingestion_retry_recovery.py` drives
+  `tests/e2e/backend/ingestion/test_retry_recovery.py` drives
   `POST .../ingestion/retry` over real HTTP after a real forced/transient failure and a
   manufactured stale-`PROCESSING` row, confirming both the retry contract and that history stays
   visible through the existing read APIs.
-- **Full document deletion E2E coverage (Phase 2.8.4)** —
-  `tests/e2e/backend/test_document_deletion.py` drives `DELETE /api/v1/documents/{id}` and `GET
-  .../deletion` over real HTTP, then executes the scheduled job with a real
-  `DocumentDeletionWorker` against the real ephemeral Qdrant container and a real
-  `LocalFileStorage`. Covers all five required scenarios: successful deletion (vectors and object
-  removed, lifecycle becomes `deleted`, download returns `410`, chunks no longer searchable via a
-  real `search_similar()` call); a forced real Qdrant delete failure (lifecycle becomes
-  `deletion_failed`, the object stays downloadable, no false success); a forced storage failure
+- **Full document deletion E2E coverage (Phase 2.8.4)** — `tests/e2e/backend/documents/deletion/`,
+  organized by user-visible workflow rather than infrastructure: `test_successful_deletion.py`
+  drives `DELETE /api/v1/documents/{id}` and `GET .../deletion` over real HTTP, then executes the
+  scheduled job with a real `DocumentDeletionWorker` against the real ephemeral Qdrant container
+  and a real `LocalFileStorage` (vectors and object removed, lifecycle becomes `deleted`, download
+  returns `410`, chunks no longer searchable via a real `search_similar()` call);
+  `test_partial_failures.py` covers a forced real Qdrant delete failure (lifecycle becomes
+  `deletion_failed`, the object stays downloadable, no false success) and a forced storage failure
   followed by a successful retry (vectors removed once, storage cleanup completes on the second
-  attempt); two genuinely concurrent `DELETE` requests (`asyncio.gather`) converging on exactly
-  one active job; and a deleted document rejecting `POST .../ingestion/retry` with `409`.
+  attempt); `test_concurrent_requests.py` covers two genuinely concurrent `DELETE` requests
+  (`asyncio.gather`) converging on exactly one active job; `test_deleted_document_behavior.py`
+  covers a deleted document rejecting `POST .../ingestion/retry` with `409`. Shared
+  upload-and-ingest/execute-deletion helpers live in `support.py` within that same directory.
 
 Run it with:
 
@@ -1126,7 +1150,7 @@ or `MinioFileStorage` (S3-compatible, selected via `FILE_STORAGE_PROVIDER=minio`
 through one factory (`create_file_storage()`) exactly like the AI provider factory — see "Storage
 abstraction" above and "Storage Abstraction (Phase 2.6/2.7)" in ARCHITECTURE.md. MinIO is now
 covered end to end: real adapter tests (`tests/integration/test_minio_storage.py`), a real
-ingestion-pipeline test (`tests/integration/test_ingestion_worker_minio.py`), and a focused
+ingestion-pipeline test (`tests/integration/ingestion/test_worker_minio.py`), and a focused
 public backend E2E test (`tests/e2e/backend/test_minio_e2e.py`, `make test-e2e-backend-minio`)
 that drives `POST /api/v1/documents` → real MinIO → ingestion → `POST /api/v1/chat` through real
 HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
@@ -1134,14 +1158,14 @@ HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
 2.8.2) now let a client inspect a document's lifecycle and download its original content —
 `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `GET /api/v1/documents/{id}/ingestion`,
 `GET /api/v1/documents/{id}/failure`, `GET /api/v1/documents/{id}/download` — backed by a new
-`app/services/document_query_service.py` query layer and a derived `DocumentLifecycleStatus`
+`app/services/documents/query_service.py` query layer and a derived `DocumentLifecycleStatus`
 (`uploaded`/`pending`/`processing`/`indexed`/`failed`, plus `deleting`/`deletion_failed`/`deleted`
 as of Phase 2.8.4 below); see "Document read APIs and original download (Phase 2.8.2)" above and
 in ARCHITECTURE.md. **These five endpoints remain strictly read-only.** Document lifecycle
 *mutation* has two deliberate exceptions: `POST /api/v1/documents/{id}/ingestion/retry` (Phase
 2.8.3) schedules a new ingestion attempt for a FAILED or stale-PROCESSING document, backed by a
 real Postgres partial unique index (`ix_ingestion_jobs_one_active_per_document`) enforcing at
-most one active job per document, and `app/services/ingestion_retry_service.py`'s
+most one active job per document, and `app/services/ingestion/stale_recovery_service.py`'s
 `recover_stale_ingestion_jobs()` (triggered manually via `scripts/recover_stale_ingestion_jobs.py`
 / `make recover-stale-ingestion-jobs`, no HTTP endpoint) recovers `PROCESSING` jobs abandoned by a
 crashed worker — see "Ingestion retry and stale-job recovery" above and in ARCHITECTURE.md.

@@ -22,7 +22,7 @@ class Document(Base):
     """An uploaded document: original + stored filename, content type, size, storage path.
 
     The `embedding_*`/`chunking_version`/`collection_name`/`indexed_at` columns are populated
-    only after a *successful* indexing (or re-index) run — see app/services/index_registry.py.
+    only after a *successful* indexing (or re-index) run — see app/services/indexing/collection_registry.py.
     They stay NULL until then, and a failed re-index never updates them, so a document's stored
     indexing configuration always reflects the last version it was genuinely, successfully
     indexed with. Comparing these columns against the platform's current active

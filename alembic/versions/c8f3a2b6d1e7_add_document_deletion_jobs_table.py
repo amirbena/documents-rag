@@ -5,7 +5,7 @@ Revises: b7e2f6a1c9d4
 Create Date: 2026-07-13 14:00:00.000000
 
 Introduces `document_deletion_jobs` (Phase 2.8.4 full document deletion — see
-`app/models/document_deletion_job.py` and `app/services/document_deletion_service.py`) plus a
+`app/models/document_deletion_job.py` and `app/services/documents/deletion_service.py`) plus a
 partial unique index enforcing at most one active (`pending`/`processing`) deletion job per
 document, mirroring `b7e2f6a1c9d4`'s `ix_ingestion_jobs_one_active_per_document` pattern exactly.
 `DocumentDeletionJob.status` is stored as a plain VARCHAR (native_enum=False), so the partial
