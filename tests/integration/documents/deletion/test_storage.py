@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import Settings
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
-from app.services.document_deletion_service import DeletionErrorCode, DocumentDeletionWorker
+from app.services.documents.deletion_service import DeletionErrorCode
+from app.services.documents.deletion_worker import DocumentDeletionWorker
 from app.storage.local_storage import LocalFileStorage
 from app.storage.minio_storage import MinioFileStorage
 

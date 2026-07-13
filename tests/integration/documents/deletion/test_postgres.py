@@ -1,12 +1,10 @@
 """Postgres integration tests for full document deletion — real Testcontainers Postgres, real locks.
 
 Proves properties a fake session double cannot faithfully represent: the partial unique index
-actually rejecting a second concurrent active deletion job, real `SELECT ... FOR UPDATE`/
-`SKIP LOCKED` serializing genuinely concurrent scheduling/claim calls, append-only history, and
-lifecycle-status derivation against real rows. Mirrors
-tests/integration/test_ingestion_retry_postgres.py's fixtures/style exactly. Real Qdrant/MinIO
-cross-system cleanup is covered separately by test_document_deletion_qdrant.py /
-test_document_deletion_storage.py.
+actually rejecting a second concurrent active deletion job, append-only history, migration
+correctness, and lifecycle-status derivation against real rows. Genuinely concurrent scheduling/
+claim stress tests live separately in test_concurrency.py — see that module's docstring for why.
+Real Qdrant/MinIO cross-system cleanup is covered separately by test_qdrant.py / test_storage.py.
 """
 
 import asyncio
@@ -22,37 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.document_deletion_service import (
+from app.services.document_query_service import derive_lifecycle_status, get_latest_ingestion_job
+from app.services.documents.deletion_service import (
     DeletionRequestOutcome,
-    DocumentDeletionWorker,
     get_latest_deletion_job,
     request_document_deletion,
 )
-from app.services.document_query_service import derive_lifecycle_status, get_latest_ingestion_job
-from app.storage.errors import StorageObjectNotFoundError
-
-
-class _NoopVectorStore:
-    """A VectorStore whose deletes always succeed instantly — worker-claim tests don't need real Qdrant."""
-
-    async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
-        return None
-
-
-class _NoopFileStorage:
-    """A FileStorage whose delete always succeeds instantly (idempotent no-op, per contract)."""
-
-    async def delete(self, key: str) -> None:
-        return None
-
-    async def save(self, key: str, content: bytes) -> None:  # pragma: no cover - unused
-        raise NotImplementedError
-
-    async def read(self, key: str) -> bytes:
-        raise StorageObjectNotFoundError(key)
-
-    async def exists(self, key: str) -> bool:  # pragma: no cover - unused
-        return False
 
 
 @pytest.fixture(autouse=True)
@@ -210,81 +183,6 @@ async def test_partial_unique_index_allows_two_different_documents_each_active(
         DocumentDeletionJob(id=str(uuid.uuid4()), document_id=doc_b.id, status=DocumentDeletionStatus.PENDING)
     )
     await integration_db_session.commit()  # must not raise
-
-
-@pytest.mark.parametrize("run", range(5))
-async def test_concurrent_delete_requests_produce_exactly_one_active_job(
-    run: int, migrated_schema: None, postgres_url: str, integration_db_session: AsyncSession
-) -> None:
-    """Repeated (5x) concurrency stress: two genuinely concurrent DELETE schedulings -> one job."""
-    document = await _seed_document(integration_db_session)
-
-    engine = create_async_engine(postgres_url, future=True)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-    async def _request_with_own_session() -> DeletionRequestOutcome:
-        async with session_factory() as session:
-            result = await request_document_deletion(session, document.id)
-            return result.outcome
-
-    try:
-        outcomes = await asyncio.gather(_request_with_own_session(), _request_with_own_session())
-    finally:
-        await engine.dispose()
-
-    assert sorted(outcomes) == sorted(
-        [DeletionRequestOutcome.CREATED, DeletionRequestOutcome.ALREADY_ACTIVE]
-    )
-
-    active_rows = await integration_db_session.execute(
-        text(
-            "SELECT count(*) FROM document_deletion_jobs WHERE document_id = :id "
-            "AND status IN ('pending', 'processing')"
-        ),
-        {"id": document.id},
-    )
-    assert active_rows.scalar_one() == 1
-
-
-@pytest.mark.parametrize("run", range(3))
-async def test_concurrent_worker_claims_never_claim_the_same_job_twice(
-    run: int, migrated_schema: None, postgres_url: str, integration_db_session: AsyncSession
-) -> None:
-    """Repeated (3x) concurrency stress: two workers racing to claim distinct PENDING jobs."""
-    doc_a = await _seed_document(integration_db_session)
-    doc_b = await _seed_document(integration_db_session)
-    integration_db_session.add(
-        DocumentDeletionJob(id=str(uuid.uuid4()), document_id=doc_a.id, status=DocumentDeletionStatus.PENDING)
-    )
-    integration_db_session.add(
-        DocumentDeletionJob(id=str(uuid.uuid4()), document_id=doc_b.id, status=DocumentDeletionStatus.PENDING)
-    )
-    await integration_db_session.commit()
-
-    engine = create_async_engine(postgres_url, future=True)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-    async def _claim_with_own_session() -> str | None:
-        worker = DocumentDeletionWorker(vector_store=_NoopVectorStore(), file_storage=_NoopFileStorage())
-        async with session_factory() as session:
-            job = await worker.process_next_job(session)
-            return job.id if job is not None else None
-
-    try:
-        first_id, second_id = await asyncio.gather(
-            _claim_with_own_session(), _claim_with_own_session()
-        )
-    finally:
-        await engine.dispose()
-
-    assert first_id is not None
-    assert second_id is not None
-    assert first_id != second_id
-
-    completed = await integration_db_session.execute(
-        text("SELECT count(*) FROM document_deletion_jobs WHERE status = 'completed'")
-    )
-    assert completed.scalar_one() == 2
 
 
 async def test_deletion_history_is_append_only_across_retry(

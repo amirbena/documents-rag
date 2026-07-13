@@ -19,7 +19,7 @@ from app.models.index_collection import IndexCollection
 from app.models.vector_cleanup_job import VectorCleanupJob, VectorCleanupStatus
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorPoint
-from app.services.document_deletion_service import DocumentDeletionWorker
+from app.services.documents.deletion_worker import DocumentDeletionWorker
 
 _VECTOR_SIZE = 4
 

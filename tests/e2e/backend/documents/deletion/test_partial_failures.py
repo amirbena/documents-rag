@@ -1,33 +1,26 @@
-"""Backend E2E: full document deletion through the real public HTTP boundary (Phase 2.8.4).
+"""Backend E2E: document-deletion partial-failure workflows, through the real HTTP boundary.
 
 Same real-HTTP, real-Postgres/Qdrant, fake-AI-provider setup as
-test_upload_to_streaming_chat.py/test_ingestion_retry_recovery.py (see conftest.py). Drives
-DELETE /api/v1/documents/{id} and GET .../deletion over real HTTP, and executes the actual
-cross-system cleanup via a real DocumentDeletionWorker (real Qdrant, real tmp_path-rooted
-LocalFileStorage) — never a mock. Covers Part 10.5's five mandatory scenarios: successful
-deletion, vector-cleanup failure, storage-cleanup failure + retry-to-success, concurrent delete
-requests, and deleted-document ingestion-retry rejection.
+test_upload_to_streaming_chat.py/test_ingestion_retry_recovery.py (see tests/e2e/backend/
+conftest.py). Wraps the real QdrantVectorStore/LocalFileStorage to inject one controlled failure
+per scenario — never a fully-mocked dependency.
 """
-
-import asyncio
-from pathlib import Path
 
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
-from app.models.ingestion_job import IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
-from app.services.document_deletion_service import DocumentDeletionWorker
+from app.services.documents.deletion_worker import DocumentDeletionWorker
 from app.storage.errors import StorageUnavailableError
 from app.storage.local_storage import LocalFileStorage
-from tests.e2e.backend.fakes import FakeEmbeddingProvider
+from tests.e2e.backend.documents.deletion.support import process_pending_deletion, upload_and_ingest
 
 pytestmark = pytest.mark.e2e
 
-_VALID_CONTENT = b"Plain text content for the document deletion E2E test.\n"
+__all__ = ["process_pending_deletion"]  # re-exported fixture, used via pytest fixture injection
 
 
 class _FailingVectorStore:
@@ -70,27 +63,8 @@ class _FailOnceThenSucceedFileStorage:
 
 
 @pytest.fixture
-def process_pending_deletion(
-    e2e_session_factory: async_sessionmaker[AsyncSession],
-    tmp_path: Path,
-    isolated_test_state: None,
-):
-    """Run a real DocumentDeletionWorker against one pending deletion job (real Qdrant + storage)."""
-    settings = get_settings()
-    file_storage = LocalFileStorage(root=tmp_path)
-    vector_store = QdrantVectorStore(settings=settings)
-
-    async def _process():
-        async with e2e_session_factory() as session:
-            worker = DocumentDeletionWorker(vector_store=vector_store, file_storage=file_storage)
-            return await worker.process_next_job(session)
-
-    return _process
-
-
-@pytest.fixture
 def process_pending_deletion_with_failing_vector_store(
-    e2e_session_factory: async_sessionmaker[AsyncSession], tmp_path: Path, isolated_test_state: None
+    e2e_session_factory: async_sessionmaker[AsyncSession], tmp_path, isolated_test_state: None
 ):
     """Like process_pending_deletion, but vector cleanup fails for the active collection."""
     settings = get_settings()
@@ -109,7 +83,7 @@ def process_pending_deletion_with_failing_vector_store(
 
 @pytest.fixture
 def process_pending_deletion_with_flaky_storage(
-    e2e_session_factory: async_sessionmaker[AsyncSession], tmp_path: Path, isolated_test_state: None
+    e2e_session_factory: async_sessionmaker[AsyncSession], tmp_path, isolated_test_state: None
 ):
     """Like process_pending_deletion, but the first storage delete() call fails, then succeeds."""
     settings = get_settings()
@@ -125,76 +99,13 @@ def process_pending_deletion_with_flaky_storage(
     return _process
 
 
-async def _upload_and_ingest(app_client: httpx.AsyncClient, process_pending_job) -> str:
-    """Upload one document and drive it to COMPLETED through the real IngestionWorker."""
-    upload = await app_client.post(
-        "/api/v1/documents", files={"file": ("notes.txt", _VALID_CONTENT, "text/plain")}
-    )
-    assert upload.status_code == 202
-    document_id = upload.json()["document_id"]
-
-    result = await process_pending_job()
-    assert result is not None
-    assert result.status == IngestionStatus.COMPLETED
-    return document_id
-
-
-# --- Scenario 1: successful deletion -------------------------------------------------------------
-
-
-async def test_successful_deletion_removes_content_and_makes_it_unsearchable(
-    app_client: httpx.AsyncClient,
-    process_pending_job,
-    process_pending_deletion,
-    fake_embedding_provider: FakeEmbeddingProvider,
-) -> None:
-    """Upload -> ingest -> searchable -> DELETE -> worker runs -> deleted, 410, not searchable."""
-    document_id = await _upload_and_ingest(app_client, process_pending_job)
-
-    settings = get_settings()
-    active_config = get_active_embedding_config(settings)
-    vector_store = QdrantVectorStore(settings=settings)
-    query_vector = (await fake_embedding_provider.embed(["notes"]))[0]
-
-    before = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
-    assert any(result.document_id == document_id for result in before)
-
-    delete_response = await app_client.delete(f"/api/v1/documents/{document_id}")
-    assert delete_response.status_code == 202
-    assert delete_response.json()["created"] is True
-
-    deletion_result = await process_pending_deletion()
-    assert deletion_result is not None
-    assert deletion_result.status.value == "completed"
-
-    detail = await app_client.get(f"/api/v1/documents/{document_id}")
-    assert detail.status_code == 200
-    assert detail.json()["status"] == "deleted"
-
-    download = await app_client.get(f"/api/v1/documents/{document_id}/download")
-    assert download.status_code == 410
-
-    after = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
-    assert all(result.document_id != document_id for result in after)
-
-    status_response = await app_client.get(f"/api/v1/documents/{document_id}/deletion")
-    assert status_response.status_code == 200
-    body = status_response.json()
-    assert body["status"] == "completed"
-    assert body["vector_cleanup_completed"] is True
-    assert body["storage_cleanup_completed"] is True
-
-
-# --- Scenario 2: vector cleanup failure ------------------------------------------------------------
-
-
 async def test_vector_cleanup_failure_leaves_document_available_not_deleted(
     app_client: httpx.AsyncClient,
     process_pending_job,
     process_pending_deletion_with_failing_vector_store,
 ) -> None:
     """A partial vector-cleanup failure -> deletion_failed lifecycle; object stays available."""
-    document_id = await _upload_and_ingest(app_client, process_pending_job)
+    document_id = await upload_and_ingest(app_client, process_pending_job)
 
     delete_response = await app_client.delete(f"/api/v1/documents/{document_id}")
     assert delete_response.status_code == 202
@@ -223,9 +134,6 @@ async def test_vector_cleanup_failure_leaves_document_available_not_deleted(
     assert "simulated" not in body["safe_message"]
 
 
-# --- Scenario 3: storage cleanup failure, then successful retry ------------------------------------
-
-
 async def test_storage_failure_then_retry_succeeds(
     app_client: httpx.AsyncClient,
     process_pending_job,
@@ -233,7 +141,7 @@ async def test_storage_failure_then_retry_succeeds(
     process_pending_deletion,
 ) -> None:
     """Vectors removed, storage fails -> deletion_failed; retry -> storage succeeds -> deleted."""
-    document_id = await _upload_and_ingest(app_client, process_pending_job)
+    document_id = await upload_and_ingest(app_client, process_pending_job)
 
     delete_response = await app_client.delete(f"/api/v1/documents/{document_id}")
     assert delete_response.status_code == 202
@@ -261,44 +169,3 @@ async def test_storage_failure_then_retry_succeeds(
 
     download = await app_client.get(f"/api/v1/documents/{document_id}/download")
     assert download.status_code == 410
-
-
-# --- Scenario 4: concurrent delete requests ---------------------------------------------------------
-
-
-async def test_concurrent_delete_requests_reference_the_same_deletion_job(
-    app_client: httpx.AsyncClient, process_pending_job
-) -> None:
-    """Two DELETE calls for the same document must reference exactly one active deletion job."""
-    document_id = await _upload_and_ingest(app_client, process_pending_job)
-
-    first, second = await asyncio.gather(
-        app_client.delete(f"/api/v1/documents/{document_id}"),
-        app_client.delete(f"/api/v1/documents/{document_id}"),
-    )
-
-    assert first.status_code == 202
-    assert second.status_code == 202
-    assert first.json()["deletion_job_id"] == second.json()["deletion_job_id"]
-    # Exactly one of the two responses reports having created the job.
-    assert sorted([first.json()["created"], second.json()["created"]]) == [False, True]
-
-
-# --- Scenario 5: deleted document rejects ingestion retry -------------------------------------------
-
-
-async def test_deleted_document_rejects_ingestion_retry(
-    app_client: httpx.AsyncClient, process_pending_job, process_pending_deletion
-) -> None:
-    """A fully deleted document must reject POST .../ingestion/retry with 409, never resurrect it."""
-    document_id = await _upload_and_ingest(app_client, process_pending_job)
-
-    delete_response = await app_client.delete(f"/api/v1/documents/{document_id}")
-    assert delete_response.status_code == 202
-
-    deletion_result = await process_pending_deletion()
-    assert deletion_result is not None
-    assert deletion_result.status.value == "completed"
-
-    retry_response = await app_client.post(f"/api/v1/documents/{document_id}/ingestion/retry")
-    assert retry_response.status_code == 409

@@ -1,14 +1,14 @@
-"""A minimal in-memory AsyncSession double for document_deletion_service unit tests.
+"""A minimal in-memory AsyncSession double for deletion_service/deletion_worker unit tests.
 
 Dispatches each SELECT by inspecting the compiled SQL's target table plus its WHERE clause,
 mirroring tests/support/fake_ingestion_retry_session.py's style — no SQLite or any other real
 database engine is used, since deletion scheduling/claiming depends on Postgres-specific
 row-locking semantics a fake session cannot faithfully execute. This fake only simulates the
 filter/order/limit logic and the partial-unique-index/commit-time IntegrityError in plain Python;
-real locking is covered separately by tests/integration/test_document_deletion_postgres.py.
+real locking is covered separately by tests/integration/documents/deletion/test_postgres.py.
 
-Supports the four models document_deletion_service and its dependency
-(`index_registry.delete_all_tracked_document_vectors`) touch: Document, IngestionJob,
+Supports the four models app.services.documents.deletion_service/deletion_worker and their
+dependency (`index_registry.delete_all_tracked_document_vectors`) touch: Document, IngestionJob,
 DocumentDeletionJob, VectorCleanupJob.
 """
 
