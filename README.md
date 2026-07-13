@@ -348,8 +348,8 @@ written before this feature remain readable.
 Five read-only endpoints let you inspect a document's lifecycle and download its original
 content — see "Document read APIs and original download (Phase 2.8.2)" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for full contract details, the lifecycle-status derivation
-table, and the 404/409/503 mapping rationale. None of them mutate anything (no retry/delete/
-re-index/reconciliation endpoint exists yet).
+table, and the 404/409/503 mapping rationale. None of them mutate anything (no delete/re-index/
+reconciliation endpoint exists yet — retry is a separate, mutating endpoint, see below).
 
 ```bash
 # List (paginated, newest first)
@@ -374,6 +374,27 @@ Unicode filenames survive via a `filename*=UTF-8''...` percent-encoded form alon
 fallback). `404` if the document doesn't exist, `409` if the document row exists but its storage
 object is missing (a real inconsistency, not "not found"), `503` if the storage backend itself is
 unreachable.
+
+### Ingestion retry and stale-job recovery
+
+See "Ingestion retry and stale-job recovery (Phase 2.8.3)" in [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full decision table, the one-active-job-per-document Postgres constraint, and the
+vector-idempotency reasoning.
+
+```bash
+# Retry a FAILED (or stale-PROCESSING) document — 202 + new job if scheduled, 200 if an
+# already-active job exists, 404 if the document is missing, 409 if it's already indexed.
+curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/ingestion/retry"
+
+# Run one stale-PROCESSING-job recovery batch (manual/optional — never run by make verify/CI):
+make recover-stale-ingestion-jobs
+```
+
+Retry never deletes or resets an existing `IngestionJob` row — history is append-only, and a new
+attempt always means a brand-new `PENDING` row for the existing `IngestionWorker` to pick up.
+Retrying doesn't require re-uploading the original file (the same `FileStorage` object is reused)
+or any vector-cleanup step (Qdrant point IDs are deterministic per document/chunk, so a retry's
+successful upsert naturally overwrites what a first successful attempt would have written).
 
 ### Ingestion worker
 
@@ -834,7 +855,17 @@ make test-storage-integration  # MinIO integration suite only (needs Docker)
 make test-minio             # MinIO unit + integration tests (needs Docker for the latter)
 make test-document-read     # document read/download API unit tests (no Docker)
 make test-document-read-integration  # document read/download Postgres + MinIO + E2E coverage (needs Docker)
+make test-ingestion-retry   # retry/stale-recovery unit tests (no Docker)
+make test-ingestion-retry-integration  # retry/stale-recovery Postgres + Qdrant coverage (needs Docker)
 ```
+
+- **Ingestion retry/stale-recovery coverage (Phase 2.8.3)** —
+  `tests/integration/test_ingestion_retry_postgres.py` (real Postgres: the partial unique index
+  actually rejecting a second active job, two genuinely concurrent retry requests via
+  `asyncio.gather` over independent sessions producing exactly one new active job, two concurrent
+  stale-recovery calls never recovering the same row twice, history preservation after a retry)
+  plus one real-Postgres-and-Qdrant test forcing a first attempt to fail, confirming zero Qdrant
+  points exist, then retrying to a real success — see `make test-ingestion-retry-integration`.
 
 ## Backend E2E tests
 
@@ -1044,9 +1075,18 @@ HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
 `app/services/document_query_service.py` query layer and a derived `DocumentLifecycleStatus`
 (`uploaded`/`pending`/`processing`/`indexed`/`failed`); see "Document read APIs and original
 download (Phase 2.8.2)" above and in ARCHITECTURE.md. **Nothing is mutated by any of these five
-endpoints** — there is still no retry, delete, re-index, or reconciliation endpoint. Document
-lifecycle *mutation* (delete, retry, reconciliation), orphan-object cleanup, hash-based
-deduplication, frontend E2E, a real-Ollama smoke suite, and a real multilingual-model evaluation
-run remain future milestones — see "Integration tests" above, and "Test architecture"/"What is
-intentionally not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
-what's intentionally deferred.
+endpoints** — there is still no delete, re-index, or reconciliation endpoint. Document lifecycle
+*mutation* now has one deliberate exception: `POST /api/v1/documents/{id}/ingestion/retry` (Phase
+2.8.3) schedules a new ingestion attempt for a FAILED or stale-PROCESSING document, backed by a
+real Postgres partial unique index (`ix_ingestion_jobs_one_active_per_document`) enforcing at
+most one active job per document, and `app/services/ingestion_retry_service.py`'s
+`recover_stale_ingestion_jobs()` (triggered manually via `scripts/recover_stale_ingestion_jobs.py`
+/ `make recover-stale-ingestion-jobs`, no HTTP endpoint) recovers `PROCESSING` jobs abandoned by a
+crashed worker — see "Ingestion retry and stale-job recovery" above and in ARCHITECTURE.md.
+Retry never re-uploads content or touches Qdrant directly — vector idempotency is free by
+construction (deterministic chunk/point IDs), verified against a real ephemeral Qdrant container.
+Delete, bulk re-index/reconciliation, orphan-object cleanup, hash-based deduplication, frontend
+E2E, a real-Ollama smoke suite, a real multilingual-model evaluation run, and a real scheduler
+deployment for stale recovery remain future milestones — see "Integration tests" above, and "Test
+architecture"/"What is intentionally not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full list of what's intentionally deferred.

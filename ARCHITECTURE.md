@@ -232,8 +232,10 @@ picks up and resolves the `pending` job it creates.
 Five strictly read-only endpoints (`app/api/v1/routes/documents.py`) let a client inspect a
 document's lifecycle and download its original content. **None of them mutate anything** —
 Postgres, object storage, Qdrant, `IngestionJob` rows, and `VectorCleanupJob` rows are all
-untouched by every route in this section. There is no retry, delete, re-index, or reconciliation
-endpoint in this codebase yet.
+untouched by every route in this section. `POST /api/v1/documents/{document_id}/ingestion/retry`
+(Phase 2.8.3, see "Ingestion retry and stale-job recovery" below) is the one mutating route this
+module adds; there is still no delete, re-index (a separate existing endpoint/service), or
+reconciliation endpoint.
 
 - `GET /api/v1/documents?limit=&offset=` — one page of documents (`created_at` DESC, `id` DESC
   tiebreaker), each with its derived lifecycle `status` and total row count. `limit` defaults to
@@ -310,13 +312,148 @@ string to a client — the `/failure` endpoint's `safe_message` is always one fi
 constant ("Document ingestion failed. See server logs for the underlying error."), mirroring
 `app/api/v1/routes/chat.py`'s `_SAFE_ERROR_MESSAGE` pattern rather than attempting to pattern-match
 "safe" substrings out of arbitrary exception text. The raw message stays in Postgres for operator/
-log inspection. `IngestionFailureResponse` has no `retryable` field — there is no retry endpoint
-or attempt-count tracking in this codebase yet, so a boolean here would be fabricated rather than
-genuinely derived.
+log inspection. `IngestionFailureResponse` has no `retryable` field — this codebase has no
+attempt-count tracking, so a boolean here would be fabricated rather than genuinely derived. This
+sanitization rule now extends to retry/recovery too (Phase 2.8.3): a stale-recovered job's
+`error_message` (the fixed `STALE_RECOVERY_ERROR_PREFIX` marker — see below) is stored in
+Postgres exactly like any other `error_message`, and passes through the same
+`sanitize_ingestion_error()` before ever reaching an API response — no new sanitization path was
+added, and none was needed.
 
 **N+1 avoidance**: `GET /api/v1/documents` resolves every page row's latest job with exactly one
 batched query (`get_latest_jobs_for_documents()` — `WHERE document_id IN (...)`, grouped by
 `document_id` in Python), never one query per row.
+
+## Ingestion retry and stale-job recovery (Phase 2.8.3)
+
+`app/services/ingestion_retry_service.py` adds two Postgres-only, transactional operations on top
+of the existing `IngestionWorker`/`IngestionJob` model — neither touches `FileStorage` or a vector
+store directly:
+
+- **`retry_ingestion()`** — the service behind `POST /api/v1/documents/{document_id}/ingestion/retry`.
+- **`recover_stale_ingestion_jobs()`** — an internal maintenance operation with no HTTP endpoint,
+  invoked by the standalone `scripts/recover_stale_ingestion_jobs.py` (`make
+  recover-stale-ingestion-jobs`).
+
+### `POST /api/v1/documents/{document_id}/ingestion/retry`
+
+Decision table, driven by the document's *latest* `IngestionJob` (same `created_at` DESC, `id`
+DESC ordering as the read APIs above):
+
+| Latest job | Stale? | Outcome | HTTP |
+| --- | --- | --- | --- |
+| Document doesn't exist | — | `DOCUMENT_NOT_FOUND` | `404` |
+| none | — | `CREATED` (treated like FAILED — unreachable via the normal upload flow, same defensive stance as `DocumentLifecycleStatus.UPLOADED` above) | `202` |
+| `PENDING` | — | `ALREADY_ACTIVE` (existing job returned, nothing new scheduled) | `200` |
+| `PROCESSING` | no | `ALREADY_ACTIVE` | `200` |
+| `PROCESSING` | yes (`> INGESTION_STALE_AFTER_SECONDS`) | `CREATED` — the stale row is flipped to `FAILED` in the *same commit* as the new job (see below) | `202` |
+| `FAILED` | — | `CREATED`; the FAILED row is never modified | `202` |
+| `COMPLETED` | — | `ALREADY_COMPLETED` (re-index is a separate endpoint/service, not this one) | `409` |
+
+A `CREATED` response inserts a brand-new `PENDING` `IngestionJob` row for the existing
+`IngestionWorker` to claim and process exactly like a first attempt — retry never resets,
+deletes, or replays an old row's status; ingestion history is append-only.
+
+**Why a stale-PROCESSING retry must flip the old row, unlike a FAILED retry**: the partial unique
+index below allows at most one `PENDING`/`PROCESSING` row per document. A `FAILED` row is already
+outside that set, so a new `PENDING` insert alongside it is always legal. A still-`PROCESSING` row
+is *inside* that set — inserting a new `PENDING` row while it stays `PROCESSING` would violate the
+index outright. So `retry_ingestion()` transitions a stale `PROCESSING` row to `FAILED` (using the
+identical fixed `STALE_RECOVERY_ERROR_PREFIX` marker `recover_stale_ingestion_jobs()` uses) as
+part of the same commit that creates the replacement — a client-triggered "reactive" recovery and
+the background "proactive" one (below) are indistinguishable in stored data, just triggered from
+two different call sites.
+
+### One active job per document — a real Postgres constraint
+
+At most one `IngestionJob` per `document_id` may be `PENDING`/`PROCESSING` — enforced by a real
+partial unique index, `ix_ingestion_jobs_one_active_per_document` (migration `b7e2f6a1c9d4`,
+`ON ingestion_jobs (document_id) WHERE status IN ('pending', 'processing')`), not merely
+application logic. `IngestionStatus` is stored as a plain `VARCHAR` (`native_enum=False`), so the
+partial index's `WHERE` clause matches the lowercase string values directly.
+
+The migration also runs a defensive, idempotent cleanup pass immediately before creating the
+index: for any document somehow already having more than one active row, it keeps only the most
+recently created one active and marks the rest `FAILED` with a fixed migration-reason message.
+Given the codebase at the time of this migration — `upload_document()` creates exactly one
+`PENDING` job per upload, and no prior retry/re-index path could create a second job while one was
+already active — this is believed genuinely unreachable in any installation that only ever ran
+code up to this PR; the cleanup pass exists so the migration cannot fail outright even if that
+assumption turns out to be wrong for some out-of-band data, without silently dropping a row.
+
+**Concurrency**: `retry_ingestion()` takes a blocking `SELECT ... FOR UPDATE` on the document's
+existing job rows before deciding whether to insert, so two concurrent retries for an
+already-active document serialize instead of racing. A residual race remains when the latest job
+is `FAILED`/absent/stale-`PROCESSING` — inserting a brand-new row is never covered by a lock taken
+on rows that already existed when the lock was acquired — closed by catching the unique index's
+`IntegrityError` at commit time and re-reading/returning the now-existing active job instead of
+raising. Proven against real Postgres (not a fake session) by
+`tests/integration/test_ingestion_retry_postgres.py::test_two_concurrent_retries_produce_exactly_one_new_active_job`,
+which runs two independent `AsyncSession`s racing via `asyncio.gather()`.
+
+### `recover_stale_ingestion_jobs()`
+
+Finds `PROCESSING` jobs whose row hasn't been updated in `INGESTION_STALE_AFTER_SECONDS`, locks up
+to `INGESTION_RECOVERY_BATCH_SIZE` of them with `SELECT ... FOR UPDATE SKIP LOCKED` (`updated_at
+ASC, id ASC`, mirroring `IngestionWorker._claim_next_pending_job()`'s exact locking pattern so two
+concurrent recovery runs never both recover the same row), marks each `FAILED` (fixed
+`STALE_RECOVERY_ERROR_PREFIX` message, never deleted/reset), and creates one fresh `PENDING`
+replacement per recovered row. Idempotent — a job it already recovered is `PROCESSING` no longer,
+so a later call never re-selects it.
+
+**Stale detection is an approximation, not a liveness proof.** `IngestionJob` has no dedicated
+heartbeat column — `updated_at` (`onupdate=func.now()`) is the only available signal. A
+`PROCESSING` job whose `updated_at` is older than the threshold is *probably* abandoned
+(crashed/killed worker), but a genuinely slow-but-alive worker looks identical.
+`INGESTION_STALE_AFTER_SECONDS` (default `900`) should be set well above the platform's expected
+worst-case single-document processing time.
+
+**Trigger mechanism**: `scripts/recover_stale_ingestion_jobs.py` (`make
+recover-stale-ingestion-jobs`) — a standalone script, not an `app/cli/` package (this repo has no
+existing CLI-package convention; introducing one for a single operation would be more machinery
+than warranted), mirroring `scripts/smoke_multilingual_real.py`'s style. It is optional/manual,
+never invoked by `make verify`/`make test*`/CI — the same operational boundary
+`smoke-multilingual-real` already establishes for real-provider checks. A real scheduler
+deployment (cron, Kubernetes CronJob, etc.) wiring this script to run periodically is intentionally
+out of scope for this phase.
+
+### Vector idempotency is free — no cleanup mechanism needed for retry
+
+`IngestionWorker._default_process_document()` performs exactly one embedding call followed by
+exactly one `vector_store.upsert_vectors()` call; if extraction/chunking/embedding raises, that
+happens strictly before `upsert_vectors()` is ever reached — **a `FAILED` (or stale-recovered) job
+never wrote any vectors to Qdrant.** Chunk IDs (`f"{document.id}-{chunk_index}"`,
+`app/services/document_chunker.py`) and their derived Qdrant point IDs
+(`uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)`, `to_vector_point()` in
+`app/services/ingestion_worker.py`) are fully deterministic for a given document, so a retry's
+eventual successful upsert naturally overwrites the same point IDs a first successful attempt
+would have used — Qdrant's own upsert-by-ID semantics make this idempotent with no extra
+mechanism. No delete-before-retry step, temporary-collection-swap, or new cleanup logic was added
+for this phase, and none is needed.
+
+This was verified against real Qdrant, not just asserted:
+`tests/integration/test_ingestion_retry_postgres.py::
+test_retry_after_real_failure_writes_no_orphaned_vectors_then_succeeds` forces a real first
+attempt to fail (an embedding-provider error injected before `upsert_vectors()`), confirms zero
+points exist in the real ephemeral Qdrant container for that document, then retries and lets the
+real `IngestionWorker` process the new job with a working embedding provider, confirming it
+completes and its points are searchable via `search_similar()`. The one edge case this does *not*
+cover —
+orphaned points if chunking parameters change *between two genuinely-successful* indexing runs of
+the same document with different chunk counts — is structurally unreachable within retry/recovery's
+scope: both only ever fire for a job that never reached `upsert_vectors()`. That scenario belongs
+to a future chunking-upgrade migration, deliberately out of scope here (see "Boundaries" in
+CLAUDE.md).
+
+### `IngestionWorker` claim safety — confirmed, not modified
+
+`IngestionWorker._claim_next_pending_job()`'s existing `SELECT ... FOR UPDATE SKIP LOCKED` claim
+(see "Ingestion worker" below) was reviewed and found to already satisfy every property this phase
+needed: atomic claim, `PROCESSING` committed before expensive work starts, a crashed worker leaves
+a recoverable `PROCESSING` row (which is exactly what stale recovery targets), and a
+`COMPLETED`/`FAILED` job is never reclaimed. It was not modified, and does not need to be — retry
+and recovery both only ever create a new `PENDING` row for the existing worker to pick up through
+its unchanged claim path.
 
 ## Ingestion worker
 
@@ -1323,6 +1460,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 | `MINIO_REGION`             | *(unset)*                                                              | Optional S3 region hint passed to the `minio` SDK client |
 | `MINIO_PRESIGNED_URL_EXPIRY_SECONDS` | `3600`                                                       | Expiry for `MinioFileStorage.generate_download_url()`'s presigned GET URLs |
 | `MINIO_CREATE_BUCKET_IF_MISSING` | `true`                                                           | Whether `ensure_bucket()` creates the configured bucket when missing, vs. failing readiness |
+| `INGESTION_STALE_AFTER_SECONDS` | `900`                                                             | Seconds a `PROCESSING` `IngestionJob`'s row can go untouched before it's treated as stale by `retry_ingestion()`/`recover_stale_ingestion_jobs()` — an approximation, not a liveness proof (see "Ingestion retry and stale-job recovery") |
+| `INGESTION_RECOVERY_BATCH_SIZE` | `50`                                                              | Maximum stale `PROCESSING` jobs `recover_stale_ingestion_jobs()` recovers per call/script run |
 
 ## Current boundaries
 
@@ -1332,8 +1471,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - `app/api/v1/routes` — versioned business API routers: `GET /health` (legacy, see "Operational
   Health Contract" above), `GET /providers/ollama/health`, `POST /documents` plus the five
   read-only `GET /documents*` routes (see "Document upload and ingestion job skeleton" and
-  "Document read APIs and original download (Phase 2.8.2)" above), and `POST /chat` (see
-  "Streaming chat endpoint" above) — `chat.py` is the only router that depends on `app/rag`.
+  "Document read APIs and original download (Phase 2.8.2)" above), `POST
+  /documents/{document_id}/ingestion/retry` (see "Ingestion retry and stale-job recovery (Phase
+  2.8.3)" above — the one mutating route in `documents.py`), and `POST /chat` (see "Streaming
+  chat endpoint" above) — `chat.py` is the only router that depends on `app/rag`.
 - `app/core` — configuration and cross-cutting concerns, plus `version.py` (`SERVICE_NAME`/
   `SERVICE_VERSION` — the single source of truth for both the FastAPI app's own metadata and the
   unversioned platform health responses).
@@ -1372,7 +1513,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   `reindex_service.py`'s `reindex_document()`, the backend re-index capability; and
   `document_query_service.py`, the read-only query/lifecycle-derivation layer backing the five
   `GET /documents*` routes (see "Document read APIs and original download (Phase 2.8.2)" above)
-  — never writes to Postgres, object storage, or Qdrant.
+  — never writes to Postgres, object storage, or Qdrant; and `ingestion_retry_service.py`'s
+  `retry_ingestion()`/`recover_stale_ingestion_jobs()` (see "Ingestion retry and stale-job
+  recovery (Phase 2.8.3)" above) — the one write path in this file's list that touches
+  `IngestionJob`, and strictly Postgres-only (never `FileStorage`, never a vector store).
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
@@ -1463,11 +1607,13 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - An LLM-based (as opposed to rule-based) question router
 - Conversation memory / multi-turn context (in prompt building or the orchestrator)
 - A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
-- A document-deletion, retry, re-index, or reconciliation endpoint, or an orphan-object cleanup
-  worker, or hash-based content deduplication — Phase 2.8.2 added the five *read-only* document
-  APIs (list/detail/ingestion/failure/download — see "Document read APIs and original download"
-  above), but no public route calls `FileStorage.delete()` or mutates a `Document`/`IngestionJob`
-  row in any way; those remain future milestones
+- A document-deletion endpoint, an orphan-object cleanup worker, hash-based content
+  deduplication, a bulk re-index endpoint, or a real scheduler deployment for stale-job recovery
+  (`scripts/recover_stale_ingestion_jobs.py` is manual-trigger only — see "Ingestion retry and
+  stale-job recovery (Phase 2.8.3)" above) — those remain future milestones. Retry
+  (`POST /documents/{document_id}/ingestion/retry`, Phase 2.8.3) is now implemented; no route
+  calls `FileStorage.delete()` or mutates a `Document` row (only `IngestionJob` rows are ever
+  written by retry/recovery)
 - AWS S3 or Cloudflare R2 as a `FileStorage` implementation, and presigned multipart uploads —
   `MinioFileStorage` covers MinIO/S3-compatible storage generically, but a dedicated S3/R2
   implementation and multipart upload support are future work, not implemented in this phase
