@@ -248,9 +248,17 @@ def get_settings() -> Settings:
 - **A legacy-vector cleanup failure is tracked, never silently dropped or conflated with
   re-index failure.** Persist it as a `VectorCleanupJob` (`app/models/vector_cleanup_job.py`) and
   expose a retryable `retry_cleanup_job()` — retried regardless of whether the document itself is
-  still stale, since cleanup success/failure is independent of `is_document_stale()`. Document
-  deletion (`delete_document_vectors()`) must clean every collection tracked by a pending/failed
-  cleanup job for that document, not just its current one.
+  still stale, since cleanup success/failure is independent of `is_document_stale()`. Full
+  document deletion (`delete_all_tracked_document_vectors()`) must clean every collection tracked
+  by a pending/failed cleanup job for that document, not just its current one, and must attempt
+  every resolved collection independently — one collection's delete failing must never stop,
+  skip, or abort attempts against the others, or silently fall back to active-only semantics.
+- **Any user-facing or lifecycle-level document deletion must call
+  `delete_all_tracked_document_vectors(..., session)`.** `delete_current_document_vectors(...)`
+  (no `session` parameter, active-collection only) is only valid for explicitly scoped
+  active-collection operations such as rollback or current-index repair — never for a real
+  document-deletion path, where leaving a historical collection's vectors behind would be a
+  silent partial deletion.
 - **Never claim the Qdrant/PostgreSQL boundary is atomic, or that a failed attempt is
   indistinguishable from one that never ran.** A Qdrant write can succeed before a Postgres
   commit fails; `reindex_document()` rolls back and expires the `Document` in that case, but the
