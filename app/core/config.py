@@ -93,6 +93,24 @@ class Settings(BaseSettings):
     )
     minio_create_bucket_if_missing: bool = Field(default=True, alias="MINIO_CREATE_BUCKET_IF_MISSING")
 
+    # Retry/stale-recovery (Phase 2.8.3) — see app/services/ingestion_retry_service.py.
+    # A PROCESSING IngestionJob whose updated_at is older than this is treated as an approximate
+    # "stale" signal (the job's row hasn't been touched since it was claimed) — not proof the
+    # worker died, since a slow-but-alive worker looks identical. 900s (15 minutes) is a
+    # deliberately generous default so a normally-slow document is never falsely recovered.
+    ingestion_stale_after_seconds: int = Field(default=900, alias="INGESTION_STALE_AFTER_SECONDS")
+    # Maximum number of stale PROCESSING jobs recovered per recover_stale_ingestion_jobs() call —
+    # bounds how much work one recovery run (script or future scheduler tick) does at once.
+    ingestion_recovery_batch_size: int = Field(default=50, alias="INGESTION_RECOVERY_BATCH_SIZE")
+
+    @field_validator("ingestion_stale_after_seconds", "ingestion_recovery_batch_size")
+    @classmethod
+    def _validate_positive_ingestion_recovery_settings(cls, value: int, info) -> int:
+        """Stale-threshold seconds and recovery batch size must both be positive integers."""
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return value
+
     @field_validator("vector_size")
     @classmethod
     def _validate_vector_size(cls, value: int) -> int:
