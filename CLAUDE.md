@@ -40,7 +40,12 @@ app/
 └── schemas/                        # Pydantic request/response models
 
 tests/
-├── unit/services/{documents,ingestion,indexing}/   # mirrors app/services/ 1:1 per production module
+├── unit/                            # every unit test lives here — nothing under tests/*.py directly
+│   ├── configuration/, core/, api/   # Settings/.env consistency, app.core, route-level tests
+│   ├── services/{documents,ingestion,indexing}/  # mirrors app/services/ 1:1 per production module
+│   ├── rag/, rag/{engines,prompts,providers}/    # mirrors app/rag/'s own subpackage split
+│   ├── storage/                      # mirrors app/storage/
+│   └── scripts/                      # tests for scripts/*.py contracts
 ├── integration/{documents,ingestion,indexing,storage,...}/  # feature + infrastructure contract
 ├── e2e/backend/{documents,ingestion,chat,multilingual,health}/  # user-visible workflow
 └── support/{documents,ingestion,indexing,storage}/  # feature-owned fakes/builders (≥2 consumers only)
@@ -96,12 +101,10 @@ contents. Import from the canonical module directly:
 
 ## 5. Test Ownership
 
-- **Unit** (`tests/unit/services/**`, plus a small number of established flat files at
-  `tests/*.py` for route-level tests — e.g. `test_document_upload.py`,
-  `test_document_read_routes.py`, `test_document_deletion_routes.py`,
-  `test_ingestion_retry_routes.py`) — mirrors production modules 1:1. Fakes/mocks only, no
-  Docker. Extending the nested `tests/unit/services/` convention to other areas is a deliberate
-  future decision, not implied by its existing use.
+- **Unit** (`tests/unit/**` — nothing lives directly under `tests/*.py` anymore) — mirrors
+  production modules 1:1, organized by the same top-level areas as `app/`: `configuration/`,
+  `core/`, `api/` (route-level tests), `services/{documents,ingestion,indexing}/`,
+  `rag/`, `rag/{engines,prompts,providers}/`, `storage/`, `scripts/`. Fakes/mocks only, no Docker.
 - **Integration** (`tests/integration/**`) — grouped by feature directory
   (`documents/{read,download,deletion}/`, `ingestion/`, `indexing/`) with one file per
   infrastructure contract inside (`test_postgres.py`, `test_minio.py`, `test_concurrency.py`,

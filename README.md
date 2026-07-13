@@ -839,6 +839,32 @@ before committing. `make verify` never runs the Testcontainers-based integration
 
 Run `make help` any time for a quick summary of these commands.
 
+## Unit tests
+
+Every unit test lives under `tests/unit/` — nothing sits directly under `tests/*.py` anymore.
+The layout mirrors `app/`'s own package structure, one directory per top-level concern:
+
+```
+tests/unit/
+├── configuration/   # Settings/.env.example consistency
+├── core/            # app.core.config
+├── api/             # route-level tests (dependency-override style, fake DB session)
+├── services/
+│   ├── documents/   # mirrors app/services/documents/ 1:1
+│   ├── ingestion/   # mirrors app/services/ingestion/ 1:1
+│   └── indexing/    # mirrors app/services/indexing/ 1:1
+├── rag/             # app.rag.decision/orchestrator/prompt_builder/retrieval_service/etc.
+│   ├── engines/     # mirrors app/rag/engines/ 1:1
+│   ├── prompts/     # mirrors app/rag/prompts/ 1:1
+│   └── providers/   # mirrors app/rag/providers/ 1:1
+├── storage/         # mirrors app/storage/ 1:1
+└── scripts/         # tests for scripts/*.py contracts
+```
+
+Fakes/mocks only — no Docker, no Testcontainers, no real Postgres/Qdrant/MinIO/Ollama. This is
+what `make test`/`make verify` run (`pytest -m "not integration and not e2e and not slow" -q`,
+which still discovers everything under `tests/unit/` via `testpaths = ["tests"]`).
+
 ## Integration tests
 
 A separate, Testcontainers-based integration suite lives under `tests/integration/` (marked
