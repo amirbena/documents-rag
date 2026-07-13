@@ -90,12 +90,12 @@ test-e2e-backend-minio:
 	pytest -m e2e tests/e2e/backend/test_minio_e2e.py -q
 
 test-rag-engines:
-	pytest tests/test_rag_engine_factory.py tests/test_custom_rag_engine.py tests/test_langchain_rag_engine.py tests/test_langchain_adapters.py tests/test_prompt_provider_engine_parity.py -q
+	pytest tests/unit/rag/engines/test_rag_engine_factory.py tests/unit/rag/engines/test_custom_rag_engine.py tests/unit/rag/engines/test_langchain_rag_engine.py tests/unit/rag/engines/test_langchain_adapters.py tests/unit/rag/test_prompt_provider_engine_parity.py -q
 	pytest -m integration tests/integration/test_langchain_rag_engine_integration.py -q
 	pytest -m e2e tests/e2e/backend/test_rag_engine_parity.py -q
 
 test-multilingual-rag:
-	pytest tests/test_embedding_config.py tests/unit/services/indexing/test_collection_registry.py tests/unit/services/indexing/test_vector_deletion_service.py tests/unit/services/indexing/test_cleanup_job_service.py tests/unit/services/indexing/test_reindex_service.py tests/test_language_detector.py tests/test_prompt_catalog.py tests/test_prompt_provider_engine_parity.py -q
+	pytest tests/unit/rag/test_embedding_config.py tests/unit/services/indexing/test_collection_registry.py tests/unit/services/indexing/test_vector_deletion_service.py tests/unit/services/indexing/test_cleanup_job_service.py tests/unit/services/indexing/test_reindex_service.py tests/unit/rag/test_language_detector.py tests/unit/rag/prompts/test_prompt_catalog.py tests/unit/rag/test_prompt_provider_engine_parity.py -q
 	pytest -m integration tests/integration/test_multilingual_indexing.py -q
 	pytest -m e2e tests/e2e/backend/test_multilingual_matrix.py -q
 
