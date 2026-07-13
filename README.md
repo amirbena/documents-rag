@@ -343,6 +343,38 @@ row carries a preference for beyond its own already-persisted `storage_provider`
 "Backward compatibility for pre-migration documents" in ARCHITECTURE.md for how documents
 written before this feature remain readable.
 
+### Document read APIs and original download
+
+Five read-only endpoints let you inspect a document's lifecycle and download its original
+content — see "Document read APIs and original download (Phase 2.8.2)" in
+[ARCHITECTURE.md](ARCHITECTURE.md) for full contract details, the lifecycle-status derivation
+table, and the 404/409/503 mapping rationale. None of them mutate anything (no retry/delete/
+re-index/reconciliation endpoint exists yet).
+
+```bash
+# List (paginated, newest first)
+curl "http://localhost:8000/api/v1/documents?limit=20&offset=0"
+
+# Detail
+curl "http://localhost:8000/api/v1/documents/<document_id>"
+
+# Latest ingestion job status (200 with null fields if no job exists yet)
+curl "http://localhost:8000/api/v1/documents/<document_id>/ingestion"
+
+# Latest failed ingestion job, with a sanitized error message (404 if it never failed)
+curl "http://localhost:8000/api/v1/documents/<document_id>/failure"
+
+# Download the original file
+curl -OJ "http://localhost:8000/api/v1/documents/<document_id>/download"
+```
+
+`GET .../download` streams the original bytes back with `Content-Type` set from the stored
+`content_type` and an RFC 5987/6266-compliant `Content-Disposition: attachment` header (Hebrew/
+Unicode filenames survive via a `filename*=UTF-8''...` percent-encoded form alongside an ASCII
+fallback). `404` if the document doesn't exist, `409` if the document row exists but its storage
+object is missing (a real inconsistency, not "not found"), `503` if the storage backend itself is
+unreachable.
+
 ### Ingestion worker
 
 `IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — no public API —
@@ -784,6 +816,11 @@ fast unit suite never needs Docker beyond `docker compose config`.
   extraction → chunking → fake-embeddings → Qdrant chain. A real-Ollama smoke suite is still not
   part of this first suite — real-Ollama verification is left for a future manual/nightly smoke
   suite, not the everyday integration run.
+- **Document read API coverage (Phase 2.8.2)** — `tests/integration/test_document_read_api.py`
+  (real Postgres: ordering/pagination, latest-job selection with multiple jobs, a document with
+  no job, latest-failed-job selection, isolation between documents) and
+  `tests/integration/test_document_download_minio.py` (real MinIO: exact-byte download,
+  missing-object → 409) — see `make test-document-read-integration`.
 - **Containers and all state are removed after the test session** — nothing persists between
   runs, and nothing is written outside the ephemeral containers themselves.
 
@@ -795,6 +832,8 @@ make verify-integration   # runs the integration suite (room for future integrat
 make test-storage          # storage-abstraction unit tests only (no Docker)
 make test-storage-integration  # MinIO integration suite only (needs Docker)
 make test-minio             # MinIO unit + integration tests (needs Docker for the latter)
+make test-document-read     # document read/download API unit tests (no Docker)
+make test-document-read-integration  # document read/download Postgres + MinIO + E2E coverage (needs Docker)
 ```
 
 ## Backend E2E tests
@@ -831,6 +870,15 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   full round trip, that citation/source identity and the SSE event contract are unaffected by the
   storage provider, and that no MinIO implementation detail (bucket name, endpoint, credentials)
   leaks into the public response. Runs under both `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`.
+- **Document read API backend E2E coverage (Phase 2.8.2)** —
+  `tests/e2e/backend/test_document_read_api.py` (local storage) and
+  `tests/e2e/backend/test_document_read_api_minio.py` (real MinIO) drive
+  upload → ingestion → list → detail → ingestion-status → download over the real HTTP boundary,
+  including a forced-failure scenario asserted through `GET .../failure`, exact-byte download
+  comparison, and a Hebrew filename round-trip through `Content-Disposition`. These are read-only
+  document APIs (they touch only `Document`/`IngestionJob`/`FileStorage`, never `RagEngine`), so
+  — unlike the RAG-engine-parity/multilingual E2E suites — they do not need to run under both
+  `RAG_ENGINE` settings.
 
 Run it with:
 
@@ -839,6 +887,7 @@ make test-e2e-backend     # pytest -m e2e tests/e2e/backend -q (includes the Min
 make verify-e2e-backend   # runs the backend E2E suite (room for future E2E-specific checks)
 make test-e2e-backend-minio    # the MinIO backend E2E test only (needs Docker)
 make verify-e2e-backend-minio  # runs the MinIO backend E2E test (room for future checks)
+make test-document-read-integration  # document read/download Postgres + MinIO + E2E coverage
 ```
 
 ## Pre-commit verification
@@ -988,9 +1037,16 @@ ingestion-pipeline test (`tests/integration/test_ingestion_worker_minio.py`), an
 public backend E2E test (`tests/e2e/backend/test_minio_e2e.py`, `make test-e2e-backend-minio`)
 that drives `POST /api/v1/documents` → real MinIO → ingestion → `POST /api/v1/chat` through real
 HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
-`RAG_ENGINE=langchain` — see "Backend E2E tests" above. Document
-lifecycle APIs (deletion, download, listing), orphan-object cleanup, hash-based deduplication,
-frontend E2E, a real-Ollama smoke suite, and a real multilingual-model evaluation run remain
-future milestones — see "Integration tests" above, and "Test architecture"/"What is intentionally
-not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's
-intentionally deferred.
+`RAG_ENGINE=langchain` — see "Backend E2E tests" above. Five read-only document APIs (Phase
+2.8.2) now let a client inspect a document's lifecycle and download its original content —
+`GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `GET /api/v1/documents/{id}/ingestion`,
+`GET /api/v1/documents/{id}/failure`, `GET /api/v1/documents/{id}/download` — backed by a new
+`app/services/document_query_service.py` query layer and a derived `DocumentLifecycleStatus`
+(`uploaded`/`pending`/`processing`/`indexed`/`failed`); see "Document read APIs and original
+download (Phase 2.8.2)" above and in ARCHITECTURE.md. **Nothing is mutated by any of these five
+endpoints** — there is still no retry, delete, re-index, or reconciliation endpoint. Document
+lifecycle *mutation* (delete, retry, reconciliation), orphan-object cleanup, hash-based
+deduplication, frontend E2E, a real-Ollama smoke suite, and a real multilingual-model evaluation
+run remain future milestones — see "Integration tests" above, and "Test architecture"/"What is
+intentionally not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full list of
+what's intentionally deferred.

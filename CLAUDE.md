@@ -145,12 +145,56 @@ def get_settings() -> Settings:
   must come with a matching update to "Storage Abstraction (Phase 2.6/2.7)" in
   [ARCHITECTURE.md](ARCHITECTURE.md) and the "Storage abstraction" section of
   [README.md](README.md) — in the same change, not deferred.
-- **Do not silently broaden storage scope beyond Phase 2.6/2.7.** No document-deletion endpoint,
-  lifecycle/download/listing API, orphan-object cleanup worker, hash-based deduplication, AWS
-  S3/Cloudflare R2 implementation, or presigned multipart upload support belongs in this layer
-  until a future phase explicitly adds it — `MinioFileStorage`'s `delete()`/
-  `generate_download_url()` exist to satisfy the `FileStorage` contract, not because a route
-  calls them yet.
+- **Do not silently broaden storage scope beyond what's explicitly landed.** Phase 2.8.2 added a
+  read-only document lifecycle/list/download API (see "Document Read API Style" below) — but a
+  document-deletion endpoint, retry/re-index/reconciliation endpoint, orphan-object cleanup
+  worker, hash-based deduplication, AWS S3/Cloudflare R2 implementation, or presigned multipart
+  upload support still does not belong in this layer until a future phase explicitly adds it —
+  `MinioFileStorage`'s `delete()` exists to satisfy the `FileStorage` contract and is used only by
+  `document_upload_service.py`'s own-write rollback path, not by any lifecycle-mutation route.
+
+## Document Read API Style
+
+- **Document read APIs use the service/query-function layer, never raw SQL or route-level
+  queries.** `app/services/document_query_service.py` (flat, function-based, mirroring
+  `app/services/index_registry.py` — no `app/repositories/` abstraction) owns every `select()`
+  behind `GET /api/v1/documents*`. `app/api/v1/routes/documents.py`'s read routes never construct
+  a SQLAlchemy statement themselves.
+- **A SQLAlchemy `Document`/`IngestionJob` is never returned directly from a route.** Every
+  response is built through a Pydantic schema in `app/schemas/documents.py`
+  (`DocumentSummaryResponse`/`DocumentDetailResponse`/`IngestionStatusResponse`/
+  `IngestionFailureResponse`/`DocumentListResponse`) — a route's return type is always one of
+  these, never an ORM instance.
+- **Download endpoints use `FileStorage`, never a raw filesystem path or a provider SDK call, in
+  the route.** `GET /api/v1/documents/{document_id}/download` resolves the storage key via
+  `app.storage.keys.resolve_document_storage_key()` and reads bytes via the injected
+  `FileStorage` (the same `get_file_storage()` dependency the upload route already uses) — never
+  `Path(...).read_bytes()`, never a MinIO SDK call, and never `generate_download_url()` (that
+  endpoint uses application streaming, not a redirect — see "Storage Abstraction Style" above).
+- **Local paths and provider credentials/presigned URLs are never exposed in a response.** No
+  document response schema includes `storage_bucket`/`storage_key`/`storage_etag`, a MinIO
+  endpoint, a credential, or a presigned/`file://` URL — only `storage_provider` (e.g.
+  `"local"`/`"minio"`) is exposed. A download error's `detail`/message text is a fixed, safe
+  string — never a raw filesystem path or storage exception message.
+- **Raw ingestion exceptions are never returned verbatim.** `GET
+  .../failure`'s `safe_message` is always `document_query_service.sanitize_ingestion_error()`'s
+  fixed, generic constant — never `IngestionJob.error_message` echoed back — because that raw
+  string can embed a connection/host detail (e.g. a `QdrantVectorStoreError`'s stringified
+  `{exc}`). The raw message stays in Postgres for operator/log inspection only.
+  `IngestionFailureResponse` has no `retryable` field — there is no retry endpoint or
+  attempt-count tracking to genuinely derive one from; do not add a fabricated boolean.
+- **A document/storage consistency mismatch is a `409`, never presented as "document not
+  found."** If a `Document` row exists but `FileStorage.read()` raises
+  `StorageObjectNotFoundError`, the download endpoint returns `409` (the document is real; its
+  storage object is missing) — a `404` is reserved for a `document_id` that matches no `Document`
+  row at all. A storage backend failure for any other reason (`StorageUnavailableError`/
+  `StorageReadError`) is `503`.
+- **Read endpoints must never trigger a retry, re-index, or cleanup.** The five `GET
+  /api/v1/documents*` routes are strictly read-only: no write to Postgres, object storage,
+  Qdrant, an `IngestionJob`, or a `VectorCleanupJob` happens on any of them, and none of them may
+  call `IngestionWorker`, `reindex_document()`, `retry_cleanup_job()`, or any vector-deletion
+  function. There is no retry/delete/re-index/reconciliation endpoint in this codebase yet — do
+  not add one under the guise of a "read" route.
 
 ## RAG Engine Compatibility Style
 

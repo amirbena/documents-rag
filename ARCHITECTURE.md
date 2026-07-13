@@ -181,10 +181,14 @@ code path depends on — never a filesystem path or a MinIO SDK type directly.
   exception leaves the adapter, preserving the original exception as `__cause__`. Messages
   include the operation/key where safe; never a credential, connection string, or signed URL.
 - **Download URLs** (`generate_download_url`) — `LocalFileStorage` returns a `file://` URI (an
-  internal representation only — no browser-facing download route exists yet, out of scope for
-  this phase). `MinioFileStorage` returns a time-limited presigned GET URL
-  (`MINIO_PRESIGNED_URL_EXPIRY_SECONDS`, default 3600s). Neither is ever persisted — the
-  persisted identity is always `storage_provider`/`storage_bucket`/`storage_key`, never a URL.
+  internal representation only, never returned to a client). `MinioFileStorage` returns a
+  time-limited presigned GET URL (`MINIO_PRESIGNED_URL_EXPIRY_SECONDS`, default 3600s). Neither
+  is ever persisted — the persisted identity is always `storage_provider`/`storage_bucket`/
+  `storage_key`, never a URL. **`GET /api/v1/documents/{document_id}/download`** (Phase 2.8.2 —
+  see "Document read APIs and original download" below) deliberately does *not* use
+  `generate_download_url()` at all: it streams bytes through the application via
+  `FileStorage.read()` instead, so a MinIO endpoint/bucket/credential is never exposed to a
+  client, regardless of the configured provider.
 - **Bucket initialization** (`MinioFileStorage.ensure_bucket()`) — checks whether the configured
   bucket exists; creates it only if `MINIO_CREATE_BUCKET_IF_MISSING` (default `true`); a
   `BucketAlreadyOwnedByYou`/`BucketAlreadyExists` race from concurrent startup is treated as
@@ -222,6 +226,97 @@ The endpoint returns `202 Accepted` with `{document_id, job_id, status}` — **i
 chunk, embed, or index the document inside the request.** An empty (zero-byte) upload is
 rejected with `400` before any row is created. `IngestionWorker` (below) is what eventually
 picks up and resolves the `pending` job it creates.
+
+## Document read APIs and original download (Phase 2.8.2)
+
+Five strictly read-only endpoints (`app/api/v1/routes/documents.py`) let a client inspect a
+document's lifecycle and download its original content. **None of them mutate anything** —
+Postgres, object storage, Qdrant, `IngestionJob` rows, and `VectorCleanupJob` rows are all
+untouched by every route in this section. There is no retry, delete, re-index, or reconciliation
+endpoint in this codebase yet.
+
+- `GET /api/v1/documents?limit=&offset=` — one page of documents (`created_at` DESC, `id` DESC
+  tiebreaker), each with its derived lifecycle `status` and total row count. `limit` defaults to
+  20, capped at 100; `offset` defaults to 0. Always `200`.
+- `GET /api/v1/documents/{document_id}` — one document's detail: identity, size, content type,
+  `storage_provider` (never `storage_bucket`/`storage_key`/`storage_etag` — see "Storage
+  Abstraction" above), indexing metadata (`collection_name`/`embedding_version`/
+  `chunking_version`/`indexed_at`), and its latest ingestion job's id/status. `404` if the
+  document doesn't exist.
+- `GET /api/v1/documents/{document_id}/ingestion` — the document's latest `IngestionJob`'s
+  id/status/`created_at`/`updated_at`. `404` only if the *document* doesn't exist; a document
+  with no ingestion job yet is a `200` with `job_id`/`status`/`created_at`/`updated_at` all
+  `null` — a legitimate lifecycle state, not a missing resource (see "Lifecycle status
+  derivation" below for whether this is actually reachable in practice).
+- `GET /api/v1/documents/{document_id}/failure` — the document's latest **FAILED** ingestion
+  job, with a sanitized `safe_message` (see "Ingestion failure sanitization" below). `404` both
+  when the document itself is missing and when the document exists but has never failed — "no
+  failure to inspect" is treated as absent-resource, unlike the ingestion-status endpoint's
+  `200`-with-null choice above (deliberately different, since "inspect the failure" implies one
+  should exist).
+- `GET /api/v1/documents/{document_id}/download` — streams the document's original bytes.
+  `404` if the document row doesn't exist. `409` if the row exists but its storage object is
+  missing (a real document/storage inconsistency — deliberately *not* `404`, since the document
+  itself is real). `503` if the storage backend itself is unreachable/failing for a reason other
+  than not-found. On success: `200` with `Content-Type` set from `Document.content_type` and
+  `Content-Disposition: attachment` carrying both an ASCII-fallback `filename="..."` and an
+  RFC 5987/6266 `filename*=UTF-8''...` percent-encoded form, so a Hebrew/Unicode original
+  filename survives HTTP header encoding (headers are Latin-1/ASCII) without being mangled or
+  raising. Reads the full object into memory via `FileStorage.read()` (both `LocalFileStorage`
+  and `MinioFileStorage` return `bytes`, not a stream) and returns it in one `Response` — the
+  same unbounded-memory characteristic `POST /api/v1/documents` already has today (`await
+  file.read()`, no size limit anywhere in this codebase); this is not a new risk introduced
+  here, and is a known, accepted limitation to revisit if large-file support becomes a
+  requirement. Uses **application streaming**, never a redirect to a presigned URL — a MinIO
+  endpoint/bucket/credential is never exposed to a client this way, and `generate_download_url()`
+  is not called by this endpoint at all.
+
+**Query layer**: `app/services/document_query_service.py` owns every read query behind these
+routes, following the flat function-based style of `app/services/index_registry.py` (no
+`app/repositories/` abstraction exists in this codebase). Routes stay thin per CLAUDE.md's
+"Route Layer Style": parse query params, inject `AsyncSession`/`FileStorage` via `Depends`, call
+one service function, copy its typed result's `status_code` (`DocumentDetailResult`/
+`DocumentIngestionResult`/`DocumentFailureResult`/`DocumentDownloadResult`, mirroring
+`platform_health.ReadinessResult`'s pattern) — no aggregation/business logic lives in the route
+module, and no route ever returns a SQLAlchemy `Document`/`IngestionJob` directly (always through
+a Pydantic response schema in `app/schemas/documents.py`).
+
+**Lifecycle status derivation** (`DocumentLifecycleStatus`, `app/schemas/documents.py`; computed
+by `derive_lifecycle_status()` in `document_query_service.py`) is sourced from a document's
+*latest* `IngestionJob` (`created_at` DESC, `id` DESC tiebreaker) plus `Document.indexed_at`:
+
+| Latest job | `indexed_at` | Status |
+| --- | --- | --- |
+| none | — | `uploaded` |
+| `PENDING` | — | `pending` |
+| `PROCESSING` | — | `processing` |
+| `FAILED` | — | `failed` |
+| `COMPLETED` | any | `indexed` |
+
+No `IngestionJob` at all (`uploaded`) is, in practice, unreachable through the normal upload
+flow — `upload_document()` always creates exactly one `Document` and one `IngestionJob` row in
+the same commit — so this status exists defensively for any pre-existing/malformed data, not as
+a state a client should expect to see from a document created through the API. A `COMPLETED` job
+should always imply `indexed_at is not None` (`IngestionWorker.process_next_job()` commits both
+in the same transaction, including for zero-chunk documents — see "Zero-chunk behavior" below),
+but `derive_lifecycle_status()` still reports `indexed` even in the theoretical case where
+`indexed_at` is somehow null, treating the job's own status as authoritative rather than
+inventing a new status. No `deleting`/`deleted` status exists — there is no delete endpoint yet.
+
+**Ingestion failure sanitization**: `IngestionJob.error_message` is a raw `str(exception)` (see
+"Ingestion worker" below) that can embed a connection/host detail (e.g. a `QdrantVectorStoreError`
+wrapping an `httpx` connect error's message). `sanitize_ingestion_error()` never returns this raw
+string to a client — the `/failure` endpoint's `safe_message` is always one fixed, generic
+constant ("Document ingestion failed. See server logs for the underlying error."), mirroring
+`app/api/v1/routes/chat.py`'s `_SAFE_ERROR_MESSAGE` pattern rather than attempting to pattern-match
+"safe" substrings out of arbitrary exception text. The raw message stays in Postgres for operator/
+log inspection. `IngestionFailureResponse` has no `retryable` field — there is no retry endpoint
+or attempt-count tracking in this codebase yet, so a boolean here would be fabricated rather than
+genuinely derived.
+
+**N+1 avoidance**: `GET /api/v1/documents` resolves every page row's latest job with exactly one
+batched query (`get_latest_jobs_for_documents()` — `WHERE document_id IN (...)`, grouped by
+`document_id` in Python), never one query per row.
 
 ## Ingestion worker
 
@@ -1235,9 +1330,10 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   `/health/ready`, `/health/dependencies` (see "Operational Health Contract" above). Registered
   on `app` with no prefix — never move these under `app/api/v1`.
 - `app/api/v1/routes` — versioned business API routers: `GET /health` (legacy, see "Operational
-  Health Contract" above), `GET /providers/ollama/health`, `POST /documents` (see "Document
-  upload and ingestion job skeleton" above), and `POST /chat` (see "Streaming chat endpoint"
-  above) — the only router that depends on `app/rag`.
+  Health Contract" above), `GET /providers/ollama/health`, `POST /documents` plus the five
+  read-only `GET /documents*` routes (see "Document upload and ingestion job skeleton" and
+  "Document read APIs and original download (Phase 2.8.2)" above), and `POST /chat` (see
+  "Streaming chat endpoint" above) — `chat.py` is the only router that depends on `app/rag`.
 - `app/core` — configuration and cross-cutting concerns, plus `version.py` (`SERVICE_NAME`/
   `SERVICE_VERSION` — the single source of truth for both the FastAPI app's own metadata and the
   unversioned platform health responses).
@@ -1272,8 +1368,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   than duplicating it; `index_registry.py`, the collection-safety and document-indexing-metadata
   service (see "Multilingual RAG Foundation" above) — `ensure_active_collection()`,
   `mark_document_indexed()`, `is_document_stale()`, `get_stale_documents()`, `retire_collection()`,
-  `delete_current_document_vectors()`, `delete_all_tracked_document_vectors()`; and
-  `reindex_service.py`'s `reindex_document()`, the backend re-index capability.
+  `delete_current_document_vectors()`, `delete_all_tracked_document_vectors()`;
+  `reindex_service.py`'s `reindex_document()`, the backend re-index capability; and
+  `document_query_service.py`, the read-only query/lifecycle-derivation layer backing the five
+  `GET /documents*` routes (see "Document read APIs and original download (Phase 2.8.2)" above)
+  — never writes to Postgres, object storage, or Qdrant.
 - `app/rag/retrieval_service.py` — `RetrievalService`, the internal read-side counterpart to
   ingestion's embed/upsert steps (see "Retrieval service" above). It is the second caller of
   `get_embedding_provider()`/`get_vector_store()` alongside `IngestionWorker`, and it never calls
@@ -1364,11 +1463,11 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
 - An LLM-based (as opposed to rule-based) question router
 - Conversation memory / multi-turn context (in prompt building or the orchestrator)
 - A client-selectable model override on `POST /api/v1/chat` — `ChatRequest` has no `model` field
-- A document-deletion endpoint, document lifecycle/list/download API, orphan-object cleanup
-  worker, or hash-based content deduplication — `FileStorage`/`MinioFileStorage` exist (Phase
-  2.6/2.7), but no public route uses `delete()`/`generate_download_url()` yet; this is deferred
-  to a future Phase 2.8
-  ("Document Lifecycle APIs")
+- A document-deletion, retry, re-index, or reconciliation endpoint, or an orphan-object cleanup
+  worker, or hash-based content deduplication — Phase 2.8.2 added the five *read-only* document
+  APIs (list/detail/ingestion/failure/download — see "Document read APIs and original download"
+  above), but no public route calls `FileStorage.delete()` or mutates a `Document`/`IngestionJob`
+  row in any way; those remain future milestones
 - AWS S3 or Cloudflare R2 as a `FileStorage` implementation, and presigned multipart uploads —
   `MinioFileStorage` covers MinIO/S3-compatible storage generically, but a dedicated S3/R2
   implementation and multipart upload support are future work, not implemented in this phase
