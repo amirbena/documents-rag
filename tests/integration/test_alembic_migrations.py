@@ -12,7 +12,7 @@ import uuid
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
 
@@ -63,6 +63,10 @@ async def test_upgrade_head_creates_expected_columns(migrated_schema: None, post
         "chunking_version",
         "collection_name",
         "indexed_at",
+        "storage_provider",
+        "storage_bucket",
+        "storage_key",
+        "storage_etag",
     }
     assert job_columns == {
         "id",
@@ -242,3 +246,59 @@ async def test_upgrade_from_prior_revision_adds_vector_cleanup_jobs_table(
         "created_at",
         "completed_at",
     }
+
+
+async def test_upgrade_backfills_storage_identity_for_pre_migration_rows(
+    migrated_schema: None, postgres_url: str
+) -> None:
+    """A document row written before the storage-identity migration must be backfilled safely.
+
+    Downgrades to the immediately-prior revision (1c2d9f3a7b4e), inserts a row the way the old
+    LocalFileStorage wrote it (flat stored_filename, stored_path under the local root), then
+    upgrades to head and confirms storage_provider/storage_key are backfilled deterministically
+    from the existing columns — no file content is read, no row becomes unreadable.
+    """
+    from app.models.document import Document
+
+    await asyncio.to_thread(run_alembic_downgrade, "1c2d9f3a7b4e")
+
+    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
+    document_id = str(uuid.uuid4())
+    stored_filename = f"{uuid.uuid4().hex}.pdf"
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO documents "
+                    "(id, original_filename, stored_filename, content_type, file_size, stored_path) "
+                    "VALUES (:id, :original_filename, :stored_filename, :content_type, :file_size, "
+                    ":stored_path)"
+                ),
+                {
+                    "id": document_id,
+                    "original_filename": "legacy.pdf",
+                    "stored_filename": stored_filename,
+                    "content_type": "application/pdf",
+                    "file_size": 10,
+                    "stored_path": f"storage/documents/{stored_filename}",
+                },
+            )
+            await conn.commit()
+    finally:
+        await engine.dispose()
+
+    await asyncio.to_thread(run_alembic_upgrade, "head")
+
+    engine = create_async_engine(postgres_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    try:
+        async with session_factory() as session:
+            document = await session.get(Document, document_id)
+    finally:
+        await engine.dispose()
+
+    assert document is not None
+    assert document.storage_provider == "local"
+    assert document.storage_key == stored_filename
+    assert document.storage_bucket is None
+    assert document.storage_etag is None

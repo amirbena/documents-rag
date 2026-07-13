@@ -18,6 +18,10 @@ dependencies = [
     "pypdf>=4.0",
     "python-docx>=1.1",
     "openpyxl>=3.1",
+    # MinIO/S3-compatible object storage client (Phase 2.6/2.7's MinioFileStorage) — see
+    # app/storage/minio_storage.py's module docstring for why the SDK is used directly instead
+    # of raw httpx, unlike this project's Ollama/Qdrant providers.
+    "minio>=7.2",
     "langchain-core>=0.3",
     # Pinned below 2.5: not used directly by this app (pulled in transitively — a runtime
     # dependency of qdrant-client, and type-checking-only via langchain-core's
@@ -67,3 +71,7 @@ ignore = ["B008"]
 python_version = "3.11"
 ignore_missing_imports = true
 disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["minio.*", "urllib3.*"]
+ignore_missing_imports = true

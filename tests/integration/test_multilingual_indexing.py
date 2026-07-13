@@ -30,6 +30,7 @@ from app.services.index_registry import (
 )
 from app.services.ingestion_worker import IngestionWorker
 from app.services.reindex_service import ReindexOutcome, reindex_document
+from app.storage.local_storage import LocalFileStorage
 from tests.multilingual_fixtures import MIXED_TECHNICAL_DOCUMENT, MultilingualFakeEmbeddingProvider
 
 
@@ -70,7 +71,7 @@ async def _new_session(postgres_url: str) -> AsyncIterator[AsyncSession]:
 
 
 async def _create_pending_job(
-    session: AsyncSession, stored_path: str = "storage/documents/x.txt"
+    session: AsyncSession, storage_key: str = "x.txt"
 ) -> IngestionJob:
     document = Document(
         id=str(uuid.uuid4()),
@@ -78,7 +79,9 @@ async def _create_pending_job(
         stored_filename=f"{uuid.uuid4().hex}.txt",
         content_type="text/plain",
         file_size=11,
-        stored_path=stored_path,
+        stored_path=storage_key,
+        storage_provider="local",
+        storage_key=storage_key,
     )
     session.add(document)
     job = IngestionJob(id=str(uuid.uuid4()), document_id=document.id, status=IngestionStatus.PENDING)
@@ -105,8 +108,8 @@ async def test_document_indexing_persists_embedding_metadata(
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        job = await _create_pending_job(session, stored_path=str(file_path))
-        worker = IngestionWorker()
+        job = await _create_pending_job(session, storage_key=file_path.name)
+        worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
         result = await worker.process_next_job(session)
 
         assert result is not None
@@ -133,8 +136,8 @@ async def test_active_collection_name_is_persisted_and_tracked(
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
 
         document = (await session.execute(select(Document))).scalar_one()
         assert document.collection_name == active_config.collection_name
@@ -175,8 +178,8 @@ async def test_stale_document_detection_after_embedding_version_change(
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
         document = (await session.execute(select(Document))).scalar_one()
 
     original_config = get_active_embedding_config(settings)
@@ -200,8 +203,8 @@ async def test_reindex_writes_to_the_new_collection_and_updates_metadata(
     file_path.write_text(MIXED_TECHNICAL_DOCUMENT.decode("utf-8"), encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
 
     monkeypatch.setattr(settings, "embedding_version", "v2-multilingual")
     new_config = get_active_embedding_config(settings)
@@ -211,7 +214,9 @@ async def test_reindex_writes_to_the_new_collection_and_updates_metadata(
         document = (await session.execute(select(Document))).scalar_one()
         assert is_document_stale(document, new_config) is True
 
-        result = await reindex_document(document, session, settings)
+        result = await reindex_document(
+            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        )
 
         assert result.outcome == ReindexOutcome.REINDEXED
         assert document.collection_name == new_config.collection_name
@@ -236,8 +241,8 @@ async def test_failed_reindex_does_not_mark_document_current(
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
 
     monkeypatch.setattr(settings, "embedding_version", "v2-broken")
     new_config = get_active_embedding_config(settings)
@@ -255,7 +260,7 @@ async def test_failed_reindex_does_not_mark_document_current(
         original_collection_name = document.collection_name
 
         with pytest.raises(RuntimeError, match="embedding provider unavailable"):
-            await reindex_document(document, session, settings)
+            await reindex_document(document, session, settings, file_storage=LocalFileStorage(root=tmp_path))
 
         assert document.collection_name == original_collection_name
         assert is_document_stale(document, new_config) is True
@@ -272,8 +277,8 @@ async def test_reindex_cleanup_failure_persists_job_and_retry_succeeds_against_r
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
 
     original_config = get_active_embedding_config(settings)
     monkeypatch.setattr(settings, "embedding_version", "v2-multilingual")
@@ -308,7 +313,9 @@ async def test_reindex_cleanup_failure_persists_job_and_retry_succeeds_against_r
 
     async with _new_session(postgres_url) as session:
         document = (await session.execute(select(Document))).scalar_one()
-        result = await reindex_document(document, session, settings)
+        result = await reindex_document(
+            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        )
         assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
         assert document.collection_name == new_config.collection_name
 
@@ -349,8 +356,8 @@ async def test_full_document_deletion_cleans_pending_historical_collection_again
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
 
     original_config = get_active_embedding_config(settings)
     monkeypatch.setattr(settings, "embedding_version", "v3-multilingual")
@@ -380,7 +387,9 @@ async def test_full_document_deletion_cleans_pending_historical_collection_again
 
     async with _new_session(postgres_url) as session:
         document = (await session.execute(select(Document))).scalar_one()
-        result = await reindex_document(document, session, settings)
+        result = await reindex_document(
+            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        )
         assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
 
     async with _new_session(postgres_url) as session:
@@ -417,8 +426,8 @@ async def test_deleting_a_document_cleans_its_tracked_vectors(
     file_path.write_text("hello world " * 20, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        job = await _create_pending_job(session, stored_path=str(file_path))
-        await IngestionWorker().process_next_job(session)
+        job = await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
         document = await session.get(Document, job.document_id)
         assert document is not None
 
@@ -447,8 +456,8 @@ async def test_mixed_hebrew_english_text_survives_persistence_and_retrieval(
     file_path.write_text(mixed_text, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        job = await _create_pending_job(session, stored_path=str(file_path))
-        result = await IngestionWorker().process_next_job(session)
+        job = await _create_pending_job(session, storage_key=file_path.name)
+        result = await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
         assert result is not None
         assert result.status == IngestionStatus.COMPLETED
 

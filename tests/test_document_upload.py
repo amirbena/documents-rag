@@ -5,12 +5,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.v1.routes.documents import get_local_file_storage
+from app.api.v1.routes.documents import get_file_storage
 from app.db.session import get_db_session
 from app.main import app
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from app.services.local_file_storage import LocalFileStorage
+from app.storage.local_storage import LocalFileStorage
 
 client = TestClient(app)
 
@@ -44,7 +44,7 @@ def _override_dependencies(tmp_path: Path) -> _FakeAsyncSession:
         yield fake_session
 
     app.dependency_overrides[get_db_session] = _fake_db_session
-    app.dependency_overrides[get_local_file_storage] = lambda: LocalFileStorage(root=tmp_path)
+    app.dependency_overrides[get_file_storage] = lambda: LocalFileStorage(root=tmp_path)
     return fake_session
 
 
@@ -66,6 +66,9 @@ def test_upload_creates_document_and_ingestion_job(tmp_path: Path) -> None:
     assert job.document_id == document.id
     assert job.status == IngestionStatus.PENDING
     assert fake_session.committed is True
+    assert document.storage_provider == "local"
+    assert document.storage_key is not None
+    assert document.storage_key.startswith(f"documents/{document.id}/")
 
 
 def test_upload_response_status_is_202(tmp_path: Path) -> None:
@@ -143,8 +146,8 @@ def test_stored_filename_is_generated_and_safe(tmp_path: Path) -> None:
     assert document.original_filename == original_name
     # Safe: ASCII-only, no path separators, no spaces or special characters.
     assert all(c.isascii() and (c.isalnum() or c == ".") for c in document.stored_filename)
-    # The uploaded content was actually written under the generated safe name.
-    stored_file = tmp_path / document.stored_filename
+    # The uploaded content was actually written under the generated object key.
+    stored_file = tmp_path / document.storage_key
     assert stored_file.exists()
     assert stored_file.read_bytes() == b"content"
 

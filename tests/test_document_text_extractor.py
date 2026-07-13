@@ -14,6 +14,7 @@ from pypdf.generic import StreamObject as _StreamObject
 
 from app.models.document import Document
 from app.services.document_text_extractor import DocumentTextExtractionError, DocumentTextExtractor
+from app.storage.local_storage import LocalFileStorage
 
 
 def _make_document(path: Path, content_type: str = "text/plain") -> Document:
@@ -23,8 +24,15 @@ def _make_document(path: Path, content_type: str = "text/plain") -> Document:
         stored_filename=path.name,
         content_type=content_type,
         file_size=path.stat().st_size if path.exists() else 0,
-        stored_path=str(path),
+        stored_path=path.name,
+        storage_provider="local",
+        storage_key=path.name,
     )
+
+
+def _extractor(path: Path) -> DocumentTextExtractor:
+    """Build a DocumentTextExtractor backed by a LocalFileStorage rooted at path's parent."""
+    return DocumentTextExtractor(storage=LocalFileStorage(root=path.parent))
 
 
 def _build_pdf_bytes(page_texts: list[str]) -> bytes:
@@ -66,7 +74,7 @@ async def test_txt_extraction(tmp_path: Path) -> None:
     path.write_text("hello world", encoding="utf-8")
     document = _make_document(path)
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert result.document_id == document.id
     assert len(result.pages) == 1
@@ -80,7 +88,7 @@ async def test_markdown_extraction(tmp_path: Path) -> None:
     path.write_text("# Title\n\nSome **bold** text.", encoding="utf-8")
     document = _make_document(path, content_type="text/markdown")
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert len(result.pages) == 1
     assert result.pages[0].text == "# Title\n\nSome **bold** text."
@@ -93,7 +101,7 @@ async def test_pdf_extraction_with_page_numbers(tmp_path: Path) -> None:
     path.write_bytes(_build_pdf_bytes(["Page one text", "Page two text"]))
     document = _make_document(path, content_type="application/pdf")
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert len(result.pages) == 2
     assert result.pages[0].page_number == 1
@@ -111,7 +119,7 @@ async def test_unsupported_file_type_fails(tmp_path: Path) -> None:
     document = _make_document(path, content_type="application/zip")
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_missing_file_fails(tmp_path: Path) -> None:
@@ -120,7 +128,7 @@ async def test_missing_file_fails(tmp_path: Path) -> None:
     document = _make_document(path)
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_empty_extracted_text_fails(tmp_path: Path) -> None:
@@ -130,7 +138,7 @@ async def test_empty_extracted_text_fails(tmp_path: Path) -> None:
     document = _make_document(path)
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_hebrew_text_extraction(tmp_path: Path) -> None:
@@ -140,7 +148,7 @@ async def test_hebrew_text_extraction(tmp_path: Path) -> None:
     path.write_text(hebrew_text, encoding="utf-8")
     document = _make_document(path)
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert result.pages[0].text == hebrew_text
 
@@ -156,7 +164,7 @@ async def test_docx_extraction(tmp_path: Path) -> None:
         path, content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert len(result.pages) == 1
     assert result.pages[0].page_number is None
@@ -174,7 +182,7 @@ async def test_docx_hebrew_extraction(tmp_path: Path) -> None:
     document_file.save(str(path))
     document = _make_document(path)
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert hebrew_text in result.pages[0].text
 
@@ -192,7 +200,7 @@ async def test_xlsx_extraction(tmp_path: Path) -> None:
         path, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert len(result.pages) == 1
     assert result.pages[0].sheet_name == "Summary"
@@ -213,7 +221,7 @@ async def test_xlsx_multiple_sheets(tmp_path: Path) -> None:
     workbook.save(str(path))
     document = _make_document(path)
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert len(result.pages) == 2
     assert result.pages[0].sheet_name == "Q1"
@@ -232,7 +240,7 @@ async def test_xlsx_hebrew_extraction(tmp_path: Path) -> None:
     workbook.save(str(path))
     document = _make_document(path)
 
-    result = await DocumentTextExtractor().extract(document)
+    result = await _extractor(path).extract(document)
 
     assert hebrew_value in result.pages[0].text
 
@@ -244,7 +252,7 @@ async def test_fake_pdf_with_non_pdf_bytes_fails(tmp_path: Path) -> None:
     document = _make_document(path, content_type="application/pdf")
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_fake_docx_with_non_docx_bytes_fails(tmp_path: Path) -> None:
@@ -256,7 +264,7 @@ async def test_fake_docx_with_non_docx_bytes_fails(tmp_path: Path) -> None:
     )
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_fake_xlsx_with_non_xlsx_bytes_fails(tmp_path: Path) -> None:
@@ -268,7 +276,7 @@ async def test_fake_xlsx_with_non_xlsx_bytes_fails(tmp_path: Path) -> None:
     )
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)
 
 
 async def test_zip_without_docx_structure_fails_as_docx(tmp_path: Path) -> None:
@@ -279,4 +287,4 @@ async def test_zip_without_docx_structure_fails_as_docx(tmp_path: Path) -> None:
     document = _make_document(path)
 
     with pytest.raises(DocumentTextExtractionError):
-        await DocumentTextExtractor().extract(document)
+        await _extractor(path).extract(document)

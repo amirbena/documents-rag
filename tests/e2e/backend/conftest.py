@@ -28,12 +28,12 @@ import app.rag.orchestrator as orchestrator_module
 import app.rag.retrieval_service as retrieval_service_module
 import app.services.ingestion_worker as ingestion_worker_module
 from alembic import command
-from app.api.v1.routes.documents import get_local_file_storage
+from app.api.v1.routes.documents import get_file_storage
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app
 from app.services.ingestion_worker import IngestionWorker
-from app.services.local_file_storage import LocalFileStorage
+from app.storage.local_storage import LocalFileStorage
 from tests.e2e.backend.fakes import FakeEmbeddingProvider, FakeStreamingLLMProvider
 
 _PRODUCTION_ENV_NAMES = {"production", "prod"}
@@ -251,7 +251,7 @@ def _db_session_override(session_factory: async_sessionmaker[AsyncSession]):
 
 
 def _local_file_storage_override(root: Path):
-    """Build a get_local_file_storage override rooted at a temporary directory."""
+    """Build a get_file_storage override rooted at a temporary directory."""
 
     def _override() -> LocalFileStorage:
         return LocalFileStorage(root=root)
@@ -274,7 +274,7 @@ async def app_client(
     incremental delivery, event order — remain observable, unlike a fully-buffered test client.
     """
     app.dependency_overrides[get_db_session] = _db_session_override(e2e_session_factory)
-    app.dependency_overrides[get_local_file_storage] = _local_file_storage_override(tmp_path)
+    app.dependency_overrides[get_file_storage] = _local_file_storage_override(tmp_path)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://e2e-testserver") as client:
@@ -282,23 +282,26 @@ async def app_client(
             yield client
         finally:
             app.dependency_overrides.pop(get_db_session, None)
-            app.dependency_overrides.pop(get_local_file_storage, None)
+            app.dependency_overrides.pop(get_file_storage, None)
 
 
 @pytest.fixture
 def process_pending_job(
     e2e_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
     e2e_provider_overrides: None,
     isolated_test_state: None,
 ):
     """Run the real IngestionWorker against one pending job, using a fresh DB session.
 
     Real extraction/chunking/Qdrant upsert; embeddings come from the fake provider via
-    e2e_provider_overrides.
+    e2e_provider_overrides. Uses the same tmp_path-rooted LocalFileStorage the app_client's
+    upload override writes to, so the worker reads exactly what the upload endpoint wrote.
     """
+    file_storage = LocalFileStorage(root=tmp_path)
 
     async def _process():
         async with e2e_session_factory() as session:
-            return await IngestionWorker().process_next_job(session)
+            return await IngestionWorker(file_storage=file_storage).process_next_job(session)
 
     return _process

@@ -24,6 +24,7 @@ from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.services.ingestion_worker import IngestionWorker
+from app.storage.local_storage import LocalFileStorage
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +74,7 @@ async def _new_session(postgres_url: str) -> AsyncIterator[AsyncSession]:
 
 
 async def _create_pending_job(
-    session: AsyncSession, stored_path: str = "storage/documents/x.txt"
+    session: AsyncSession, storage_key: str = "x.txt"
 ) -> IngestionJob:
     document = Document(
         id=str(uuid.uuid4()),
@@ -81,7 +82,9 @@ async def _create_pending_job(
         stored_filename=f"{uuid.uuid4().hex}.txt",
         content_type="text/plain",
         file_size=11,
-        stored_path=stored_path,
+        stored_path=storage_key,
+        storage_provider="local",
+        storage_key=storage_key,
     )
     session.add(document)
     job = IngestionJob(id=str(uuid.uuid4()), document_id=document.id, status=IngestionStatus.PENDING)
@@ -204,8 +207,8 @@ async def test_default_pipeline_against_real_postgres_and_qdrant_with_fake_embed
     file_path.write_text("hello world " * 100, encoding="utf-8")
 
     async with _new_session(postgres_url) as session:
-        await _create_pending_job(session, stored_path=str(file_path))
-        worker = IngestionWorker()
+        await _create_pending_job(session, storage_key=file_path.name)
+        worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
         result = await worker.process_next_job(session)
 

@@ -52,6 +52,8 @@ from app.services.index_registry import (
     mark_document_indexed,
 )
 from app.services.ingestion_worker import to_vector_point
+from app.storage.contract import FileStorage
+from app.storage.factory import create_file_storage
 
 
 class ReindexOutcome(StrEnum):
@@ -77,7 +79,10 @@ class ReindexResult:
 
 
 async def reindex_document(
-    document: Document, session: AsyncSession, settings: Settings | None = None
+    document: Document,
+    session: AsyncSession,
+    settings: Settings | None = None,
+    file_storage: FileStorage | None = None,
 ) -> ReindexResult:
     """Re-extract/re-chunk/re-embed/re-upsert one Document under the active configuration.
 
@@ -97,7 +102,8 @@ async def reindex_document(
 
     previous_collection_name = document.collection_name
 
-    extracted = await DocumentTextExtractor().extract(document)
+    file_storage = file_storage or create_file_storage(settings)
+    extracted = await DocumentTextExtractor(storage=file_storage).extract(document)
     chunker = DocumentChunker(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
     chunks = chunker.chunk(extracted)
 
