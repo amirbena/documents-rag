@@ -196,9 +196,11 @@ def get_settings() -> Settings:
   /api/v1/documents*` routes are strictly read-only: no write to Postgres, object storage,
   Qdrant, an `IngestionJob`, or a `VectorCleanupJob` happens on any of them, and none of them may
   call `IngestionWorker`, `reindex_document()`, `retry_cleanup_job()`, or any vector-deletion
-  function. `POST /api/v1/documents/{document_id}/ingestion/retry` (Phase 2.8.3) is a separate,
-  explicitly mutating endpoint — do not add mutation to any `GET` route under the guise of a
-  "read" route; there is still no delete/re-index/reconciliation endpoint in this codebase.
+  function. `POST /api/v1/documents/{document_id}/ingestion/retry` (Phase 2.8.3) and
+  `DELETE /api/v1/documents/{document_id}` / `GET .../deletion` (Phase 2.8.4, see "Full Document
+  Deletion Style" below) are the only mutating/deletion-scheduling routes — do not add mutation
+  to any `GET` route under the guise of a "read" route; there is still no re-index or
+  reconciliation endpoint, and `DELETE` only ever schedules (never executes inline) deletion.
 
 ## Ingestion Retry & Stale Recovery Style
 
@@ -258,6 +260,68 @@ def get_settings() -> Settings:
   existing `smoke-multilingual-real` operational-script boundary. Do not add a `POST
   /api/v1/.../recover` route, and do not wire the recovery script into any automated quality gate,
   without an explicit user request.
+
+## Full Document Deletion Style (Phase 2.8.4)
+
+- **PostgreSQL remains authoritative; the `Document` row is never physically deleted.** A
+  successful deletion never removes the `Document` row, nor any `IngestionJob`/`VectorCleanupJob`/
+  `DocumentDeletionJob` history — only a document's external resources (Qdrant vectors, the
+  stored object) are removed. Do not add cascading deletion of `IngestionJob`/`VectorCleanupJob`,
+  a hard-purge/retention-policy mechanism, or bulk deletion without an explicit user request.
+- **Deletion attempts are append-only, exactly like ingestion retry.** A `PARTIALLY_FAILED`
+  `DocumentDeletionJob` row is never reset back to `PENDING`, and never deleted. Retrying always
+  means creating a brand-new `DocumentDeletionJob` row for the same `document_id`.
+- **At most one active (`PENDING`/`PROCESSING`) `DocumentDeletionJob` per document, enforced by a
+  real Postgres constraint — never application logic alone.** The partial unique index
+  `ix_document_deletion_jobs_one_active_per_document` (migration `c8f3a2b6d1e7`) is the source of
+  truth; `request_document_deletion()` must be written assuming a concurrent insert can and will
+  violate it, and must translate that `IntegrityError` into the correct existing-job response
+  rather than letting it propagate as a raw `500` — mirror `retry_ingestion()`'s exact
+  `SELECT ... FOR UPDATE` + `IntegrityError`-catch pattern. Do not touch the Phase 2.8.3 ingestion
+  job's unique index or its migration (`b7e2f6a1c9d4`) while working on this one.
+- **Scheduling and execution are two distinct operations — do not conflate them.**
+  `request_document_deletion()` (the service behind `DELETE /api/v1/documents/{id}`) only ever
+  inserts a `PENDING` `DocumentDeletionJob` row; it never performs the actual cross-system
+  cleanup inline. `DocumentDeletionWorker.process_next_job()` is the separate execution step,
+  triggered only via `scripts/process_pending_document_deletions.py`
+  (`make process-pending-document-deletions`) or directly by tests — mirroring how
+  `IngestionWorker.process_next_job()` is never invoked inline by `POST /api/v1/documents` either.
+  Do not add a route or synchronous in-request call that runs `DocumentDeletionWorker` inline
+  without an explicit user request.
+- **Vector cleanup must complete before storage cleanup ever begins.** `DocumentDeletionWorker`
+  calls `index_registry.delete_all_tracked_document_vectors(document, vector_store, session)` —
+  the full-tracked-collection operation — strictly before `FileStorage.delete()`. If any tracked
+  collection's deletion fails, the job is marked `PARTIALLY_FAILED` and storage deletion is never
+  attempted in that call. Never call `delete_current_document_vectors()` (the deliberately-partial
+  active-collection-only sibling) from this path.
+- **A document is `deleted` only when both vector cleanup and storage cleanup fully succeed.**
+  `DocumentDeletionJob.status` becomes `COMPLETED` (and the document's public lifecycle becomes
+  `deleted`) only after `vector_cleanup_completed` and `storage_cleanup_completed` are both `True`
+  in the same attempt.
+- **Deletion lifecycle always takes precedence in `derive_lifecycle_status()`.** Once any
+  `DocumentDeletionJob` exists for a document, its status (`deleting`/`deletion_failed`/`deleted`)
+  overrides whatever the ingestion-derived status would otherwise report — never let an unchanged
+  `Document.collection_name`/`indexed_at`/`IngestionJob` make a `deleted` document look `indexed`
+  again.
+- **A deleted document blocks ingestion retry and returns `410` (not `404`) on download.**
+  `retry_ingestion()` rejects with `DELETION_ACTIVE` (`409`) whenever any `DocumentDeletionJob`
+  exists for the document at all — checked before any other branch — so a document is never
+  implicitly resurrected. `download_document()` returns `410 Gone` (never `404`) for a `COMPLETED`
+  deletion — the Postgres resource still exists; only its content was intentionally removed.
+- **Public deletion failures are sanitized exactly like ingestion failures.** `error_code`
+  (`DeletionErrorCode`, a stable `StrEnum`) is the only thing a public API maps through
+  `sanitize_deletion_error()` to a fixed, generic message; the raw `error_message` (which may
+  embed a Qdrant/MinIO connection detail) stays in Postgres for operator/log inspection only and
+  is never returned verbatim by any route.
+- **No stale-`PROCESSING`-deletion-job recovery mechanism exists in this phase.** Unlike
+  ingestion (`recover_stale_ingestion_jobs()`), deletion execution has no analogous
+  `recover_stale_*` operation — do not add one without an explicit user request; a document stuck
+  `deleting` due to a crashed worker is a known, documented limitation of this phase, not a bug
+  to silently work around.
+- **This phase does not implement hash deduplication, orphan reconciliation, version-aware
+  re-indexing, a deployed background-scheduler process, retention/purge policy, tenant/user
+  authorization changes, re-upload/restore, or a vector-only deletion HTTP endpoint.** Do not
+  begin any of these, or a future "Phase 2.8.5," without an explicit user request.
 
 ## RAG Engine Compatibility Style
 

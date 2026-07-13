@@ -396,6 +396,38 @@ Retrying doesn't require re-uploading the original file (the same `FileStorage` 
 or any vector-cleanup step (Qdrant point IDs are deterministic per document/chunk, so a retry's
 successful upsert naturally overwrites what a first successful attempt would have written).
 
+### Full document deletion
+
+See "Full document deletion (Phase 2.8.4)" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full
+scheduling decision table, the deletion-job state machine, the vectors-before-storage cleanup
+order, and the lifecycle-precedence rule. The `Document` row and all history (`IngestionJob`/
+`VectorCleanupJob`/`DocumentDeletionJob`) are never physically deleted — only a document's
+external resources (Qdrant vectors, the stored object) are removed.
+
+```bash
+# Schedule deletion — 202 if newly scheduled or already active, 200 if already fully deleted,
+# 404 if the document is missing, 409 if it has an active ingestion job.
+curl -X DELETE "http://localhost:8000/api/v1/documents/<document_id>"
+
+# Inspect the latest deletion attempt (404 if none was ever requested).
+curl "http://localhost:8000/api/v1/documents/<document_id>/deletion"
+
+# Execute pending deletion jobs against the configured database/Qdrant/storage (manual/optional —
+# never run by make verify/CI, mirrors make recover-stale-ingestion-jobs):
+make process-pending-document-deletions
+```
+
+`DELETE` only ever *schedules* a deletion (inserts a `PENDING` `DocumentDeletionJob` row) — it
+never performs the actual cross-system cleanup inline, mirroring how `POST /api/v1/documents`
+never runs ingestion inline either. Execution (`DocumentDeletionWorker`, invoked by
+`scripts/process_pending_document_deletions.py`) deletes every tracked vector collection
+(`delete_all_tracked_document_vectors()`) strictly before deleting the original stored object; a
+partial vector-cleanup failure blocks storage deletion entirely and marks the attempt
+`PARTIALLY_FAILED` (`deletion_failed` lifecycle) rather than reporting a false success. A deleted
+document's `GET .../download` returns `410 Gone` (the row still exists; only its content was
+removed), and `POST .../ingestion/retry` on it returns `409` — a document is never implicitly
+resurrected once deletion has begun.
+
 ### Ingestion worker
 
 `IngestionWorker` (`app/services/ingestion_worker.py`) is an internal service — no public API —
@@ -857,6 +889,8 @@ make test-document-read     # document read/download API unit tests (no Docker)
 make test-document-read-integration  # document read/download Postgres + MinIO + E2E coverage (needs Docker)
 make test-ingestion-retry   # retry/stale-recovery unit tests (no Docker)
 make test-ingestion-retry-integration  # retry/stale-recovery Postgres + Qdrant coverage (needs Docker)
+make test-document-deletion  # full-document-deletion unit tests (no Docker)
+make test-document-deletion-integration  # deletion Postgres + Qdrant + storage + E2E coverage (needs Docker)
 ```
 
 - **Ingestion retry/stale-recovery coverage (Phase 2.8.3)** —
@@ -866,6 +900,18 @@ make test-ingestion-retry-integration  # retry/stale-recovery Postgres + Qdrant 
   stale-recovery calls never recovering the same row twice, history preservation after a retry)
   plus one real-Postgres-and-Qdrant test forcing a first attempt to fail, confirming zero Qdrant
   points exist, then retrying to a real success — see `make test-ingestion-retry-integration`.
+- **Full document deletion coverage (Phase 2.8.4)** —
+  `tests/integration/test_document_deletion_postgres.py` (real Postgres: the partial unique
+  index, concurrent delete requests via `asyncio.gather` producing exactly one active job,
+  concurrent worker claims never double-processing a row, append-only history, lifecycle
+  derivation after completion/partial failure),
+  `tests/integration/test_document_deletion_qdrant.py` (real Qdrant: full tracked-collection
+  cleanup including a historical pending/failed `VectorCleanupJob` collection, an unrelated
+  document's vectors surviving, idempotent re-deletion, a real forced partial-collection failure
+  blocking storage deletion), and `tests/integration/test_document_deletion_storage.py` (real
+  LocalFileStorage and real Testcontainers MinIO: exact-object deletion, already-missing-object
+  idempotency, provider-failure partial state, identical Local/MinIO contract) — see
+  `make test-document-deletion-integration`.
 
 ## Backend E2E tests
 
@@ -910,6 +956,22 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   document APIs (they touch only `Document`/`IngestionJob`/`FileStorage`, never `RagEngine`), so
   — unlike the RAG-engine-parity/multilingual E2E suites — they do not need to run under both
   `RAG_ENGINE` settings.
+- **Ingestion retry/stale-recovery E2E coverage (Phase 2.8.3)** —
+  `tests/e2e/backend/test_ingestion_retry_recovery.py` drives
+  `POST .../ingestion/retry` over real HTTP after a real forced/transient failure and a
+  manufactured stale-`PROCESSING` row, confirming both the retry contract and that history stays
+  visible through the existing read APIs.
+- **Full document deletion E2E coverage (Phase 2.8.4)** —
+  `tests/e2e/backend/test_document_deletion.py` drives `DELETE /api/v1/documents/{id}` and `GET
+  .../deletion` over real HTTP, then executes the scheduled job with a real
+  `DocumentDeletionWorker` against the real ephemeral Qdrant container and a real
+  `LocalFileStorage`. Covers all five required scenarios: successful deletion (vectors and object
+  removed, lifecycle becomes `deleted`, download returns `410`, chunks no longer searchable via a
+  real `search_similar()` call); a forced real Qdrant delete failure (lifecycle becomes
+  `deletion_failed`, the object stays downloadable, no false success); a forced storage failure
+  followed by a successful retry (vectors removed once, storage cleanup completes on the second
+  attempt); two genuinely concurrent `DELETE` requests (`asyncio.gather`) converging on exactly
+  one active job; and a deleted document rejecting `POST .../ingestion/retry` with `409`.
 
 Run it with:
 
@@ -1073,10 +1135,10 @@ HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
 `GET /api/v1/documents`, `GET /api/v1/documents/{id}`, `GET /api/v1/documents/{id}/ingestion`,
 `GET /api/v1/documents/{id}/failure`, `GET /api/v1/documents/{id}/download` — backed by a new
 `app/services/document_query_service.py` query layer and a derived `DocumentLifecycleStatus`
-(`uploaded`/`pending`/`processing`/`indexed`/`failed`); see "Document read APIs and original
-download (Phase 2.8.2)" above and in ARCHITECTURE.md. **Nothing is mutated by any of these five
-endpoints** — there is still no delete, re-index, or reconciliation endpoint. Document lifecycle
-*mutation* now has one deliberate exception: `POST /api/v1/documents/{id}/ingestion/retry` (Phase
+(`uploaded`/`pending`/`processing`/`indexed`/`failed`, plus `deleting`/`deletion_failed`/`deleted`
+as of Phase 2.8.4 below); see "Document read APIs and original download (Phase 2.8.2)" above and
+in ARCHITECTURE.md. **These five endpoints remain strictly read-only.** Document lifecycle
+*mutation* has two deliberate exceptions: `POST /api/v1/documents/{id}/ingestion/retry` (Phase
 2.8.3) schedules a new ingestion attempt for a FAILED or stale-PROCESSING document, backed by a
 real Postgres partial unique index (`ix_ingestion_jobs_one_active_per_document`) enforcing at
 most one active job per document, and `app/services/ingestion_retry_service.py`'s
@@ -1085,8 +1147,17 @@ most one active job per document, and `app/services/ingestion_retry_service.py`'
 crashed worker — see "Ingestion retry and stale-job recovery" above and in ARCHITECTURE.md.
 Retry never re-uploads content or touches Qdrant directly — vector idempotency is free by
 construction (deterministic chunk/point IDs), verified against a real ephemeral Qdrant container.
-Delete, bulk re-index/reconciliation, orphan-object cleanup, hash-based deduplication, frontend
-E2E, a real-Ollama smoke suite, a real multilingual-model evaluation run, and a real scheduler
-deployment for stale recovery remain future milestones — see "Integration tests" above, and "Test
-architecture"/"What is intentionally not implemented yet" in [ARCHITECTURE.md](ARCHITECTURE.md)
-for the full list of what's intentionally deferred.
+`DELETE /api/v1/documents/{id}` and `GET /api/v1/documents/{id}/deletion` (Phase 2.8.4) are the
+other exception: full, asynchronous, cross-system document deletion, backed by
+`app/models/document_deletion_job.py`'s append-only `DocumentDeletionJob` ledger, its own real
+Postgres partial unique index (`ix_document_deletion_jobs_one_active_per_document`), and
+`DocumentDeletionWorker` (execution triggered by `scripts/process_pending_document_deletions.py`
+/ `make process-pending-document-deletions`, mirroring `IngestionWorker`'s out-of-band execution
+model exactly) — see "Full document deletion" above and in ARCHITECTURE.md. The `Document` row
+and all `IngestionJob`/`VectorCleanupJob`/`DocumentDeletionJob` history are never physically
+removed; only Qdrant vectors and the stored object are. Bulk re-index/reconciliation,
+orphan-object cleanup, hash-based deduplication, frontend E2E, a real-Ollama smoke suite, a real
+multilingual-model evaluation run, and a real scheduler deployment for stale
+ingestion-recovery/deletion-execution remain future milestones — see "Integration tests" above,
+and "Test architecture"/"What is intentionally not implemented yet" in
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full list of what's intentionally deferred.
