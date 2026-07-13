@@ -10,6 +10,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_RESPONSE_LANGUAGES = ("he", "en")
+SUPPORTED_FILE_STORAGE_PROVIDERS = ("local", "minio")
 
 
 class Settings(BaseSettings):
@@ -74,6 +75,24 @@ class Settings(BaseSettings):
     # though the catalog's PromptType coverage did not.
     prompt_catalog_version: str = Field(default="v2", alias="PROMPT_CATALOG_VERSION")
 
+    # Storage abstraction (Phase 2.6/2.7) — selects the FileStorage implementation via
+    # app/storage/factory.py. Defaults to 'local' so `make verify` and local dev never require
+    # MinIO. See "Storage Abstraction" in ARCHITECTURE.md.
+    file_storage_provider: str = Field(default="local", alias="FILE_STORAGE_PROVIDER")
+    local_storage_root: str = Field(default="storage/documents", alias="LOCAL_STORAGE_ROOT")
+
+    # MinIO-only settings — only read/validated when FILE_STORAGE_PROVIDER=minio.
+    minio_endpoint: str | None = Field(default=None, alias="MINIO_ENDPOINT")
+    minio_access_key: str | None = Field(default=None, alias="MINIO_ACCESS_KEY")
+    minio_secret_key: str | None = Field(default=None, alias="MINIO_SECRET_KEY")
+    minio_bucket: str | None = Field(default=None, alias="MINIO_BUCKET")
+    minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
+    minio_region: str | None = Field(default=None, alias="MINIO_REGION")
+    minio_presigned_url_expiry_seconds: int = Field(
+        default=3600, alias="MINIO_PRESIGNED_URL_EXPIRY_SECONDS"
+    )
+    minio_create_bucket_if_missing: bool = Field(default=True, alias="MINIO_CREATE_BUCKET_IF_MISSING")
+
     @field_validator("vector_size")
     @classmethod
     def _validate_vector_size(cls, value: int) -> int:
@@ -99,6 +118,16 @@ class Settings(BaseSettings):
         if value not in SUPPORTED_RESPONSE_LANGUAGES:
             raise ValueError(
                 f"DEFAULT_RESPONSE_LANGUAGE must be one of {SUPPORTED_RESPONSE_LANGUAGES}, got {value!r}"
+            )
+        return value
+
+    @field_validator("file_storage_provider")
+    @classmethod
+    def _validate_file_storage_provider(cls, value: str) -> str:
+        """FILE_STORAGE_PROVIDER must name a storage provider the factory can construct."""
+        if value not in SUPPORTED_FILE_STORAGE_PROVIDERS:
+            raise ValueError(
+                f"FILE_STORAGE_PROVIDER must be one of {SUPPORTED_FILE_STORAGE_PROVIDERS}, got {value!r}"
             )
         return value
 
