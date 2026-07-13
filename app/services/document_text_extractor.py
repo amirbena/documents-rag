@@ -1,7 +1,10 @@
-"""Extracts text from a stored document file: .txt, .md, .pdf, .docx, and .xlsx only.
+"""Extracts text from a stored document's bytes: .txt, .md, .pdf, .docx, and .xlsx only.
 
-No chunking, embedding, or Qdrant upsert here — this is purely the "load the file and get raw
-text out of it" step. Routing is by file extension, but before parsing, each file's basic
+No chunking, embedding, or Qdrant upsert here — this is purely the "load the bytes and get raw
+text out of it" step. Content is read via the injected `FileStorage` (never a direct filesystem
+path) and parsed entirely in memory — pypdf/python-docx/openpyxl all accept an in-memory
+`io.BytesIO` stream directly, so no temporary file materialization is needed. Routing is by file
+extension (from the document's original filename), but before parsing, each file's basic
 structure/content is validated against what its extension claims (PDF header, DOCX/XLSX OOXML
 zip structure, UTF-8 readability for plain text) — a mismatched or corrupt file fails clearly
 instead of being handed to the wrong parser. PDF text is extracted page by page via pypdf,
@@ -11,6 +14,7 @@ as a single unnumbered page.
 """
 
 import asyncio
+import io
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +24,9 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from app.models.document import Document
+from app.storage.contract import FileStorage
+from app.storage.errors import StorageObjectNotFoundError
+from app.storage.keys import resolve_document_storage_key
 
 _PLAIN_TEXT_SUFFIXES = {".txt", ".md"}
 _SUPPORTED_SUFFIXES = _PLAIN_TEXT_SUFFIXES | {".pdf", ".docx", ".xlsx"}
@@ -29,7 +36,7 @@ _XLSX_REQUIRED_ENTRY = "xl/workbook.xml"
 
 
 class DocumentTextExtractionError(Exception):
-    """Raised when a document's stored file is missing, unsupported, or has no extractable text."""
+    """Raised when a document's stored content is missing, unsupported, or has no extractable text."""
 
 
 @dataclass
@@ -59,31 +66,36 @@ class ExtractedDocument:
 
 
 class DocumentTextExtractor:
-    """Extracts text from a Document's stored file into an ExtractedDocument."""
+    """Extracts text from a Document's stored content (read via FileStorage) into an ExtractedDocument."""
+
+    def __init__(self, storage: FileStorage) -> None:
+        self._storage = storage
 
     async def extract(self, document: Document) -> ExtractedDocument:
-        """Load the document's stored file and extract its text (blocking work off the loop)."""
-        return await asyncio.to_thread(self._extract_sync, document)
+        """Read the document's stored content via FileStorage and extract its text."""
+        key = resolve_document_storage_key(document)
+        try:
+            content = await self._storage.read(key)
+        except StorageObjectNotFoundError as exc:
+            raise DocumentTextExtractionError(f"Stored file not found: {key}") from exc
 
-    def _extract_sync(self, document: Document) -> ExtractedDocument:
-        path = Path(document.stored_path)
-        if not path.exists():
-            raise DocumentTextExtractionError(f"Stored file not found: {document.stored_path}")
+        return await asyncio.to_thread(self._extract_sync, document, content)
 
-        suffix = path.suffix.lower()
+    def _extract_sync(self, document: Document, content: bytes) -> ExtractedDocument:
+        suffix = Path(document.original_filename).suffix.lower()
         if suffix not in _SUPPORTED_SUFFIXES:
             raise DocumentTextExtractionError(f"Unsupported file type: {suffix or '(no extension)'}")
 
-        self._validate_file_type(path, suffix)
+        self._validate_file_type(content, suffix, document.original_filename)
 
         if suffix in _PLAIN_TEXT_SUFFIXES:
-            pages = [self._extract_plain_text(path)]
+            pages = [self._extract_plain_text(content)]
         elif suffix == ".pdf":
-            pages = self._extract_pdf(path)
+            pages = self._extract_pdf(content)
         elif suffix == ".docx":
-            pages = [self._extract_docx(path)]
+            pages = [self._extract_docx(content)]
         else:
-            pages = self._extract_xlsx(path)
+            pages = self._extract_xlsx(content)
 
         if not any(page.text.strip() for page in pages):
             raise DocumentTextExtractionError("No extractable text found in document.")
@@ -91,67 +103,66 @@ class DocumentTextExtractor:
         return ExtractedDocument(document_id=document.id, pages=pages)
 
     @staticmethod
-    def _validate_file_type(path: Path, suffix: str) -> None:
+    def _validate_file_type(content: bytes, suffix: str, filename: str) -> None:
         """Check the file's actual content matches what its extension claims, before parsing it."""
         if suffix in _PLAIN_TEXT_SUFFIXES:
             try:
-                path.read_text(encoding="utf-8")
+                content.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise DocumentTextExtractionError(f"File is not valid UTF-8 text: {path.name}") from exc
+                raise DocumentTextExtractionError(f"File is not valid UTF-8 text: {filename}") from exc
             return
 
         if suffix == ".pdf":
-            with path.open("rb") as f:
-                header = f.read(len(_PDF_HEADER))
-            if header != _PDF_HEADER:
-                raise DocumentTextExtractionError(f"File does not look like a valid PDF: {path.name}")
+            if content[: len(_PDF_HEADER)] != _PDF_HEADER:
+                raise DocumentTextExtractionError(f"File does not look like a valid PDF: {filename}")
             return
 
         if suffix == ".docx":
-            DocumentTextExtractor._validate_office_zip(path, _DOCX_REQUIRED_ENTRY, "DOCX")
+            DocumentTextExtractor._validate_office_zip(content, _DOCX_REQUIRED_ENTRY, "DOCX", filename)
             return
 
-        DocumentTextExtractor._validate_office_zip(path, _XLSX_REQUIRED_ENTRY, "XLSX")
+        DocumentTextExtractor._validate_office_zip(content, _XLSX_REQUIRED_ENTRY, "XLSX", filename)
 
     @staticmethod
-    def _validate_office_zip(path: Path, required_entry: str, kind: str) -> None:
+    def _validate_office_zip(content: bytes, required_entry: str, kind: str, filename: str) -> None:
         """Check the file is a valid ZIP archive containing the expected OOXML structure."""
-        if not zipfile.is_zipfile(path):
+        buffer = io.BytesIO(content)
+        if not zipfile.is_zipfile(buffer):
             raise DocumentTextExtractionError(
-                f"File does not look like a valid {kind} (not a zip archive): {path.name}"
+                f"File does not look like a valid {kind} (not a zip archive): {filename}"
             )
-        with zipfile.ZipFile(path) as archive:
+        buffer.seek(0)
+        with zipfile.ZipFile(buffer) as archive:
             if required_entry not in archive.namelist():
                 raise DocumentTextExtractionError(
-                    f"File does not look like a valid {kind} (missing {required_entry}): {path.name}"
+                    f"File does not look like a valid {kind} (missing {required_entry}): {filename}"
                 )
 
     @staticmethod
-    def _extract_plain_text(path: Path) -> ExtractedPage:
-        """Read a .txt/.md file as UTF-8 text (Hebrew and other Unicode content supported)."""
-        text = path.read_text(encoding="utf-8")
-        return ExtractedPage(text=text, page_number=None)
+    def _extract_plain_text(content: bytes) -> ExtractedPage:
+        """Decode a .txt/.md file's bytes as UTF-8 text (Hebrew and other Unicode content supported)."""
+        return ExtractedPage(text=content.decode("utf-8"), page_number=None)
 
     @staticmethod
-    def _extract_pdf(path: Path) -> list[ExtractedPage]:
+    def _extract_pdf(content: bytes) -> list[ExtractedPage]:
         """Extract text page by page from a PDF, preserving 1-indexed page numbers."""
-        reader = PdfReader(str(path))
+        reader = PdfReader(io.BytesIO(content))
         return [
             ExtractedPage(text=page.extract_text() or "", page_number=index + 1)
             for index, page in enumerate(reader.pages)
         ]
 
     @staticmethod
-    def _extract_docx(path: Path) -> ExtractedPage:
+    def _extract_docx(content: bytes) -> ExtractedPage:
         """Extract plain paragraph text from a DOCX (no tables, headers/footers, or pagination)."""
-        document = docx.Document(str(path))
+        document = docx.Document(io.BytesIO(content))
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         return ExtractedPage(text=text)
 
     @staticmethod
-    def _extract_xlsx(path: Path) -> list[ExtractedPage]:
+    def _extract_xlsx(content: bytes) -> list[ExtractedPage]:
         """Extract text sheet by sheet from an XLSX, preserving each sheet's name."""
-        workbook = load_workbook(str(path), read_only=True, data_only=True)
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         pages = []
         for sheet in workbook.worksheets:
             rows_text = [

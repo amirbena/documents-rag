@@ -27,6 +27,8 @@ from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunk, DocumentChunker
 from app.services.document_text_extractor import DocumentTextExtractor
 from app.services.index_registry import ensure_active_collection, mark_document_indexed
+from app.storage.contract import FileStorage
+from app.storage.factory import create_file_storage
 
 ProcessDocumentFn = Callable[[Document | None, IngestionJob, AsyncSession], Awaitable[None]]
 
@@ -51,13 +53,13 @@ def to_vector_point(chunk: DocumentChunk, vector: list[float], source: str) -> V
 
 
 async def _default_process_document(
-    document: Document | None, job: IngestionJob, session: AsyncSession
+    document: Document | None, job: IngestionJob, session: AsyncSession, file_storage: FileStorage
 ) -> None:
     """Extract text, chunk it, embed each chunk, and upsert the vectors into the active collection."""
     if document is None:
         raise ValueError(f"Document not found for job {job.id}")
 
-    extracted = await DocumentTextExtractor().extract(document)
+    extracted = await DocumentTextExtractor(storage=file_storage).extract(document)
 
     settings = get_settings()
     config = get_active_embedding_config(settings)
@@ -86,8 +88,19 @@ async def _default_process_document(
 class IngestionWorker:
     """Claims and processes one pending IngestionJob at a time."""
 
-    def __init__(self, process_document: ProcessDocumentFn | None = None) -> None:
-        self._process_document = process_document or _default_process_document
+    def __init__(
+        self,
+        process_document: ProcessDocumentFn | None = None,
+        file_storage: FileStorage | None = None,
+    ) -> None:
+        self._file_storage = file_storage or create_file_storage()
+        self._process_document = process_document or self._default_process_document
+
+    async def _default_process_document(
+        self, document: Document | None, job: IngestionJob, session: AsyncSession
+    ) -> None:
+        """Bind the worker's injected FileStorage into the module-level default processing step."""
+        await _default_process_document(document, job, session, self._file_storage)
 
     async def process_next_job(self, session: AsyncSession) -> IngestionJob | None:
         """Claim one pending job, run the processing step, and resolve its final status.

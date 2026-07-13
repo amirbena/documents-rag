@@ -20,6 +20,7 @@ from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunker
 from app.services.ingestion_worker import IngestionWorker
+from app.storage.local_storage import LocalFileStorage
 
 
 @pytest.fixture(autouse=True)
@@ -129,15 +130,22 @@ class _FakeAsyncSession:
 def _add_document_and_job(
     session: _FakeAsyncSession,
     status: IngestionStatus = IngestionStatus.PENDING,
-    stored_path: str = "storage/documents/x.pdf",
+    storage_key: str = "x.pdf",
+    original_filename: str | None = None,
 ) -> IngestionJob:
+    # original_filename's extension drives extractor routing — default to a name matching
+    # storage_key's extension so real-extraction tests (which write actual .txt content under
+    # a file named after storage_key) route to the right parser.
+    original_filename = original_filename or ("handbook.pdf" if storage_key == "x.pdf" else storage_key)
     document = Document(
         id=str(uuid.uuid4()),
-        original_filename="handbook.pdf",
+        original_filename=original_filename,
         stored_filename=f"{uuid.uuid4().hex}.pdf",
         content_type="application/pdf",
         file_size=123,
-        stored_path=stored_path,
+        stored_path=storage_key,
+        storage_provider="local",
+        storage_key=storage_key,
     )
     session.add(document)
     job = IngestionJob(id=str(uuid.uuid4()), document_id=document.id, status=status)
@@ -276,8 +284,8 @@ async def test_worker_marks_completed_when_extraction_succeeds(
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -301,9 +309,9 @@ async def test_worker_marks_zero_chunk_document_indexed_with_no_vectors(
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    job = _add_document_and_job(session, stored_path=str(file_path))
+    job = _add_document_and_job(session, storage_key=file_path.name)
     document = session._documents[job.document_id]
-    worker = IngestionWorker()
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -319,8 +327,8 @@ async def test_worker_marks_failed_when_extraction_fails(tmp_path: Path) -> None
     missing_path = tmp_path / "does_not_exist.txt"
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(missing_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=missing_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -352,8 +360,8 @@ async def test_worker_default_pipeline_extracts_then_chunks(tmp_path: Path, monk
     monkeypatch.setattr(DocumentChunker, "chunk", _spying_chunk)
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -377,8 +385,8 @@ async def test_worker_embeds_each_chunk(tmp_path: Path, monkeypatch) -> None:
     file_path.write_text("hello world " * 300, encoding="utf-8")
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -404,9 +412,9 @@ async def test_worker_upserts_vectors_preserving_metadata(tmp_path: Path, monkey
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    job = _add_document_and_job(session, stored_path=str(file_path))
+    job = _add_document_and_job(session, storage_key=file_path.name)
     document = session._documents[job.document_id]
-    worker = IngestionWorker()
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -440,8 +448,8 @@ async def test_worker_marks_failed_when_embedding_fails(tmp_path: Path, monkeypa
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -463,8 +471,8 @@ async def test_worker_marks_failed_when_vector_store_fails(tmp_path: Path, monke
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 
@@ -493,8 +501,8 @@ async def test_worker_never_calls_llm_provider_during_ingestion(tmp_path: Path, 
     file_path.write_text("hello world", encoding="utf-8")
 
     session = _FakeAsyncSession()
-    _add_document_and_job(session, stored_path=str(file_path))
-    worker = IngestionWorker()
+    _add_document_and_job(session, storage_key=file_path.name)
+    worker = IngestionWorker(file_storage=LocalFileStorage(root=tmp_path))
 
     result = await worker.process_next_job(session)
 

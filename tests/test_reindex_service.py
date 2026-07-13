@@ -17,6 +17,7 @@ from app.rag.providers.vector_store import VectorPoint
 from app.services.document_chunker import DocumentChunker
 from app.services.index_registry import get_pending_cleanup_jobs
 from app.services.reindex_service import ReindexOutcome, reindex_document
+from app.storage.local_storage import LocalFileStorage
 
 
 @pytest.fixture(autouse=True)
@@ -136,10 +137,10 @@ async def test_reindex_of_a_never_indexed_document_writes_vectors_and_marks_inde
     monkeypatch.setattr(reindex_service_module, "get_embedding_provider", lambda settings: embedding_provider)
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
 
-    document = _document(stored_path=str(file_path))
+    document = _document(storage_provider="local", storage_key=file_path.name)
     session = _FakeSession()
 
-    result = await reindex_document(document, session)
+    result = await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert result.outcome == ReindexOutcome.REINDEXED
     assert result.document is document
@@ -168,7 +169,7 @@ async def test_reindex_of_an_already_current_document_is_a_noop(tmp_path: Path, 
     )
     session = _FakeSession()
 
-    result = await reindex_document(document, session)
+    result = await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert result.outcome == ReindexOutcome.ALREADY_CURRENT
     assert embedding_provider.embed_calls == []
@@ -188,7 +189,8 @@ async def test_reindex_into_a_new_version_deletes_the_previous_collections_vecto
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
 
     document = _document(
-        stored_path=str(file_path),
+        storage_provider="local",
+        storage_key=file_path.name,
         collection_name="documents__ollama__old-model__ev0__cv0__d3",
         embedding_version="v0",
         chunking_version="v0",
@@ -196,7 +198,7 @@ async def test_reindex_into_a_new_version_deletes_the_previous_collections_vecto
     session = _FakeSession()
 
     active_config = get_active_embedding_config()
-    result = await reindex_document(document, session)
+    result = await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert result.outcome == ReindexOutcome.REINDEXED
     assert document.collection_name == active_config.collection_name
@@ -218,11 +220,11 @@ async def test_reindex_failure_does_not_mark_document_current(tmp_path: Path, mo
 
     file_path = tmp_path / "notes.txt"
     file_path.write_text("hello world " * 50, encoding="utf-8")
-    document = _document(stored_path=str(file_path))
+    document = _document(storage_provider="local", storage_key=file_path.name)
     session = _FakeSession()
 
     try:
-        await reindex_document(document, session)
+        await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
         raise AssertionError("expected RuntimeError")
     except RuntimeError as exc:
         assert str(exc) == "embedding unavailable"
@@ -244,16 +246,17 @@ async def test_reindex_is_idempotent_for_the_same_active_collection(tmp_path: Pa
     monkeypatch.setattr(reindex_service_module, "get_embedding_provider", lambda settings: embedding_provider)
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
 
-    document = _document(stored_path=str(file_path))
+    document = _document(storage_provider="local", storage_key=file_path.name)
     session = _FakeSession()
 
-    await reindex_document(document, session)
+    file_storage = LocalFileStorage(root=tmp_path)
+    await reindex_document(document, session, file_storage=file_storage)
     active_config = get_active_embedding_config()
     first_point_ids = [point.id for point in vector_store.upserted[active_config.collection_name]]
 
     # Force staleness again to exercise a second real re-index run (same active config).
     document.collection_name = None
-    await reindex_document(document, session)
+    await reindex_document(document, session, file_storage=file_storage)
     all_points = vector_store.upserted[active_config.collection_name]
     second_point_ids = [point.id for point in all_points[len(first_point_ids) :]]
 
@@ -281,11 +284,11 @@ async def test_commit_failure_rolls_back_and_expires_the_document(tmp_path: Path
     monkeypatch.setattr(reindex_service_module, "get_embedding_provider", lambda settings: embedding_provider)
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
 
-    document = _document(stored_path=str(file_path))
+    document = _document(storage_provider="local", storage_key=file_path.name)
     session = _FakeSession(fail_commit=True)
 
     with pytest.raises(RuntimeError, match="db unavailable"):
-        await reindex_document(document, session)
+        await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert session.rollback_count == 1
     assert document in session.expired
@@ -310,14 +313,15 @@ async def test_cleanup_failure_after_successful_commit_is_reindexed_with_cleanup
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
 
     document = _document(
-        stored_path=str(file_path),
+        storage_provider="local",
+        storage_key=file_path.name,
         collection_name=previous_collection,
         embedding_version="v0",
         chunking_version="v0",
     )
     session = _FakeSession()
 
-    result = await reindex_document(document, session)
+    result = await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
     # The document itself IS current — the re-index is not reported as a failure.
@@ -343,10 +347,10 @@ async def test_zero_chunk_document_is_reindexed_empty(tmp_path: Path, monkeypatc
     monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings: vector_store)
     monkeypatch.setattr(DocumentChunker, "chunk", lambda self, extracted: [])
 
-    document = _document(stored_path=str(file_path))
+    document = _document(storage_provider="local", storage_key=file_path.name)
     session = _FakeSession()
 
-    result = await reindex_document(document, session)
+    result = await reindex_document(document, session, file_storage=LocalFileStorage(root=tmp_path))
 
     assert result.outcome == ReindexOutcome.REINDEXED_EMPTY
     active_config = get_active_embedding_config()

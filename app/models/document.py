@@ -1,5 +1,13 @@
 """ORM model for an uploaded document's storage/original filename metadata, plus which indexing
 configuration (if any) it was last successfully indexed with.
+
+`storage_provider`/`storage_bucket`/`storage_key` are the provider-neutral storage identity
+introduced in Phase 2.6/2.7 — `storage_key` is what `FileStorage.read()`/`.delete()` are called
+with, never `stored_path`. `stored_filename`/`stored_path` are retained for backward
+compatibility with rows written before this migration: a row with `storage_key IS NULL` is a
+pre-migration local document whose `stored_path` value is treated as its local storage key (see
+`app.storage.keys.resolve_document_storage_key` and the migration in
+`alembic/versions/`) — this is documented, not silently unreadable.
 """
 
 from datetime import datetime
@@ -30,6 +38,12 @@ class Document(Base):
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
     stored_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Provider-neutral storage identity (Phase 2.6/2.7) — see module docstring.
+    storage_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    storage_bucket: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    storage_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     embedding_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
