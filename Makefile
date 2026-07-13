@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio smoke-multilingual-real
+.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio test-document-read test-document-read-integration lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio verify-document-read verify-document-read-integration smoke-multilingual-real
 
 help:
 	@echo "Available commands:"
@@ -19,6 +19,11 @@ help:
 	@echo "                          (needs Docker)"
 	@echo "  make test-minio        - run only the MinIO-specific unit + integration tests"
 	@echo "                          (needs Docker for the integration half)"
+	@echo "  make test-document-read - run the Phase 2.8.2 document read/download API unit tests"
+	@echo "                          (list/detail/ingestion/failure/download, local storage) —"
+	@echo "                          no Docker required"
+	@echo "  make test-document-read-integration - run the Testcontainers-based Postgres + MinIO"
+	@echo "                          coverage for the document read/download APIs (needs Docker)"
 	@echo "  make lint              - lint the codebase (ruff check .)"
 	@echo "  make typecheck         - type-check the app package (mypy app)"
 	@echo "  make compose           - validate docker-compose.yml (docker compose config)"
@@ -34,6 +39,10 @@ help:
 	@echo "  make verify-storage     - run the storage-abstraction unit tests plus their own checks"
 	@echo "  make verify-storage-integration - run the MinIO integration suite plus its own checks"
 	@echo "  make verify-minio       - run the MinIO-specific tests plus their own checks"
+	@echo "  make verify-document-read - run the document read/download unit tests plus their own"
+	@echo "                          checks"
+	@echo "  make verify-document-read-integration - run the document read/download Postgres +"
+	@echo "                          MinIO integration/E2E coverage plus its own checks"
 	@echo "  make smoke-multilingual-real - OPTIONAL, MANUAL, non-blocking: exercise the real"
 	@echo "                          configured embedding model (default bge-m3) against 5"
 	@echo "                          Hebrew/English scenarios. Needs a local Ollama with the"
@@ -77,6 +86,13 @@ test-minio:
 	pytest tests/test_minio_file_storage.py -q
 	pytest -m integration tests/integration/test_minio_storage.py tests/integration/test_ingestion_worker_minio.py -q
 
+test-document-read:
+	pytest tests/test_document_query_service.py tests/test_document_read_routes.py tests/test_document_download_local_storage.py -q
+
+test-document-read-integration:
+	pytest -m integration tests/integration/test_document_read_api.py tests/integration/test_document_download_minio.py -q
+	pytest -m e2e tests/e2e/backend/test_document_read_api.py tests/e2e/backend/test_document_read_api_minio.py -q
+
 lint:
 	ruff check .
 
@@ -112,6 +128,12 @@ verify-storage-integration: test-storage-integration
 
 verify-minio: test-minio
 	@echo "MinIO quality gates passed."
+
+verify-document-read: test-document-read
+	@echo "Document read/download quality gates passed."
+
+verify-document-read-integration: test-document-read-integration
+	@echo "Document read/download integration/E2E quality gates passed."
 
 smoke-multilingual-real:
 	python scripts/smoke_multilingual_real.py
