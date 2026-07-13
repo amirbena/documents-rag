@@ -988,6 +988,31 @@ document-and-question matrix under both engines. Both suites use
 embedding model. `make test-multilingual-rag`/`make verify-multilingual-rag` run just these files
 as a convenience, same caveat as `verify-rag-engines` above.
 
+MinIO storage coverage spans two tiers, plus one focused backend-E2E addition (there is no
+MinIO-specific unit tier — `FileStorage`'s contract/local/factory/upload/ingestion-wiring unit
+tests already cover the provider-neutral seams without a real object store). Real-adapter and
+real-pipeline coverage: `tests/integration/test_minio_storage.py` exercises `MinioFileStorage`
+directly against a real, ephemeral MinIO container (bucket init, save/read/delete/exists/metadata,
+presigned URLs, not-found/error translation), and
+`tests/integration/test_ingestion_worker_minio.py` runs the real `IngestionWorker` pipeline
+(extraction → chunking → fake embeddings → real Qdrant upsert) reading content that only ever
+lived in MinIO. Public-contract coverage: `tests/e2e/backend/test_minio_e2e.py` runs the same
+upload → ingestion → retrieval → streaming chat flow as `test_upload_to_streaming_chat.py`, but
+through the real HTTP boundary with `FILE_STORAGE_PROVIDER=minio` resolved via the app's actual
+`Settings`/`create_file_storage()` dependency chain (never a hand-substituted storage instance),
+under both `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`. It additionally verifies the uploaded
+object landed in MinIO (queried via `Document.storage_key`, read back through `MinioFileStorage`,
+byte-compared) and that no MinIO implementation detail (bucket name, endpoint, credentials) leaks
+into the public response. The ephemeral MinIO container itself is started by
+`tests/support/minio_containers.py`, a small shared helper both `tests/integration/conftest.py`
+and `tests/e2e/backend/conftest.py` call, instead of duplicating the `DockerContainer` setup in
+each — the container is only started lazily when a test actually requests it, so the existing
+local-storage E2E tests never pay for it. `make test-storage`/`make test-storage-integration`/
+`make test-minio` and `make test-e2e-backend-minio`/`make verify-e2e-backend-minio` run these
+tiers individually as a convenience, same caveat as `verify-rag-engines` above. None of this
+covers browser/frontend E2E, real AWS S3/Cloudflare R2, orphan-object cleanup, document-lifecycle
+deletion, or production storage benchmarking — see "What is intentionally not implemented yet".
+
 ### AI-provider policy in tests
 
 No tier pulls or calls a real LLM/embedding model. Unit tests use hand-written fake provider
@@ -1290,11 +1315,16 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
   (`get_rag_engine()`, `UnsupportedRagEngineError`).
 - `app/workers` — background job placeholders.
 - `tests/integration/` — the Testcontainers-based integration suite (see "Test architecture"
-  above): `conftest.py` (ephemeral Postgres/Qdrant fixtures, the production-environment guard,
-  the Alembic-migration helpers), `test_alembic_migrations.py`, `test_ingestion_worker_postgres.py`,
-  `test_qdrant_vector_store_integration.py`, `test_langchain_rag_engine_integration.py`. Entirely
-  separate from `tests/*.py` (unit tests); auto-marked `@pytest.mark.integration` and excluded
-  from `make test`/`make verify`.
+  above): `conftest.py` (ephemeral Postgres/Qdrant/MinIO fixtures, the production-environment
+  guard, the Alembic-migration helpers), `test_alembic_migrations.py`,
+  `test_ingestion_worker_postgres.py`, `test_qdrant_vector_store_integration.py`,
+  `test_langchain_rag_engine_integration.py`, `test_minio_storage.py`,
+  `test_ingestion_worker_minio.py`. Entirely separate from `tests/*.py` (unit tests); auto-marked
+  `@pytest.mark.integration` and excluded from `make test`/`make verify`.
+- `tests/support/` — small, non-test helper modules reused by more than one test tier;
+  `minio_containers.py` holds the one ephemeral-MinIO-container startup routine
+  `tests/integration/conftest.py` and `tests/e2e/backend/conftest.py` both call, instead of each
+  duplicating the `DockerContainer` setup.
 
 ## What is intentionally not implemented yet
 

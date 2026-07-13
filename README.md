@@ -821,12 +821,24 @@ part of `make test`/`make verify`, and it is a distinct suite from `tests/integr
   factory each consuming module already imports, never a production-code branch on `APP_ENV`.
   **No real Ollama container runs and no model is pulled.**
 - **Containers and all state are removed after the test session.**
+- **MinIO backend E2E coverage** — `tests/e2e/backend/test_minio_e2e.py` runs the same
+  upload → ingestion → retrieval → streaming chat flow through the real HTTP boundary with
+  `FILE_STORAGE_PROVIDER=minio`, against a real, ephemeral MinIO container (Testcontainers,
+  dynamic port, unique bucket per test, no persistent volume), selected purely through the app's
+  real `Settings`/`create_file_storage()` dependency chain — never a hand-substituted storage
+  instance. It verifies the uploaded object exists in MinIO under the `Document` row's real
+  `storage_key` with byte-identical content, that Hebrew/Unicode filenames and content survive the
+  full round trip, that citation/source identity and the SSE event contract are unaffected by the
+  storage provider, and that no MinIO implementation detail (bucket name, endpoint, credentials)
+  leaks into the public response. Runs under both `RAG_ENGINE=custom` and `RAG_ENGINE=langchain`.
 
 Run it with:
 
 ```bash
-make test-e2e-backend     # pytest -m e2e tests/e2e/backend -q
+make test-e2e-backend     # pytest -m e2e tests/e2e/backend -q (includes the MinIO E2E test)
 make verify-e2e-backend   # runs the backend E2E suite (room for future E2E-specific checks)
+make test-e2e-backend-minio    # the MinIO backend E2E test only (needs Docker)
+make verify-e2e-backend-minio  # runs the MinIO backend E2E test (room for future checks)
 ```
 
 ## Pre-commit verification
@@ -970,7 +982,13 @@ abstraction (`app/storage/`) now sits behind upload/ingestion/extraction/re-inde
 `delete`/`exists`/`get_metadata`/`generate_download_url`, backed by `LocalFileStorage` (default)
 or `MinioFileStorage` (S3-compatible, selected via `FILE_STORAGE_PROVIDER=minio`), resolved
 through one factory (`create_file_storage()`) exactly like the AI provider factory — see "Storage
-abstraction" above and "Storage Abstraction (Phase 2.6/2.7)" in ARCHITECTURE.md. Document
+abstraction" above and "Storage Abstraction (Phase 2.6/2.7)" in ARCHITECTURE.md. MinIO is now
+covered end to end: real adapter tests (`tests/integration/test_minio_storage.py`), a real
+ingestion-pipeline test (`tests/integration/test_ingestion_worker_minio.py`), and a focused
+public backend E2E test (`tests/e2e/backend/test_minio_e2e.py`, `make test-e2e-backend-minio`)
+that drives `POST /api/v1/documents` → real MinIO → ingestion → `POST /api/v1/chat` through real
+HTTP with `FILE_STORAGE_PROVIDER=minio`, under both `RAG_ENGINE=custom` and
+`RAG_ENGINE=langchain` — see "Backend E2E tests" above. Document
 lifecycle APIs (deletion, download, listing), orphan-object cleanup, hash-based deduplication,
 frontend E2E, a real-Ollama smoke suite, and a real multilingual-model evaluation run remain
 future milestones — see "Integration tests" above, and "Test architecture"/"What is intentionally

@@ -1,4 +1,4 @@
-.PHONY: help test test-unit test-integration test-e2e-backend test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio lint typecheck compose verify verify-integration verify-e2e-backend verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio smoke-multilingual-real
+.PHONY: help test test-unit test-integration test-e2e-backend test-e2e-backend-minio test-rag-engines test-multilingual-rag test-storage test-storage-integration test-minio lint typecheck compose verify verify-integration verify-e2e-backend verify-e2e-backend-minio verify-rag-engines verify-multilingual-rag verify-storage verify-storage-integration verify-minio smoke-multilingual-real
 
 help:
 	@echo "Available commands:"
@@ -6,6 +6,8 @@ help:
 	@echo "  make test-unit         - alias for 'make test'"
 	@echo "  make test-integration  - run the Testcontainers-based integration suite (needs Docker)"
 	@echo "  make test-e2e-backend  - run the Testcontainers-based backend E2E suite (needs Docker)"
+	@echo "  make test-e2e-backend-minio - run the backend E2E suite's focused MinIO coverage"
+	@echo "                          (upload -> real MinIO -> ingestion -> streaming chat, needs Docker)"
 	@echo "  make test-rag-engines  - run only the RAG engine (custom/LangChain) unit, integration,"
 	@echo "                          and E2E parity tests (needs Docker for the latter two)"
 	@echo "  make test-multilingual-rag - run only the Phase 2.5 multilingual RAG unit,"
@@ -25,6 +27,8 @@ help:
 	@echo "                          fast, does not require Docker beyond compose-config validation)"
 	@echo "  make verify-integration - run the integration suite plus its own checks"
 	@echo "  make verify-e2e-backend - run the backend E2E suite plus its own checks"
+	@echo "  make verify-e2e-backend-minio - run the backend E2E suite's MinIO coverage plus its"
+	@echo "                          own checks"
 	@echo "  make verify-rag-engines - run the RAG engine tests plus their own checks"
 	@echo "  make verify-multilingual-rag - run the multilingual RAG tests plus their own checks"
 	@echo "  make verify-storage     - run the storage-abstraction unit tests plus their own checks"
@@ -49,6 +53,9 @@ test-integration:
 
 test-e2e-backend:
 	pytest -m e2e tests/e2e/backend -q
+
+test-e2e-backend-minio:
+	pytest -m e2e tests/e2e/backend/test_minio_e2e.py -q
 
 test-rag-engines:
 	pytest tests/test_rag_engine_factory.py tests/test_custom_rag_engine.py tests/test_langchain_rag_engine.py tests/test_langchain_adapters.py tests/test_prompt_provider_engine_parity.py -q
@@ -87,6 +94,9 @@ verify-integration: test-integration
 
 verify-e2e-backend: test-e2e-backend
 	@echo "Backend E2E quality gates passed."
+
+verify-e2e-backend-minio: test-e2e-backend-minio
+	@echo "Backend E2E MinIO quality gates passed."
 
 verify-rag-engines: test-rag-engines
 	@echo "RAG engine compatibility layer quality gates passed."
