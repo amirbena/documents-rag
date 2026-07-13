@@ -24,6 +24,9 @@ from app.core.config import Settings
 from app.core.version import SERVICE_NAME, SERVICE_VERSION
 from app.schemas.health import DependenciesResponse, DependencyCheckResult, ReadinessResponse
 from app.services.ollama_client import OllamaClient
+from app.storage.errors import StorageError
+from app.storage.factory import create_file_storage
+from app.storage.minio_storage import MinioFileStorage
 
 CHECK_TIMEOUT_SECONDS = 3.0
 
@@ -118,18 +121,43 @@ async def check_ollama(settings: Settings) -> list[DependencyCheckResult]:
     return [ollama_check, chat_model_check, embedding_model_check]
 
 
+async def check_file_storage(settings: Settings) -> DependencyCheckResult:
+    """Validate the configured FileStorage backend is reachable and usable.
+
+    Local storage: the configured root exists (or can be created) and is writable. MinIO: the
+    endpoint is reachable, credentials are accepted, and the configured bucket exists (or can be
+    created, per MINIO_CREATE_BUCKET_IF_MISSING). Never returns a raw exception message,
+    connection string, or credential — see module docstring.
+    """
+    try:
+        async with asyncio.timeout(CHECK_TIMEOUT_SECONDS):
+            storage = create_file_storage(settings)
+            if isinstance(storage, MinioFileStorage):
+                await storage.ensure_bucket()
+            else:
+                probe_key = "__health_check__/probe.txt"
+                await storage.save(probe_key, b"ok")
+                await storage.delete(probe_key)
+        return DependencyCheckResult(name="file_storage", status="ok", required=True)
+    except (StorageError, TimeoutError, OSError):
+        return DependencyCheckResult(
+            name="file_storage", status="error", required=True, detail="File storage is unavailable."
+        )
+
+
 async def run_all_checks(settings: Settings) -> list[DependencyCheckResult]:
     """Run every dependency check concurrently and return their results.
 
     Never raises: each check function already turns its own failure into an "error" result.
     """
-    postgres_result, redis_result, qdrant_result, ollama_results = await asyncio.gather(
+    postgres_result, redis_result, qdrant_result, ollama_results, storage_result = await asyncio.gather(
         check_postgres(settings),
         check_redis(settings),
         check_qdrant(settings),
         check_ollama(settings),
+        check_file_storage(settings),
     )
-    return [postgres_result, redis_result, qdrant_result, *ollama_results]
+    return [postgres_result, redis_result, qdrant_result, *ollama_results, storage_result]
 
 
 @dataclass

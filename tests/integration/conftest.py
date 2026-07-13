@@ -94,6 +94,46 @@ def qdrant_container() -> Iterator[DockerContainer]:
         container.stop()
 
 
+_MINIO_TEST_ROOT_USER = "minioadmin-test"
+_MINIO_TEST_ROOT_PASSWORD = "minioadmin-test-secret"
+
+
+@pytest.fixture(scope="session")
+def minio_container() -> Iterator[DockerContainer]:
+    """Start one ephemeral MinIO container for the whole integration session, dynamic port.
+
+    Test-only credentials, dynamic host port, no persistent volume — mirrors qdrant_container's
+    style exactly (see module docstring).
+    """
+    container = (
+        DockerContainer("minio/minio:latest")
+        .with_exposed_ports(9000)
+        .with_env("MINIO_ROOT_USER", _MINIO_TEST_ROOT_USER)
+        .with_env("MINIO_ROOT_PASSWORD", _MINIO_TEST_ROOT_PASSWORD)
+        .with_command("server /data")
+    )
+    container.waiting_for(HttpWaitStrategy(9000, "/minio/health/live"))
+    container.start()
+    try:
+        yield container
+    finally:
+        container.stop()
+
+
+@pytest.fixture(scope="session")
+def minio_endpoint(minio_container: DockerContainer) -> str:
+    """Dynamically generated host:port endpoint for the ephemeral MinIO container."""
+    host = minio_container.get_container_host_ip()
+    port = minio_container.get_exposed_port(9000)
+    return f"{host}:{port}"
+
+
+@pytest.fixture(scope="session")
+def minio_credentials() -> tuple[str, str]:
+    """The test-only access key / secret key the ephemeral MinIO container was started with."""
+    return _MINIO_TEST_ROOT_USER, _MINIO_TEST_ROOT_PASSWORD
+
+
 @pytest.fixture(scope="session")
 def postgres_url(postgres_container: PostgresContainer) -> str:
     """Dynamically generated asyncpg connection URL for the ephemeral Postgres container."""
