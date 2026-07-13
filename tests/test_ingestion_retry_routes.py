@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from tests.support.fake_ingestion_retry_session import FakeIngestionRetrySession
 
@@ -140,6 +141,27 @@ def test_retry_completed_job_returns_409() -> None:
     session.documents[document.id] = document
     completed_job = _job(document.id, IngestionStatus.COMPLETED)
     session.jobs[completed_job.id] = completed_job
+
+    response = _retry(document.id)
+
+    assert response.status_code == 409
+
+
+def test_retry_returns_409_when_document_is_being_deleted() -> None:
+    session = _override_session()
+    document = _document()
+    session.documents[document.id] = document
+    failed_job = _job(document.id, IngestionStatus.FAILED)
+    session.jobs[failed_job.id] = failed_job
+    session.deletion_jobs["d1"] = DocumentDeletionJob(
+        id="d1",
+        document_id=document.id,
+        status=DocumentDeletionStatus.PENDING,
+        vector_cleanup_completed=False,
+        storage_cleanup_completed=False,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
 
     response = _retry(document.id)
 

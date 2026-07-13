@@ -1,15 +1,18 @@
-"""Document upload + read-only inspection/download endpoints.
+"""Document upload + read-only inspection/download endpoints, plus deletion scheduling/status.
 
 Upload does not parse, chunk, embed, or index the document — that happens asynchronously via
-`app.services.ingestion_worker`. The five read routes here (list, detail, ingestion status,
-failure, download) are strictly read-only: no mutation of Postgres, object storage, Qdrant,
-ingestion jobs, or cleanup records happens on any of them. `POST .../ingestion/retry` (Phase
-2.8.3) is the one mutating route in this module — it only ever inserts a new PENDING IngestionJob
-row via `app.services.ingestion_retry_service`, never a delete/re-index/reconciliation endpoint.
-All business/aggregation/locking logic (lifecycle derivation, latest-job selection, sanitization,
-N+1-avoidance, retry transaction semantics) lives in `app.services.document_query_service` /
-`app.services.ingestion_retry_service` — routes here only parse/inject/call/copy-status, per
-CLAUDE.md's "Route Layer Style".
+`app.services.ingestion_worker`. The five original read routes here (list, detail, ingestion
+status, failure, download) are strictly read-only: no mutation of Postgres, object storage,
+Qdrant, ingestion jobs, or cleanup records happens on any of them. `POST .../ingestion/retry`
+(Phase 2.8.3) only ever inserts a new PENDING IngestionJob row via
+`app.services.ingestion_retry_service`. `DELETE /documents/{id}` and `GET .../deletion` (Phase
+2.8.4) schedule/report full document deletion via `app.services.document_deletion_service` — the
+DELETE route only ever inserts a new PENDING DocumentDeletionJob row (or reports an existing one);
+the actual cross-system cleanup runs out-of-band via
+`scripts/process_pending_document_deletions.py` / `DocumentDeletionWorker`, never inline in this
+request. All business/aggregation/locking logic (lifecycle derivation, latest-job selection,
+sanitization, N+1-avoidance, retry/deletion transaction semantics) lives in the service modules —
+routes here only parse/inject/call/copy-status, per CLAUDE.md's "Route Layer Style".
 """
 
 from urllib.parse import quote
@@ -20,13 +23,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.session import get_db_session
+from app.rag.providers.provider_factory import get_vector_store as _resolve_vector_store
+from app.rag.providers.vector_store import VectorStore
 from app.schemas.documents import (
+    DocumentDeletionResponse,
+    DocumentDeletionStatusResponse,
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentUploadResponse,
     IngestionFailureResponse,
     IngestionRetryResponse,
     IngestionStatusResponse,
+)
+from app.services.document_deletion_service import (
+    DeletionRequestOutcome,
+    get_latest_deletion_job,
+    request_document_deletion,
+    sanitize_deletion_error,
 )
 from app.services.document_query_service import (
     DEFAULT_LIST_LIMIT,
@@ -48,6 +61,11 @@ router = APIRouter()
 def get_file_storage() -> FileStorage:
     """Build the configured FileStorage implementation via the storage factory."""
     return create_file_storage()
+
+
+def get_vector_store() -> VectorStore:
+    """Build the configured VectorStore implementation via the provider factory."""
+    return _resolve_vector_store()
 
 
 @router.post(
@@ -136,6 +154,11 @@ _RETRY_OUTCOME_ERRORS = {
         status.HTTP_409_CONFLICT,
         "Document is already indexed; use the re-index path instead of retry.",
     ),
+    RetryOutcome.DELETION_ACTIVE: (
+        status.HTTP_409_CONFLICT,
+        "Document is being deleted, deletion failed, or the document was deleted; "
+        "ingestion retry is not available.",
+    ),
 }
 
 
@@ -222,4 +245,69 @@ async def download_document_route(
         content=result.content,
         media_type=result.content_type,
         headers={"Content-Disposition": _content_disposition_header(result.original_filename)},
+    )
+
+
+@router.delete("/documents/{document_id}", response_model=DocumentDeletionResponse)
+async def delete_document_route(
+    document_id: str, response: Response, db: AsyncSession = Depends(get_db_session)
+) -> DocumentDeletionResponse:
+    """Schedule full deletion of a document, or report its existing/completed deletion attempt.
+
+    202 with `created=True` when a new PENDING DocumentDeletionJob was inserted; 202 with
+    `created=False` when an already-active (PENDING/PROCESSING) job was returned instead; 200
+    with `created=False` when the document was already fully deleted (idempotent); 404 if the
+    document does not exist; 409 if the document's latest ingestion job is still PENDING/
+    PROCESSING (deletion never races an in-flight ingestion). Never performs the actual
+    cross-system cleanup inline — see `app.services.document_deletion_service.
+    request_document_deletion` and `DocumentDeletionWorker`.
+    """
+    result = await request_document_deletion(db, document_id)
+
+    if result.outcome == DeletionRequestOutcome.DOCUMENT_NOT_FOUND:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+    if result.outcome == DeletionRequestOutcome.INGESTION_ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document has an active ingestion job; cannot delete until it resolves.",
+        )
+
+    assert result.job is not None
+    created = result.outcome == DeletionRequestOutcome.CREATED
+    response.status_code = (
+        status.HTTP_200_OK
+        if result.outcome == DeletionRequestOutcome.ALREADY_DELETED
+        else status.HTTP_202_ACCEPTED
+    )
+    return DocumentDeletionResponse(
+        document_id=document_id,
+        deletion_job_id=result.job.id,
+        status=result.job.status,
+        created=created,
+    )
+
+
+@router.get("/documents/{document_id}/deletion", response_model=DocumentDeletionStatusResponse)
+async def get_document_deletion_route(
+    document_id: str, db: AsyncSession = Depends(get_db_session)
+) -> DocumentDeletionStatusResponse:
+    """Return one document's latest deletion attempt; 404 if no deletion was ever requested.
+
+    Never exposes a storage key/bucket, Qdrant collection internals, or a raw provider exception —
+    `safe_message` is always `sanitize_deletion_error()`'s fixed, generic text.
+    """
+    job = await get_latest_deletion_job(db, document_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No deletion attempt found.")
+
+    return DocumentDeletionStatusResponse(
+        document_id=document_id,
+        deletion_job_id=job.id,
+        status=job.status,
+        vector_cleanup_completed=job.vector_cleanup_completed,
+        storage_cleanup_completed=job.storage_cleanup_completed,
+        safe_message=sanitize_deletion_error(job.error_code),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        completed_at=job.completed_at,
     )
