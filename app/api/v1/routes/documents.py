@@ -3,10 +3,13 @@
 Upload does not parse, chunk, embed, or index the document — that happens asynchronously via
 `app.services.ingestion_worker`. The five read routes here (list, detail, ingestion status,
 failure, download) are strictly read-only: no mutation of Postgres, object storage, Qdrant,
-ingestion jobs, or cleanup records happens on any of them, and there is no retry/delete/re-index/
-reconciliation endpoint. All business/aggregation logic (lifecycle derivation, latest-job
-selection, sanitization, N+1-avoidance) lives in `app.services.document_query_service` — routes
-here only parse/inject/call/copy-status, per CLAUDE.md's "Route Layer Style".
+ingestion jobs, or cleanup records happens on any of them. `POST .../ingestion/retry` (Phase
+2.8.3) is the one mutating route in this module — it only ever inserts a new PENDING IngestionJob
+row via `app.services.ingestion_retry_service`, never a delete/re-index/reconciliation endpoint.
+All business/aggregation/locking logic (lifecycle derivation, latest-job selection, sanitization,
+N+1-avoidance, retry transaction semantics) lives in `app.services.document_query_service` /
+`app.services.ingestion_retry_service` — routes here only parse/inject/call/copy-status, per
+CLAUDE.md's "Route Layer Style".
 """
 
 from urllib.parse import quote
@@ -15,12 +18,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.schemas.documents import (
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentUploadResponse,
     IngestionFailureResponse,
+    IngestionRetryResponse,
     IngestionStatusResponse,
 )
 from app.services.document_query_service import (
@@ -33,6 +38,7 @@ from app.services.document_query_service import (
     get_document_ingestion_result,
 )
 from app.services.document_upload_service import upload_document
+from app.services.ingestion_retry_service import RetryOutcome, retry_ingestion
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 
@@ -122,6 +128,46 @@ async def get_document_failure_route(
     if result.response is None:
         raise HTTPException(status_code=result.status_code, detail="No failed ingestion job found.")
     return result.response
+
+
+_RETRY_OUTCOME_ERRORS = {
+    RetryOutcome.DOCUMENT_NOT_FOUND: (status.HTTP_404_NOT_FOUND, "Document not found."),
+    RetryOutcome.ALREADY_COMPLETED: (
+        status.HTTP_409_CONFLICT,
+        "Document is already indexed; use the re-index path instead of retry.",
+    ),
+}
+
+
+@router.post("/documents/{document_id}/ingestion/retry", response_model=IngestionRetryResponse)
+async def retry_document_ingestion_route(
+    document_id: str, response: Response, db: AsyncSession = Depends(get_db_session)
+) -> IngestionRetryResponse:
+    """Schedule a new ingestion attempt for a FAILED/stale document, or report its active job.
+
+    202 with `created=True` when a new PENDING job was inserted; 200 with `created=False` when an
+    already-active job was returned instead (nothing new was scheduled); 404 if the document does
+    not exist; 409 if the latest job is already COMPLETED (see
+    `app.services.ingestion_retry_service.retry_ingestion` for the full decision table).
+    """
+    settings = get_settings()
+    result = await retry_ingestion(
+        db, document_id, stale_after_seconds=settings.ingestion_stale_after_seconds
+    )
+
+    if result.outcome in _RETRY_OUTCOME_ERRORS:
+        status_code, detail = _RETRY_OUTCOME_ERRORS[result.outcome]
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    assert result.job is not None
+    created = result.outcome == RetryOutcome.CREATED
+    response.status_code = status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK
+    return IngestionRetryResponse(
+        document_id=document_id,
+        job_id=result.job.id,
+        status=result.job.status,
+        created=created,
+    )
 
 
 def _content_disposition_header(original_filename: str) -> str:

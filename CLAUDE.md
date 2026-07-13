@@ -181,8 +181,11 @@ def get_settings() -> Settings:
   fixed, generic constant — never `IngestionJob.error_message` echoed back — because that raw
   string can embed a connection/host detail (e.g. a `QdrantVectorStoreError`'s stringified
   `{exc}`). The raw message stays in Postgres for operator/log inspection only.
-  `IngestionFailureResponse` has no `retryable` field — there is no retry endpoint or
-  attempt-count tracking to genuinely derive one from; do not add a fabricated boolean.
+  `IngestionFailureResponse` has no `retryable` field — this codebase has no attempt-count
+  tracking to genuinely derive one from; do not add a fabricated boolean. This sanitization rule
+  extends to retry/recovery (Phase 2.8.3): a stale-recovered job's `error_message` passes through
+  the exact same `sanitize_ingestion_error()` before ever reaching a response — no separate
+  sanitization path for retry-related errors.
 - **A document/storage consistency mismatch is a `409`, never presented as "document not
   found."** If a `Document` row exists but `FileStorage.read()` raises
   `StorageObjectNotFoundError`, the download endpoint returns `409` (the document is real; its
@@ -193,8 +196,68 @@ def get_settings() -> Settings:
   /api/v1/documents*` routes are strictly read-only: no write to Postgres, object storage,
   Qdrant, an `IngestionJob`, or a `VectorCleanupJob` happens on any of them, and none of them may
   call `IngestionWorker`, `reindex_document()`, `retry_cleanup_job()`, or any vector-deletion
-  function. There is no retry/delete/re-index/reconciliation endpoint in this codebase yet — do
-  not add one under the guise of a "read" route.
+  function. `POST /api/v1/documents/{document_id}/ingestion/retry` (Phase 2.8.3) is a separate,
+  explicitly mutating endpoint — do not add mutation to any `GET` route under the guise of a
+  "read" route; there is still no delete/re-index/reconciliation endpoint in this codebase.
+
+## Ingestion Retry & Stale Recovery Style
+
+- **A `FAILED` `IngestionJob` row is never reset back to `PENDING`, and never deleted.** Retrying
+  always means creating a brand-new `IngestionJob` row with the same `document_id` — ingestion
+  history is append-only. The one exception, and the only place a row is ever transitioned after
+  the fact, is a stale `PROCESSING` row: `retry_ingestion()` and `recover_stale_ingestion_jobs()`
+  are the only two functions permitted to flip a row's status post-creation, and both only ever
+  move `PROCESSING -> FAILED` (never any other transition), using the shared, fixed
+  `STALE_RECOVERY_ERROR_PREFIX` marker (`app/services/ingestion_retry_service.py`) so both call
+  sites are indistinguishable in stored data.
+- **At most one active (`PENDING`/`PROCESSING`) `IngestionJob` per document, enforced by a real
+  Postgres constraint — never application logic alone.** The partial unique index
+  `ix_ingestion_jobs_one_active_per_document` (`ON ingestion_jobs (document_id) WHERE status IN
+  ('pending', 'processing')`, migration `b7e2f6a1c9d4`) is the source of truth; `retry_ingestion()`
+  and `recover_stale_ingestion_jobs()` must both be written assuming a concurrent insert can and
+  will violate it, and must translate that `IntegrityError` into the correct existing-job response
+  rather than letting it propagate as a raw `500`.
+- **Retry and recovery require genuine transactional row locking, not check-then-insert.**
+  `retry_ingestion()` takes a blocking `SELECT ... FOR UPDATE` on the document's existing job rows
+  before deciding whether to insert (so an already-active document serializes concurrent retries
+  instead of racing); `recover_stale_ingestion_jobs()` uses `SELECT ... FOR UPDATE SKIP LOCKED`
+  (`updated_at ASC, id ASC`), mirroring `IngestionWorker._claim_next_pending_job()`'s exact
+  pattern, so two concurrent recovery runs never both recover the same stale row. Never replace
+  either lock with an unlocked read followed by a conditional insert/update.
+- **Stale recovery preserves the abandoned attempt's history.** A recovered `PROCESSING` row is
+  marked `FAILED` (with the fixed marker message) and kept — never deleted, never reset back to
+  `PENDING`. A fresh `PENDING` replacement row is created alongside it, exactly like a normal
+  retry.
+- **`IngestionWorker._claim_next_pending_job()`'s existing locking must stay untouched by
+  retry/recovery work**, unless a genuine, precisely-stated gap is found in it — it already
+  satisfies every property retry/recovery need (atomic claim, `PROCESSING` committed before work
+  starts, a crashed worker leaves a recoverable `PROCESSING` row, `COMPLETED`/`FAILED` never
+  reclaimed). Retry and recovery both only ever create a new `PENDING` row for the existing claim
+  path to pick up — never bypass it, never add a second claim mechanism.
+- **Retry reuses the existing `FileStorage` object — it never re-uploads or re-saves content.**
+  A new `IngestionJob` row references the same `document_id`, whose `Document` row still points at
+  the original stored object; `retry_ingestion()` never calls `FileStorage.save()`/`.delete()`.
+- **Retry must never require a vector-cleanup step.** `IngestionWorker`'s default pipeline calls
+  `upsert_vectors()` exactly once, strictly after embedding succeeds — a `FAILED` (or
+  stale-recovered) job therefore never wrote any vectors. Chunk IDs
+  (`f"{document.id}-{chunk_index}"`) and their derived Qdrant point IDs
+  (`uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)`) are deterministic per document, so a retry's
+  eventual successful upsert naturally overwrites the same point IDs a first successful attempt
+  would have used. Do not add a delete-before-retry step, a temporary-collection-swap mechanism,
+  or any new vector-cleanup logic for retry — it is unneeded by construction, and the codebase's
+  test suite proves it against a real Qdrant container
+  (`tests/integration/test_ingestion_retry_postgres.py`).
+- **`INGESTION_STALE_AFTER_SECONDS` is an approximation, not a liveness proof — document it as
+  such wherever it's referenced.** `IngestionJob` has no dedicated heartbeat column; `updated_at`
+  is the only available signal, and a genuinely slow-but-alive worker looks identical to a dead
+  one under this check. Do not add a separate heartbeat column or claim this check proves a worker
+  crashed.
+- **Stale-job recovery has no HTTP endpoint and is never invoked by `make verify`/`make
+  test*`/CI.** `recover_stale_ingestion_jobs()` is triggered only via
+  `scripts/recover_stale_ingestion_jobs.py` (`make recover-stale-ingestion-jobs`), matching the
+  existing `smoke-multilingual-real` operational-script boundary. Do not add a `POST
+  /api/v1/.../recover` route, and do not wire the recovery script into any automated quality gate,
+  without an explicit user request.
 
 ## RAG Engine Compatibility Style
 

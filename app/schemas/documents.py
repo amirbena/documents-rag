@@ -97,6 +97,22 @@ class IngestionStatusResponse(BaseModel):
     updated_at: datetime | None
 
 
+class IngestionRetryResponse(BaseModel):
+    """Shape returned by POST /api/v1/documents/{document_id}/ingestion/retry.
+
+    `created=True` means a brand-new PENDING IngestionJob was inserted for the existing worker to
+    pick up; `created=False` means an already-active (PENDING, or PROCESSING-and-not-stale) job
+    was returned unchanged — nothing new was scheduled. No `attempt_number` field: this codebase
+    does not track a per-document attempt counter, and fabricating one from row order would imply
+    a guarantee (e.g. "this is attempt 3") this endpoint does not actually provide.
+    """
+
+    document_id: str
+    job_id: str
+    status: IngestionStatus
+    created: bool
+
+
 class IngestionFailureResponse(BaseModel):
     """Shape returned by GET /api/v1/documents/{document_id}/failure.
 
