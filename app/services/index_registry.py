@@ -15,6 +15,7 @@ pending cleanup for the same document are never conflated into a single record.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -129,31 +130,97 @@ async def delete_current_document_vectors(document: Document, vector_store: Vect
         await vector_store.delete_by_document_id(document.collection_name, document.id)
 
 
+@dataclass(frozen=True)
+class CollectionVectorDeletionResult:
+    """The outcome of attempting to delete one document's vectors from one Qdrant collection."""
+
+    collection_name: str
+    succeeded: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class VectorDeletionResult:
+    """The aggregate outcome of a delete_all_tracked_document_vectors() call, per collection.
+
+    A bare exception (or bare None return) cannot represent "some collections succeeded, one
+    failed" — the caller needs to know exactly which collections are still dirty so a retry (or
+    an alert) can be scoped correctly, and so a partial cleanup is never mistaken for a complete
+    one.
+    """
+
+    document_id: str
+    attempted_collections: tuple[str, ...]
+    collection_results: tuple[CollectionVectorDeletionResult, ...]
+
+    @property
+    def fully_deleted(self) -> bool:
+        """True only if every attempted collection's vectors were confirmed deleted."""
+        return all(result.succeeded for result in self.collection_results)
+
+
 async def delete_all_tracked_document_vectors(
     document: Document, vector_store: VectorStore, session: AsyncSession
-) -> None:
-    """Delete a document's vectors from every collection they could still exist in.
+) -> VectorDeletionResult:
+    """Attempt to delete a document's vectors from every collection they could still exist in.
 
     The FULL cleanup operation — this is what any document lifecycle/deletion path must call.
-    Covers the document's currently tracked collection (`collection_name`) *and* every historical
-    collection still tracked by a pending/failed VectorCleanupJob for this document (see
-    `get_pending_cleanup_jobs()`), so a document deleted after one or more failed re-index
+    Targets the document's currently tracked collection (`collection_name`) *and* every distinct
+    historical collection still tracked by a pending/failed VectorCleanupJob for this document
+    (see `get_pending_cleanup_jobs()`), so a document deleted after one or more failed re-index
     cleanups never leaves vectors behind in an old collection merely because the failure happened
     to occur before this deletion. `session` is mandatory — there is no way to check historical
     cleanup tracking without it, and defaulting it to `None` would let a caller silently get only
-    partial cleanup while believing deletion was complete. Idempotent: deleting from a collection
-    with no matching vectors (already cleaned, or never populated) is a harmless no-op. Completed
-    cleanup jobs are left untouched (retained for audit, per the "successful cleanup records may
-    be retained" project convention) — this function only removes Qdrant data, it does not mutate
-    VectorCleanupJob bookkeeping, since the document row itself is about to be deleted by the
-    caller.
+    partial cleanup while believing deletion was complete.
+
+    Every resolved collection is attempted independently: a failure deleting from one collection
+    is recorded and does not stop, skip, or abort attempts against any other collection (active
+    or historical), and never causes a silent fallback to active-only semantics. Call this
+    repeatedly to retry after a partial failure — it always re-attempts every tracked collection,
+    not just the ones that previously failed. The caller must inspect the returned
+    `VectorDeletionResult.fully_deleted` (or `collection_results`) to tell full success apart from
+    partial failure; this function itself never raises for a single collection's delete failure.
+
+    If the same collection name is targeted twice (the active collection also appears as a
+    historical cleanup-job collection, or two cleanup-job rows reference the same collection), it
+    is attempted exactly once — real Qdrant deletes are idempotent so a duplicate attempt would be
+    harmless, but deduplicating keeps `attempted_collections`/`collection_results` an accurate,
+    non-redundant picture of what was actually targeted.
+
+    Idempotent: deleting from a collection with no matching vectors (already cleaned, or never
+    populated) is a harmless no-op, reported as a success. Completed cleanup jobs are left
+    untouched (retained for audit, per the "successful cleanup records may be retained" project
+    convention) — this function only removes Qdrant data, it does not mutate VectorCleanupJob
+    bookkeeping, since the document row itself is about to be deleted by the caller.
     """
-    await delete_current_document_vectors(document, vector_store)
+    collections_to_attempt: list[str] = []
+    if document.collection_name is not None:
+        collections_to_attempt.append(document.collection_name)
 
     for job in await get_pending_cleanup_jobs(session, document_id=document.id):
-        if job.collection_name == document.collection_name:
-            continue  # already covered by the tracked-collection delete above
-        await vector_store.delete_by_document_id(job.collection_name, document.id)
+        if job.collection_name not in collections_to_attempt:
+            collections_to_attempt.append(job.collection_name)
+
+    collection_results: list[CollectionVectorDeletionResult] = []
+    for collection_name in collections_to_attempt:
+        try:
+            await vector_store.delete_by_document_id(collection_name, document.id)
+        except Exception as exc:
+            collection_results.append(
+                CollectionVectorDeletionResult(
+                    collection_name=collection_name, succeeded=False, error=str(exc)
+                )
+            )
+        else:
+            collection_results.append(
+                CollectionVectorDeletionResult(collection_name=collection_name, succeeded=True, error=None)
+            )
+
+    return VectorDeletionResult(
+        document_id=document.id,
+        attempted_collections=tuple(collections_to_attempt),
+        collection_results=tuple(collection_results),
+    )
 
 
 async def create_cleanup_job(

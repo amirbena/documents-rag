@@ -433,3 +433,96 @@ async def test_delete_current_document_vectors_never_consults_cleanup_jobs() -> 
     import inspect
 
     assert "session" not in inspect.signature(delete_current_document_vectors).parameters
+
+
+# --- delete_all_tracked_document_vectors: partial-failure and dedup semantics ----------------------
+
+
+async def test_delete_all_tracked_document_vectors_attempts_every_collection_despite_a_failure() -> None:
+    """A failure on one historical collection must not stop attempts against another."""
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="failure")
+    await create_cleanup_job(session, document.id, "legacy-collection-2", error="failure")
+    vector_store = _FakeVectorStore(fail_delete_for={"legacy-collection-1"})
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    # Both historical collections were attempted, not just the one before the failure.
+    attempted = {r.collection_name for r in result.collection_results}
+    assert attempted == {"current-collection", "legacy-collection-1", "legacy-collection-2"}
+    assert ("current-collection", document.id) in vector_store.deleted
+    assert ("legacy-collection-2", document.id) in vector_store.deleted
+    assert result.fully_deleted is False
+
+    by_name = {r.collection_name: r for r in result.collection_results}
+    assert by_name["current-collection"].succeeded is True
+    assert by_name["legacy-collection-1"].succeeded is False
+    assert by_name["legacy-collection-1"].error is not None
+    assert by_name["legacy-collection-2"].succeeded is True
+
+
+async def test_delete_all_tracked_document_vectors_still_attempts_active_collection_after_it_fails() -> None:
+    """A failure on the active collection must not skip or abort the historical collections."""
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="failure")
+    vector_store = _FakeVectorStore(fail_delete_for={"current-collection"})
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert ("legacy-collection-1", document.id) in vector_store.deleted
+    by_name = {r.collection_name: r for r in result.collection_results}
+    assert by_name["current-collection"].succeeded is False
+    assert by_name["legacy-collection-1"].succeeded is True
+    assert result.fully_deleted is False
+
+
+async def test_delete_all_tracked_document_vectors_dedupes_duplicate_historical_collection_names() -> None:
+    """Two VectorCleanupJob rows for the same historical collection must be attempted once."""
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="first failure")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="second failure")
+    vector_store = _FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert result.attempted_collections.count("legacy-collection-1") == 1
+    assert vector_store.deleted.count(("legacy-collection-1", document.id)) == 1
+    assert result.fully_deleted is True
+
+
+async def test_delete_all_tracked_document_vectors_does_not_double_attempt_active_as_historical() -> None:
+    """A cleanup job pointing at the document's own active collection is not a second attempt."""
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "current-collection", error="stale failure")
+    vector_store = _FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert result.attempted_collections == ("current-collection",)
+    assert vector_store.deleted.count(("current-collection", document.id)) == 1
+    assert result.fully_deleted is True
+
+
+async def test_delete_all_tracked_document_vectors_retries_all_collections_after_partial_failure() -> None:
+    """A repeated call after a partial failure must retry every tracked collection again, not
+    just the ones that previously failed.
+    """
+    session = _FakeSession()
+    document = _document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1", error="failure")
+    vector_store = _FakeVectorStore(fail_delete_for={"legacy-collection-1"})
+
+    first = await delete_all_tracked_document_vectors(document, vector_store, session)
+    assert first.fully_deleted is False
+
+    vector_store._fail_delete_for = set()  # simulate the transient failure clearing up
+    second = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert second.fully_deleted is True
+    # The active collection (which already succeeded the first time) was attempted again too.
+    assert vector_store.deleted.count(("current-collection", document.id)) == 2
+    assert vector_store.deleted.count(("legacy-collection-1", document.id)) == 1

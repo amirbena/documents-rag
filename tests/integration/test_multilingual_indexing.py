@@ -21,7 +21,9 @@ from app.models.index_collection import IndexCollection
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
+from app.rag.providers.vector_store import VectorPoint
 from app.services.index_registry import (
+    create_cleanup_job,
     delete_all_tracked_document_vectors,
     ensure_active_collection,
     get_pending_cleanup_jobs,
@@ -441,6 +443,142 @@ async def test_deleting_a_document_cleans_its_tracked_vectors(
 
     after = await vector_store.search_similar(active_config.collection_name, query_vector, limit=10)
     assert not any(result.document_id == document.id for result in after)
+
+
+def _fake_point(document_id: str, vector: list[float], text: str = "hello world") -> VectorPoint:
+    """Build a real VectorPoint for a document, ready to upsert directly into any collection."""
+    return VectorPoint(
+        id=str(uuid.uuid4()),
+        vector=vector,
+        document_id=document_id,
+        chunk_id=str(uuid.uuid4()),
+        text=text,
+        source="notes.txt",
+    )
+
+
+async def test_full_document_deletion_cleans_active_and_historical_without_touching_other_documents(
+    migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
+) -> None:
+    """delete_all_tracked_document_vectors() must clean a document's vectors out of its active
+    collection AND both of its tracked historical collections (one pending job, one failed job)
+    against real Qdrant, while leaving a different document's vectors in a shared historical
+    collection completely untouched.
+    """
+    fake = _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
+    settings = get_settings()
+    active_config = get_active_embedding_config(settings)
+    vector_store = QdrantVectorStore(settings=settings)
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world " * 20, encoding="utf-8")
+
+    async with _new_session(postgres_url) as session:
+        job = await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
+        document_a = await session.get(Document, job.document_id)
+        assert document_a is not None
+
+        other_job = await _create_pending_job(session, storage_key=file_path.name)
+        document_b = await session.get(Document, other_job.document_id)
+        assert document_b is not None
+
+    query_vector = (await fake.embed(["hello world"]))[0]
+
+    # Two historical collections for document A, seeded with real points directly (no need to
+    # actually drive a re-index through them). One is tracked as PENDING, the other as FAILED.
+    historical_collection_1 = f"{active_config.collection_name}-legacy-1"
+    historical_collection_2 = f"{active_config.collection_name}-legacy-2"
+    await vector_store.create_collection_if_not_exists(historical_collection_1, active_config.dimension)
+    await vector_store.create_collection_if_not_exists(historical_collection_2, active_config.dimension)
+    await vector_store.upsert_vectors(historical_collection_1, [_fake_point(document_a.id, query_vector)])
+    # historical_collection_2 also holds a *different* document's vectors — this must survive.
+    await vector_store.upsert_vectors(
+        historical_collection_2,
+        [_fake_point(document_a.id, query_vector), _fake_point(document_b.id, query_vector)],
+    )
+
+    async with _new_session(postgres_url) as session:
+        await create_cleanup_job(session, document_a.id, historical_collection_1)  # PENDING
+        await create_cleanup_job(session, document_a.id, historical_collection_2, error="boom")  # FAILED
+
+        result = await delete_all_tracked_document_vectors(document_a, vector_store, session)
+
+    assert result.fully_deleted is True
+    assert set(result.attempted_collections) == {
+        active_config.collection_name,
+        historical_collection_1,
+        historical_collection_2,
+    }
+
+    for collection_name in (active_config.collection_name, historical_collection_1, historical_collection_2):
+        remaining = await vector_store.search_similar(collection_name, query_vector, limit=10)
+        assert not any(r.document_id == document_a.id for r in remaining)
+
+    # Document B's vectors in the shared historical collection must be untouched.
+    remaining_in_shared = await vector_store.search_similar(historical_collection_2, query_vector, limit=10)
+    assert any(r.document_id == document_b.id for r in remaining_in_shared)
+
+
+async def test_partial_failure_still_cleans_the_collections_that_succeed_against_real_qdrant(
+    migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
+) -> None:
+    """When one tracked collection's delete genuinely fails, delete_all_tracked_document_vectors()
+    must still clean the other collections (verified via real search_similar) and report the
+    partial outcome via the typed result — reusing the existing monkeypatched-real-store-except-
+    one-collection pattern rather than inventing a new failure simulation.
+    """
+    fake = _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
+    settings = get_settings()
+    active_config = get_active_embedding_config(settings)
+    real_vector_store = QdrantVectorStore(settings=settings)
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("hello world " * 20, encoding="utf-8")
+
+    async with _new_session(postgres_url) as session:
+        job = await _create_pending_job(session, storage_key=file_path.name)
+        await IngestionWorker(file_storage=LocalFileStorage(root=tmp_path)).process_next_job(session)
+        document = await session.get(Document, job.document_id)
+        assert document is not None
+
+    query_vector = (await fake.embed(["hello world"]))[0]
+
+    historical_collection = f"{active_config.collection_name}-legacy"
+    await real_vector_store.create_collection_if_not_exists(historical_collection, active_config.dimension)
+    await real_vector_store.upsert_vectors(historical_collection, [_fake_point(document.id, query_vector)])
+
+    class _FailForHistoricalCollection:
+        async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
+            if collection_name == historical_collection:
+                raise RuntimeError("simulated persistent Qdrant failure")
+            await real_vector_store.delete_by_document_id(collection_name, document_id)
+
+    partially_failing_store = _FailForHistoricalCollection()
+
+    async with _new_session(postgres_url) as session:
+        await create_cleanup_job(session, document.id, historical_collection, error="boom")
+
+        result = await delete_all_tracked_document_vectors(document, partially_failing_store, session)  # type: ignore[arg-type]
+
+    assert result.fully_deleted is False
+    by_name = {r.collection_name: r for r in result.collection_results}
+    assert by_name[active_config.collection_name].succeeded is True
+    assert by_name[historical_collection].succeeded is False
+    assert by_name[historical_collection].error is not None
+
+    # The active collection's deletion genuinely happened against real Qdrant despite the other
+    # collection's failure.
+    remaining_active = await real_vector_store.search_similar(
+        active_config.collection_name, query_vector, limit=10
+    )
+    assert not any(r.document_id == document.id for r in remaining_active)
+
+    # The historical collection's vectors are still there — the simulated failure was real.
+    remaining_historical = await real_vector_store.search_similar(
+        historical_collection, query_vector, limit=10
+    )
+    assert any(r.document_id == document.id for r in remaining_historical)
 
 
 async def test_mixed_hebrew_english_text_survives_persistence_and_retrieval(
