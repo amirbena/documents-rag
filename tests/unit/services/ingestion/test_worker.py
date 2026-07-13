@@ -12,14 +12,14 @@ from typing import Any
 
 import pytest
 
-import app.services.ingestion_worker as ingestion_worker_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorPoint
-from app.services.document_chunker import DocumentChunker
-from app.services.ingestion_worker import IngestionWorker
+from app.services.documents.chunker import DocumentChunker
+from app.services.ingestion.worker import IngestionWorker
 from app.storage.local_storage import LocalFileStorage
 
 

@@ -6,9 +6,10 @@ re-processes a job that's already completed or failed. The default processing st
 Document -> extraction -> chunking -> embedding -> versioned-collection upsert, resolving the
 job to completed on success or failed (with the error stored) if any step raises. On success,
 the document's indexing metadata (embedding provider/model/dimension/version, chunking version,
-collection name, indexed_at) is persisted via app/services/index_registry.py — a failure never
-marks a document as indexed. A document producing zero chunks is still marked indexed, with no
-vectors written — it is never left permanently unindexed/stale merely for being empty.
+collection name, indexed_at) is persisted via app/services/indexing/collection_registry.py — a
+failure never marks a document as indexed. A document producing zero chunks is still marked
+indexed, with no vectors written — it is never left permanently unindexed/stale merely for being
+empty.
 """
 
 import uuid
@@ -24,9 +25,9 @@ from app.rag.embedding_config import get_active_embedding_config
 from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.rag.providers.vector_store import VectorPoint
-from app.services.document_chunker import DocumentChunk, DocumentChunker
-from app.services.document_text_extractor import DocumentTextExtractor
-from app.services.index_registry import ensure_active_collection, mark_document_indexed
+from app.services.documents.chunker import DocumentChunk, DocumentChunker
+from app.services.documents.text_extractor import DocumentTextExtractor
+from app.services.indexing.collection_registry import ensure_active_collection, mark_document_indexed
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 
@@ -36,7 +37,7 @@ ProcessDocumentFn = Callable[[Document | None, IngestionJob, AsyncSession], Awai
 def to_vector_point(chunk: DocumentChunk, vector: list[float], source: str) -> VectorPoint:
     """Build a VectorPoint from a DocumentChunk and its embedding, preserving all metadata.
 
-    Public (not `_`-prefixed) because app/services/reindex_service.py reuses it verbatim — the
+    Public (not `_`-prefixed) because app/services/indexing/reindex_service.py reuses it verbatim — the
     point ID must be derived identically on both the initial-ingest and re-index paths, or the
     same chunk would upsert under two different point IDs and silently duplicate.
     """

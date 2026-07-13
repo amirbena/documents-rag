@@ -5,16 +5,17 @@ Revises: a3f9c7d2e1b5
 Create Date: 2026-07-13 13:00:00.000000
 
 Enforces, at the database level, that a document has at most one "active" (pending or
-processing) IngestionJob row at a time — see app/services/ingestion_retry_service.py (Phase
-2.8.3). `IngestionJob.status` is stored as a plain VARCHAR (native_enum=False, see
+processing) IngestionJob row at a time — see app/services/ingestion/retry_service.py and
+app/services/ingestion/stale_recovery_service.py (Phase 2.8.3). `IngestionJob.status` is stored
+as a plain VARCHAR (native_enum=False, see
 app/models/ingestion_job.py), so the WHERE clause below matches the lowercase string values
 directly ('pending'/'processing'), not a native Postgres enum type.
 
 Duplicate-active-row backfill: checked whether two active (pending/processing) IngestionJob rows
 could already exist for the same document_id in this codebase before this migration.
-`app.services.document_upload_service.upload_document()` creates exactly one PENDING job per
+`app.services.documents.upload_service.upload_document()` creates exactly one PENDING job per
 upload, and prior to this PR there was no retry/re-index path that could create a second job
-while an existing one was still pending/processing — `app.services.reindex_service` (unrelated,
+while an existing one was still pending/processing — `app.services.indexing.reindex_service` (unrelated,
 pre-existing) does not go through IngestionJob at all. So there is no reachable path to duplicate
 active rows in any installation that only ever ran code up to this PR, and no data backfill/
 resolution step is needed here. The `upgrade()` step below still runs a defensive cleanup query

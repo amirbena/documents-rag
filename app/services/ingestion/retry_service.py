@@ -1,19 +1,13 @@
-"""Retry a failed/stale ingestion attempt, and recover PROCESSING jobs abandoned by a dead worker.
+"""Retry a failed/stale ingestion attempt — the service behind `POST
+/api/v1/documents/{id}/ingestion/retry`.
 
-Two independent, transactional operations, both scoped to Postgres only — neither ever touches
-`FileStorage` or a vector store directly:
-
-- `retry_ingestion()`: the service behind `POST /api/v1/documents/{id}/ingestion/retry`. Never
-  mutates an already-FAILED row (it stays FAILED forever, preserving history); the one exception
-  is a stale-PROCESSING row, which retry itself flips to FAILED in the same commit as creating the
-  replacement (see "latest job PROCESSING and stale" in `retry_ingestion`'s docstring for why this
-  is required, not optional). Retrying always means creating a brand-new PENDING row for the same
-  document_id, for the existing `IngestionWorker` to claim and process exactly like a first
-  attempt. This is safe and requires no vector cleanup: see "Vector idempotency" below.
-- `recover_stale_ingestion_jobs()`: an internal maintenance operation (invoked by
-  `scripts/recover_stale_ingestion_jobs.py`, not by any HTTP route) that finds PROCESSING jobs
-  whose row hasn't been touched in `stale_after_seconds`, marks each one FAILED (preserving it,
-  never deleting/resetting it), and creates one fresh PENDING replacement job per recovered row.
+Scoped to Postgres only — never touches `FileStorage` or a vector store directly. Never mutates
+an already-FAILED row (it stays FAILED forever, preserving history); the one exception is a
+stale-PROCESSING row, which retry itself flips to FAILED in the same commit as creating the
+replacement (see "latest job PROCESSING and stale" in `retry_ingestion`'s docstring for why this
+is required, not optional). Retrying always means creating a brand-new PENDING row for the same
+document_id, for the existing `IngestionWorker` to claim and process exactly like a first
+attempt. This is safe and requires no vector cleanup: see "Vector idempotency" below.
 
 ## One active job per document
 
@@ -33,9 +27,9 @@ the same document therefore always converge on exactly one new active job, never
 exactly one `vector_store.upsert_vectors()` call; if extraction/chunking/embedding raises, that
 exception happens strictly before `upsert_vectors()` is ever reached, so a FAILED (or
 stale-recovered) job never wrote any vectors. Chunk IDs
-(`f"{document.id}-{chunk_index}"`, see `app/services/document_chunker.py`) and their derived
+(`f"{document.id}-{chunk_index}"`, see `app/services/documents/chunker.py`) and their derived
 Qdrant point IDs (`uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)`, see
-`app/services/ingestion_worker.to_vector_point()`) are fully deterministic for a given document,
+`app/services/ingestion/worker.to_vector_point()`) are fully deterministic for a given document,
 so a retry's successful upsert naturally overwrites the same point IDs a first successful attempt
 would have used — Qdrant's own upsert-by-ID semantics make this idempotent with no extra
 mechanism. (An orphaned-point edge case exists only if chunking parameters change *between* two
@@ -43,16 +37,14 @@ genuinely-successful indexing runs of the same document with different chunk cou
 unreachable within this module's scope, since retry only ever fires for a job that never reached
 `upsert_vectors()`.)
 
-## Stale detection is an approximation, not a liveness proof
-
-`IngestionJob` has no dedicated heartbeat column — `updated_at` (bumped by `onupdate=func.now()`
-on every status transition) is the only available signal. A PROCESSING job whose `updated_at` is
-older than `stale_after_seconds` is *probably* abandoned (crashed/killed worker), but a genuinely
-slow-but-alive worker looks identical. `INGESTION_STALE_AFTER_SECONDS` should be set well above
-the platform's expected worst-case single-document processing time.
+For the sibling operational recovery path (abandoned PROCESSING jobs, invoked by
+`scripts/recover_stale_ingestion_jobs.py` rather than any HTTP route), see
+`app.services.ingestion.stale_recovery_service`. Both modules share the fixed
+`STALE_RECOVERY_ERROR_PREFIX` marker and job-creation helper in `app.services.ingestion.status`, so
+a client-triggered "reactive" stale recovery (via retry, below) and the background/scheduled
+"proactive" one are indistinguishable in stored data.
 """
 
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -64,12 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.services.documents.deletion_service import get_latest_deletion_job
-
-# Fixed prefix for a stale-recovery FAILED job's error_message — machine-identifiable in raw
-# Postgres data/logs, but never exposed differently by the public API: `sanitize_ingestion_error()`
-# (app/services/document_query_service.py) already collapses every error_message, including this
-# one, to one fixed generic string before it reaches an API response.
-STALE_RECOVERY_ERROR_PREFIX = "STALE_PROCESSING_RECOVERED"
+from app.services.ingestion.status import create_pending_job, stale_recovery_message
 
 
 class RetryOutcome(StrEnum):
@@ -94,21 +81,6 @@ def _is_stale_processing(job: IngestionJob, *, stale_after_seconds: int, now: da
     """A PROCESSING job is stale if its row hasn't been updated within the stale threshold."""
     updated_at = job.updated_at if job.updated_at.tzinfo is not None else job.updated_at.replace(tzinfo=UTC)
     return (now - updated_at).total_seconds() > stale_after_seconds
-
-
-def _stale_recovery_message(stale_after_seconds: int) -> str:
-    """Build the one fixed, machine-identifiable error_message used for every stale recovery."""
-    return (
-        f"{STALE_RECOVERY_ERROR_PREFIX}: PROCESSING job not updated for over "
-        f"{stale_after_seconds}s, treated as abandoned by a dead/crashed worker."
-    )
-
-
-async def _create_pending_job(session: AsyncSession, document_id: str) -> IngestionJob:
-    """Insert (but do not commit) a brand-new PENDING IngestionJob row for `document_id`."""
-    job = IngestionJob(id=str(uuid.uuid4()), document_id=document_id, status=IngestionStatus.PENDING)
-    session.add(job)
-    return job
 
 
 async def _latest_active_job(session: AsyncSession, document_id: str) -> IngestionJob | None:
@@ -139,7 +111,7 @@ async def retry_ingestion(
     - no Document row at all -> DOCUMENT_NOT_FOUND (route maps to 404).
     - no IngestionJob row at all -> treated like FAILED: a new PENDING job is created. In
       practice unreachable via the normal upload flow (which always creates one job with the
-      document), same defensive stance as document_query_service's UPLOADED status.
+      document), same defensive stance as documents.query_service's UPLOADED status.
     - latest job PENDING, or PROCESSING and not stale -> ALREADY_ACTIVE, no new job created; the
       existing active job is returned (route maps to 200, not 202 — nothing new was scheduled).
     - latest job PROCESSING and stale (per `stale_after_seconds`) -> CREATED. The stale row itself
@@ -199,9 +171,9 @@ async def retry_ingestion(
         # Stale PROCESSING: must be flipped to FAILED in this same commit — see docstring — so
         # the new PENDING insert below doesn't collide with it under the partial unique index.
         latest.status = IngestionStatus.FAILED
-        latest.error_message = _stale_recovery_message(stale_after_seconds)
+        latest.error_message = stale_recovery_message(stale_after_seconds)
 
-    new_job = await _create_pending_job(session, document_id)
+    new_job = await create_pending_job(session, document_id)
     try:
         await session.commit()
     except IntegrityError:
@@ -212,81 +184,8 @@ async def retry_ingestion(
     return IngestionRetryResult(outcome=RetryOutcome.CREATED, job=new_job)
 
 
-@dataclass(frozen=True)
-class RecoveredJob:
-    """One stale PROCESSING job recovered: the row marked FAILED, plus its fresh replacement."""
-
-    stale_job_id: str
-    replacement_job_id: str
-
-
-@dataclass(frozen=True)
-class RecoveryResult:
-    """Typed outcome of one recover_stale_ingestion_jobs() batch."""
-
-    recovered: tuple[RecoveredJob, ...]
-
-    @property
-    def count(self) -> int:
-        """Number of stale jobs recovered in this batch."""
-        return len(self.recovered)
-
-
-async def recover_stale_ingestion_jobs(
-    session: AsyncSession,
-    *,
-    batch_size: int,
-    stale_after_seconds: int,
-    now: datetime | None = None,
-) -> RecoveryResult:
-    """Mark up to `batch_size` stale PROCESSING jobs FAILED and create a fresh PENDING replacement.
-
-    Locks candidate rows with `SELECT ... FOR UPDATE SKIP LOCKED` (mirroring
-    `IngestionWorker._claim_next_pending_job()`'s exact pattern), ordered deterministically
-    (`updated_at ASC, id ASC` — oldest-stale-first), so two concurrent recovery runs never both
-    recover the same row. Each recovered row is preserved unchanged except for its `status`
-    (-> FAILED) and `error_message` (-> a fixed, machine-identifiable `STALE_RECOVERY_ERROR_PREFIX`
-    message) — never deleted, never reset back to PENDING. Idempotent: a job already FAILED here
-    is PROCESSING no longer, so a later call never re-selects it.
-    """
-    now = now or datetime.now(UTC)
-    cutoff = now.timestamp() - stale_after_seconds
-
-    stmt = (
-        select(IngestionJob)
-        .where(IngestionJob.status == IngestionStatus.PROCESSING)
-        .order_by(IngestionJob.updated_at.asc(), IngestionJob.id.asc())
-        .limit(batch_size)
-        .with_for_update(skip_locked=True)
-    )
-    result = await session.execute(stmt)
-    candidates = list(result.scalars().all())
-
-    recovered: list[RecoveredJob] = []
-    for job in candidates:
-        updated_at = (
-            job.updated_at if job.updated_at.tzinfo is not None else job.updated_at.replace(tzinfo=UTC)
-        )
-        if updated_at.timestamp() > cutoff:
-            continue  # not stale yet — SKIP LOCKED already excludes concurrently-claimed rows
-
-        job.status = IngestionStatus.FAILED
-        job.error_message = _stale_recovery_message(stale_after_seconds)
-        replacement = await _create_pending_job(session, job.document_id)
-        recovered.append(RecoveredJob(stale_job_id=job.id, replacement_job_id=replacement.id))
-
-    if recovered:
-        await session.commit()
-
-    return RecoveryResult(recovered=tuple(recovered))
-
-
 __all__ = [
-    "STALE_RECOVERY_ERROR_PREFIX",
     "IngestionRetryResult",
-    "RecoveredJob",
-    "RecoveryResult",
     "RetryOutcome",
-    "recover_stale_ingestion_jobs",
     "retry_ingestion",
 ]

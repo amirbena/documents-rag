@@ -16,7 +16,7 @@ from app.main import app
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
-from tests.support.fake_ingestion_retry_session import FakeIngestionRetrySession
+from tests.support.ingestion.fake_session import FakeIngestionRetrySession
 
 client = TestClient(app)
 STALE_AFTER = get_settings().ingestion_stale_after_seconds

@@ -1,11 +1,11 @@
-"""A minimal in-memory AsyncSession double for app.services.ingestion_retry_service unit tests.
+"""A minimal in-memory AsyncSession double for the ingestion retry/stale-recovery unit tests.
 
 Dispatches each SELECT by its compiled SQL text (literal binds), mirroring
-tests/support/fake_document_session.py's style — no SQLite or any other real database engine is
-used, since the retry/recovery service depends on Postgres-specific row-locking semantics that a
-fake session cannot faithfully execute; these fakes only simulate the *filter/order/limit* logic
-in plain Python, never the locking itself (that is covered separately by real Postgres
-integration tests).
+tests/support/documents/read/fake_session.py's style — no SQLite or any other real database
+engine is used, since `app.services.ingestion.retry_service`/`stale_recovery_service` depend on
+Postgres-specific row-locking semantics that a fake session cannot faithfully execute; these
+fakes only simulate the *filter/order/limit* logic in plain Python, never the locking itself
+(that is covered separately by real Postgres integration tests).
 """
 
 import re

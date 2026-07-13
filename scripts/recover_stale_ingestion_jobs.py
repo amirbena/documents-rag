@@ -13,7 +13,7 @@ import asyncio
 
 from app.core.config import get_settings
 from app.db.session import async_session_factory
-from app.services.ingestion_retry_service import recover_stale_ingestion_jobs
+from app.services.ingestion.stale_recovery_service import recover_stale_ingestion_jobs
 
 
 async def main() -> int:

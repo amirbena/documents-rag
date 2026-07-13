@@ -93,7 +93,8 @@ class Settings(BaseSettings):
     )
     minio_create_bucket_if_missing: bool = Field(default=True, alias="MINIO_CREATE_BUCKET_IF_MISSING")
 
-    # Retry/stale-recovery (Phase 2.8.3) — see app/services/ingestion_retry_service.py.
+    # Retry/stale-recovery (Phase 2.8.3) — see app/services/ingestion/retry_service.py and
+    # app/services/ingestion/stale_recovery_service.py.
     # A PROCESSING IngestionJob whose updated_at is older than this is treated as an approximate
     # "stale" signal (the job's row hasn't been touched since it was claimed) — not proof the
     # worker died, since a slow-but-alive worker looks identical. 900s (15 minutes) is a
