@@ -50,7 +50,7 @@ help:
 	@echo "  make test-ingestion-retry - run the Phase 2.8.3 retry/stale-recovery unit tests —"
 	@echo "                          no Docker required"
 	@echo "  make test-ingestion-retry-integration - run the Phase 2.8.3 retry/stale-recovery"
-	@echo "                          Postgres integration coverage (needs Docker)"
+	@echo "                          Postgres integration + Backend E2E coverage (needs Docker)"
 	@echo "  make verify-ingestion-retry - run the retry/stale-recovery unit tests plus their own"
 	@echo "                          checks"
 	@echo "  make verify-ingestion-retry-integration - run the retry/stale-recovery integration"
@@ -109,6 +109,7 @@ test-ingestion-retry:
 
 test-ingestion-retry-integration:
 	pytest -m integration tests/integration/test_ingestion_retry_postgres.py -q
+	pytest -m e2e tests/e2e/backend/test_ingestion_retry_recovery.py -q
 
 lint:
 	ruff check .
