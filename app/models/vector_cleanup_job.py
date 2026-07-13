@@ -1,7 +1,7 @@
 """ORM model tracking a pending/failed/completed legacy-vector cleanup after a re-index.
 
 One row per (document, previous collection) pair whose old vectors still need deleting after a
-document was successfully re-indexed into a new collection (see app/services/reindex_service.py).
+document was successfully re-indexed into a new collection (see app/services/indexing/reindex_service.py).
 Exists because a cleanup failure (the Qdrant delete-by-filter call failing after the new
 collection and Document indexing metadata already committed) must be durably tracked and
 retryable — it is never conflated with re-index failure, and never silently lost. Multiple rows

@@ -1,7 +1,7 @@
 """Framework-neutral embedding/index configuration: the versioned identity of "how this
 platform is currently indexing documents."
 
-Both ingestion (write side, via IngestionWorker/app/services/index_registry.py) and retrieval
+Both ingestion (write side, via IngestionWorker/app/services/indexing/collection_registry.py) and retrieval
 (read side, via RetrievalService) must resolve the same active EmbeddingIndexConfig, so query
 embeddings and document embeddings are always compatible — no engine constructs or selects an
 embedding model itself; both CustomRagEngine and LangChainRagEngine reach Qdrant only through

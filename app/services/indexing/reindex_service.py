@@ -7,7 +7,7 @@ collection -> persist new indexing metadata -> attempt to retire the document's 
 previous collection, if any and if different.
 
 Idempotent: point IDs are derived identically to the initial-ingest path (see
-app.services.ingestion_worker.to_vector_point), so re-running against the same active collection
+app.services.ingestion.worker.to_vector_point), so re-running against the same active collection
 overwrites the same points rather than duplicating them.
 
 Transaction/failure semantics — read carefully, this is intentionally NOT one atomic transaction
@@ -29,8 +29,9 @@ attempt:
 - After the new collection/Document-metadata commit succeeds, deleting the immediately-previous
   collection's vectors is attempted separately. Failure there does not undo or reclassify the
   re-index itself (the document IS current) — it is tracked as a pending VectorCleanupJob (see
-  app/services/index_registry.py) and reported via ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING,
-  retryable later via `retry_cleanup_job()` even once the document is no longer stale.
+  app/services/indexing/cleanup_job_service.py) and reported via
+  ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING, retryable later via `retry_cleanup_job()` even
+  once the document is no longer stale.
 """
 
 from dataclasses import dataclass
@@ -43,15 +44,15 @@ from app.models.document import Document
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
-from app.services.document_chunker import DocumentChunker
-from app.services.document_text_extractor import DocumentTextExtractor
-from app.services.index_registry import (
-    create_cleanup_job,
+from app.services.documents.chunker import DocumentChunker
+from app.services.documents.text_extractor import DocumentTextExtractor
+from app.services.indexing.cleanup_job_service import create_cleanup_job
+from app.services.indexing.collection_registry import (
     ensure_active_collection,
     is_document_stale,
     mark_document_indexed,
 )
-from app.services.ingestion_worker import to_vector_point
+from app.services.ingestion.worker import to_vector_point
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 

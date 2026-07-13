@@ -13,8 +13,8 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-import app.services.ingestion_worker as ingestion_worker_module
-import app.services.reindex_service as reindex_service_module
+import app.services.indexing.reindex_service as reindex_service_module
+import app.services.ingestion.worker as ingestion_worker_module
 from app.core.config import get_settings
 from app.models.document import Document
 from app.models.index_collection import IndexCollection
@@ -22,16 +22,15 @@ from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorPoint
-from app.services.index_registry import (
+from app.services.indexing.cleanup_job_service import (
     create_cleanup_job,
-    delete_all_tracked_document_vectors,
-    ensure_active_collection,
     get_pending_cleanup_jobs,
-    is_document_stale,
     retry_cleanup_job,
 )
-from app.services.ingestion_worker import IngestionWorker
-from app.services.reindex_service import ReindexOutcome, reindex_document
+from app.services.indexing.collection_registry import ensure_active_collection, is_document_stale
+from app.services.indexing.reindex_service import ReindexOutcome, reindex_document
+from app.services.indexing.vector_deletion_service import delete_all_tracked_document_vectors
+from app.services.ingestion.worker import IngestionWorker
 from app.storage.local_storage import LocalFileStorage
 from tests.multilingual_fixtures import MIXED_TECHNICAL_DOCUMENT, MultilingualFakeEmbeddingProvider
 
@@ -153,7 +152,7 @@ async def test_dimension_mismatch_is_rejected_against_real_qdrant(
     migrated_schema: None, postgres_url: str, qdrant_url: str, monkeypatch
 ) -> None:
     """A real, existing Qdrant collection with the wrong dimension must be rejected, not reused."""
-    from app.services.index_registry import IncompatibleIndexConfigurationError
+    from app.services.indexing.collection_registry import IncompatibleIndexConfigurationError
 
     settings = get_settings()
     active_config = get_active_embedding_config(settings)

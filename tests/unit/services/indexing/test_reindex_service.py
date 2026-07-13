@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-import app.services.reindex_service as reindex_service_module
+import app.services.indexing.reindex_service as reindex_service_module
 from app.core.config import get_settings
 from app.models.document import Document
 from app.models.vector_cleanup_job import VectorCleanupJob, VectorCleanupStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.vector_store import VectorPoint
-from app.services.document_chunker import DocumentChunker
-from app.services.index_registry import get_pending_cleanup_jobs
-from app.services.reindex_service import ReindexOutcome, reindex_document
+from app.services.documents.chunker import DocumentChunker
+from app.services.indexing.cleanup_job_service import get_pending_cleanup_jobs
+from app.services.indexing.reindex_service import ReindexOutcome, reindex_document
 from app.storage.local_storage import LocalFileStorage
 
 

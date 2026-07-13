@@ -1,7 +1,7 @@
 """Background execution of scheduled document deletion: claim, cross-system cleanup, completion.
 
 `DocumentDeletionWorker.process_next_job()` mirrors `IngestionWorker`
-(`app/services/ingestion_worker.py`) — claims one `PENDING` `DocumentDeletionJob` row with
+(`app/services/ingestion/worker.py`) — claims one `PENDING` `DocumentDeletionJob` row with
 `SELECT ... FOR UPDATE SKIP LOCKED`, transitions it to `PROCESSING` (committed before any external
 I/O), then performs vector cleanup strictly before storage cleanup (see "Cleanup order" below).
 Invoked by `scripts/process_pending_document_deletions.py`, not by any HTTP route or background
@@ -13,9 +13,10 @@ worker -> service, never the reverse — see `deletion_service`'s module docstri
 
 ## Cleanup order: vectors before storage, always
 
-`DocumentDeletionWorker` deletes all tracked vectors (`index_registry.delete_all_tracked_document_
-vectors()`) *before* ever calling `FileStorage.delete()`. If vector cleanup does not fully
-succeed, storage cleanup is never attempted in that same job, and the job is marked
+`DocumentDeletionWorker` deletes all tracked vectors
+(`vector_deletion_service.delete_all_tracked_document_vectors()`) *before* ever calling
+`FileStorage.delete()`. If vector cleanup does not fully succeed, storage cleanup is never
+attempted in that same job, and the job is marked
 `PARTIALLY_FAILED` with `storage_cleanup_completed` left `False` — enforced structurally by the
 code path (there is no branch that reaches storage deletion without first observing
 `vector_result.fully_deleted is True`), not merely as a documented intention. This ordering
@@ -33,7 +34,7 @@ from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.rag.providers.vector_store import VectorStore
 from app.services.documents.deletion_service import DeletionErrorCode
-from app.services.index_registry import delete_all_tracked_document_vectors
+from app.services.indexing.vector_deletion_service import delete_all_tracked_document_vectors
 from app.storage.contract import FileStorage
 from app.storage.errors import StorageError
 from app.storage.keys import resolve_document_storage_key
