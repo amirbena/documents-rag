@@ -141,18 +141,13 @@ def test_route_module_does_not_perform_check_aggregation_itself() -> None:
     assert "unavailable" not in source
 
 
-def test_business_routes_under_api_v1_remain_unchanged() -> None:
-    """The legacy /api/v1/health endpoint must keep working exactly as before."""
-    response = client.get("/api/v1/health")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert body["environment"] == "local"
+def test_versioned_health_route_no_longer_registered() -> None:
+    """The removed duplicate /api/v1/health route must return 404, never the old 200 response."""
+    assert client.get("/api/v1/health").status_code == 404
 
 
 def test_platform_health_endpoints_are_unversioned() -> None:
-    """The three new platform endpoints (unlike legacy /api/v1/health) must not exist under /api/v1."""
+    """The platform health endpoints exist only unversioned, never under /api/v1."""
     for path in ("/health/live", "/health/ready", "/health/dependencies"):
         assert client.get(f"/api/v1{path}").status_code == 404
 

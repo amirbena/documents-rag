@@ -1,17 +1,10 @@
-"""Response schemas for the legacy /api/v1/health endpoint and the unversioned platform
-health/readiness endpoints (see app/api/routes/health.py).
+"""Response schemas for the unversioned platform health/readiness endpoints
+(see app/api/routes/health.py).
 """
 
 from typing import Literal
 
 from pydantic import BaseModel
-
-
-class HealthResponse(BaseModel):
-    """Shape returned by GET /api/v1/health (legacy; prefer GET /health)."""
-
-    status: str
-    environment: str
 
 
 class DependencyCheckResult(BaseModel):
