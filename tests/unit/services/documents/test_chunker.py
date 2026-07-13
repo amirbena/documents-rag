@@ -2,8 +2,8 @@
 
 import pytest
 
-from app.services.document_chunker import DocumentChunk, DocumentChunker
-from app.services.document_text_extractor import ExtractedDocument, ExtractedPage
+from app.services.documents.chunker import DocumentChunk, DocumentChunker
+from app.services.documents.text_extractor import ExtractedDocument, ExtractedPage
 
 
 def test_single_chunk_for_short_text() -> None:

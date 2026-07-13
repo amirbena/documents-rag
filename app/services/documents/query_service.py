@@ -1,10 +1,10 @@
 """Read-only queries and lifecycle-status derivation for documents and their ingestion jobs.
 
 Owns every read query behind the document-read APIs (`app/api/v1/routes/documents.py`) — list,
-detail, ingestion-status, failure, and download lookups — plus the pure lifecycle-status
-derivation rule. Nothing here ever writes to Postgres, object storage, or Qdrant: this module is
-strictly read-only, mirroring the flat function-based style of `app/services/index_registry.py`
-(no `app/repositories/` abstraction exists in this codebase).
+detail, ingestion-status, and failure lookups — plus the pure lifecycle-status derivation rule.
+Nothing here ever writes to Postgres, object storage, or Qdrant, and this module never calls
+`FileStorage` — original-content retrieval is owned by the sibling
+`app.services.documents.download_service` module instead.
 
 ## Lifecycle status derivation
 
@@ -13,14 +13,14 @@ The source of truth for a document's lifecycle status is its *latest* `Ingestion
 genuine indexed state:
 
 - No `IngestionJob` row exists at all -> `UPLOADED`. In practice this is unreachable via the
-  normal upload flow: `app.services.document_upload_service.upload_document()` always creates
+  normal upload flow: `app.services.documents.upload_service.upload_document()` always creates
   exactly one `Document` and one `IngestionJob` row in the same commit, so every document created
   through the API has at least one job. This status exists defensively, for any pre-existing or
   malformed data outside that flow.
 - Latest job `PENDING` -> `PENDING`.
 - Latest job `PROCESSING` -> `PROCESSING`.
 - Latest job `FAILED` -> `FAILED`.
-- Latest job `COMPLETED` -> `INDEXED`. `app.services.ingestion_worker`'s
+- Latest job `COMPLETED` -> `INDEXED`. `app.services.ingestion.worker`'s
   `IngestionWorker.process_next_job()` calls `mark_document_indexed()` (which sets
   `document.indexed_at`) and then commits the job's `COMPLETED` status together with the
   document's indexing columns in the *same* `session.commit()` call — so a `COMPLETED` job should
@@ -65,9 +65,6 @@ from app.services.documents.deletion_service import (
     get_latest_deletion_job,
     get_latest_deletion_jobs_for_documents,
 )
-from app.storage.contract import FileStorage
-from app.storage.errors import StorageObjectNotFoundError, StorageReadError, StorageUnavailableError
-from app.storage.keys import resolve_document_storage_key
 
 DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 100
@@ -345,76 +342,15 @@ async def get_document_failure_result(session: AsyncSession, document_id: str) -
     return DocumentFailureResult(response=response, status_code=200)
 
 
-@dataclass(frozen=True)
-class DocumentDownloadResult:
-    """Typed outcome of a download attempt: content (on success) plus the HTTP status to apply.
-
-    `detail` carries a safe, fixed message for non-200 outcomes — never a raw storage exception
-    message. Storage I/O (`FileStorage.read`) happens here, not in the route, so the route stays
-    a thin dependency-injection + status-copy controller.
-    """
-
-    status_code: int
-    content: bytes | None = None
-    content_type: str | None = None
-    original_filename: str | None = None
-    detail: str | None = None
-
-
-def resolve_download_key(document: Document) -> str:
-    """Resolve the storage key to read a document's original content from — see app.storage.keys."""
-    return resolve_document_storage_key(document)
-
-
-async def download_document(
-    session: AsyncSession, document_id: str, storage: FileStorage
-) -> DocumentDownloadResult:
-    """Resolve a document, read its original bytes from `storage`, and return a typed result.
-
-    404 if the document row doesn't exist; 410 if the document was successfully deleted (Phase
-    2.8.4 — the Postgres resource still exists, only its content was intentionally removed, so
-    this is Gone rather than Not Found); 409 if the row exists but its storage object is
-    otherwise missing (a real document/storage inconsistency); 503 if the storage backend itself
-    is unreachable/failing for a reason other than not-found. Never returns a raw storage
-    exception message or a local filesystem path.
-    """
-    document = await get_document(session, document_id)
-    if document is None:
-        return DocumentDownloadResult(status_code=404, detail="Document not found.")
-
-    latest_deletion_job = await get_latest_deletion_job(session, document_id)
-    if latest_deletion_job is not None and latest_deletion_job.status == DocumentDeletionStatus.COMPLETED:
-        return DocumentDownloadResult(status_code=410, detail="Document has been deleted.")
-
-    key = resolve_download_key(document)
-    try:
-        content = await storage.read(key)
-    except StorageObjectNotFoundError:
-        return DocumentDownloadResult(
-            status_code=409, detail="Document exists but its content is unavailable in storage."
-        )
-    except (StorageUnavailableError, StorageReadError):
-        return DocumentDownloadResult(status_code=503, detail="Storage backend is unavailable.")
-
-    return DocumentDownloadResult(
-        status_code=200,
-        content=content,
-        content_type=document.content_type,
-        original_filename=document.original_filename,
-    )
-
-
 __all__ = [
     "DEFAULT_LIST_LIMIT",
     "MAX_LIST_LIMIT",
     "DocumentDetailResult",
-    "DocumentDownloadResult",
     "DocumentFailureResult",
     "DocumentIngestionResult",
     "DocumentLifecycleStatus",
     "build_document_list_response",
     "derive_lifecycle_status",
-    "download_document",
     "get_document",
     "get_document_detail_result",
     "get_document_failure_result",
@@ -423,6 +359,5 @@ __all__ = [
     "get_latest_ingestion_job",
     "get_latest_jobs_for_documents",
     "list_documents",
-    "resolve_download_key",
     "sanitize_ingestion_error",
 ]

@@ -1,4 +1,4 @@
-"""Local-storage-backed tests for app.services.document_query_service.download_document().
+"""Local-storage-backed tests for app.services.documents.download_service.download_document().
 
 Uses a real LocalFileStorage on a temp directory (no Postgres/Docker needed — the fake session
 is enough here, since the goal is exercising real filesystem read behavior, not query behavior).
@@ -8,9 +8,9 @@ import uuid
 from pathlib import Path
 
 from app.models.document import Document
-from app.services.document_query_service import download_document
+from app.services.documents.download_service import download_document
 from app.storage.local_storage import LocalFileStorage
-from tests.support.fake_document_session import FakeDocumentQuerySession
+from tests.support.documents.read.fake_session import FakeDocumentQuerySession
 
 
 def _document(**overrides: object) -> Document:

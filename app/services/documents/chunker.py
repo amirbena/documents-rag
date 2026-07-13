@@ -8,7 +8,7 @@ same chunks, in the same order, with the same chunk_ids.
 
 from dataclasses import dataclass
 
-from app.services.document_text_extractor import ExtractedDocument
+from app.services.documents.text_extractor import ExtractedDocument
 
 
 @dataclass

@@ -1,7 +1,7 @@
 """Response schemas for document upload/ingestion/read endpoints.
 
 Every schema field traces to a real column on `Document`/`IngestionJob` or a genuinely-derivable
-value (see `app/services/document_query_service.py`). No document response ever includes
+value (see `app/services/documents/query_service.py`). No document response ever includes
 `storage_key`/`storage_bucket`/`storage_etag` or any other internal storage-provider detail —
 only `storage_provider` (e.g. "local"/"minio") is exposed, per the storage-abstraction governance
 rule in CLAUDE.md.
@@ -17,10 +17,10 @@ from app.models.ingestion_job import IngestionStatus
 
 
 class DocumentLifecycleStatus(StrEnum):
-    """A document's derived lifecycle state — see `document_query_service.derive_lifecycle_status`.
+    """A document's derived lifecycle state — see `query_service.derive_lifecycle_status`.
 
     Defined here (not in the service module) so `app/schemas/documents.py` and
-    `app/services/document_query_service.py` don't import each other in a cycle: the service
+    `app/services/documents/query_service.py` don't import each other in a cycle: the service
     module builds these response schemas, so the schema module must not depend back on it.
 
     `DELETING`/`DELETION_FAILED`/`DELETED` (Phase 2.8.4) always take precedence over any
@@ -95,7 +95,7 @@ class IngestionStatusResponse(BaseModel):
     `IngestionJob` has no dedicated `started_at`/`failed_at`/`attempt_count` columns — `created_at`
     is used as a "job first created" surrogate and `updated_at` as a "last status transition"
     surrogate (it has `onupdate=func.now()`). All fields are null when the document has no
-    ingestion job yet (see DocumentLifecycleStatus.UPLOADED in document_query_service.py).
+    ingestion job yet (see DocumentLifecycleStatus.UPLOADED in documents/query_service.py).
     """
 
     document_id: str
@@ -125,7 +125,7 @@ class IngestionFailureResponse(BaseModel):
     """Shape returned by GET /api/v1/documents/{document_id}/failure.
 
     `safe_message` is a fixed, generic message — never the raw `IngestionJob.error_message` (see
-    `sanitize_ingestion_error` in document_query_service.py for why). No `retryable` field is
+    `sanitize_ingestion_error` in documents/query_service.py for why). No `retryable` field is
     included: there is no retry endpoint or attempt-count tracking in this codebase yet, so a
     boolean here would be fabricated rather than genuinely derived.
     """

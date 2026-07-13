@@ -1,9 +1,10 @@
-"""A minimal in-memory AsyncSession double for app.services.document_query_service unit tests.
+"""A minimal in-memory AsyncSession double for the document query/download unit tests.
 
-Faithfully simulates the exact SELECT shapes document_query_service.py issues (count, list with
-order/limit/offset, latest-job-by-document_id, latest-failed-job, batched latest-jobs-in) in
-plain Python, by dispatching on each Select statement's mapped entity and compiled SQL text — no
-SQLite or any other real database engine is used, per CLAUDE.md's database-testing-style rule.
+Faithfully simulates the exact SELECT shapes `app.services.documents.query_service` and
+`app.services.documents.download_service` issue (count, list with order/limit/offset,
+latest-job-by-document_id, latest-failed-job, batched latest-jobs-in) in plain Python, by
+dispatching on each Select statement's mapped entity and compiled SQL text — no SQLite or any
+other real database engine is used, per CLAUDE.md's database-testing-style rule.
 """
 
 import re

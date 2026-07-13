@@ -13,7 +13,7 @@ from pypdf.generic import DictionaryObject, NameObject
 from pypdf.generic import StreamObject as _StreamObject
 
 from app.models.document import Document
-from app.services.document_text_extractor import DocumentTextExtractionError, DocumentTextExtractor
+from app.services.documents.text_extractor import DocumentTextExtractionError, DocumentTextExtractor
 from app.storage.local_storage import LocalFileStorage
 
 

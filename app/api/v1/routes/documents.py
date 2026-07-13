@@ -1,11 +1,11 @@
 """Document upload + read-only inspection/download endpoints, plus deletion scheduling/status.
 
 Upload does not parse, chunk, embed, or index the document — that happens asynchronously via
-`app.services.ingestion_worker`. The five original read routes here (list, detail, ingestion
+`app.services.ingestion.worker`. The five original read routes here (list, detail, ingestion
 status, failure, download) are strictly read-only: no mutation of Postgres, object storage,
 Qdrant, ingestion jobs, or cleanup records happens on any of them. `POST .../ingestion/retry`
 (Phase 2.8.3) only ever inserts a new PENDING IngestionJob row via
-`app.services.ingestion_retry_service`. `DELETE /documents/{id}` and `GET .../deletion` (Phase
+`app.services.ingestion.retry_service`. `DELETE /documents/{id}` and `GET .../deletion` (Phase
 2.8.4) schedule/report full document deletion via `app.services.documents.deletion_service` — the
 DELETE route only ever inserts a new PENDING DocumentDeletionJob row (or reports an existing one);
 the actual cross-system cleanup runs out-of-band via
@@ -35,23 +35,23 @@ from app.schemas.documents import (
     IngestionRetryResponse,
     IngestionStatusResponse,
 )
-from app.services.document_query_service import (
-    DEFAULT_LIST_LIMIT,
-    MAX_LIST_LIMIT,
-    build_document_list_response,
-    download_document,
-    get_document_detail_result,
-    get_document_failure_result,
-    get_document_ingestion_result,
-)
-from app.services.document_upload_service import upload_document
 from app.services.documents.deletion_service import (
     DeletionRequestOutcome,
     get_latest_deletion_job,
     request_document_deletion,
     sanitize_deletion_error,
 )
-from app.services.ingestion_retry_service import RetryOutcome, retry_ingestion
+from app.services.documents.download_service import download_document
+from app.services.documents.query_service import (
+    DEFAULT_LIST_LIMIT,
+    MAX_LIST_LIMIT,
+    build_document_list_response,
+    get_document_detail_result,
+    get_document_failure_result,
+    get_document_ingestion_result,
+)
+from app.services.documents.upload_service import upload_document
+from app.services.ingestion.retry_service import RetryOutcome, retry_ingestion
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 
@@ -125,7 +125,7 @@ async def get_document_ingestion_route(
     """Return one document's latest ingestion status; 404 only if the document itself is missing.
 
     A document with no ingestion job yet is a 200 with null job_id/status/created_at/updated_at,
-    not a 404 — see app.services.document_query_service's module docstring.
+    not a 404 — see app.services.documents.query_service's module docstring.
     """
     result = await get_document_ingestion_result(db, document_id)
     if result.response is None:
@@ -139,7 +139,7 @@ async def get_document_failure_route(
 ) -> IngestionFailureResponse:
     """Return one document's latest failed ingestion job; 404 if the document or a failure is missing.
 
-    See DocumentFailureResult's docstring in document_query_service.py for why "no failure to
+    See DocumentFailureResult's docstring in documents/query_service.py for why "no failure to
     inspect" maps to 404 here rather than a 200-with-null body.
     """
     result = await get_document_failure_result(db, document_id)
@@ -171,7 +171,7 @@ async def retry_document_ingestion_route(
     202 with `created=True` when a new PENDING job was inserted; 200 with `created=False` when an
     already-active job was returned instead (nothing new was scheduled); 404 if the document does
     not exist; 409 if the latest job is already COMPLETED (see
-    `app.services.ingestion_retry_service.retry_ingestion` for the full decision table).
+    `app.services.ingestion.retry_service.retry_ingestion` for the full decision table).
     """
     settings = get_settings()
     result = await retry_ingestion(

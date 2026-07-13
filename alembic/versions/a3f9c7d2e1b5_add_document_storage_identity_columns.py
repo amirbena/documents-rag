@@ -14,7 +14,7 @@ pre-migration LocalFileStorage always wrote files flat under its configured root
 stored_filename — that value is exactly the object key the new LocalFileStorage needs to locate
 the same file, so no file content is read and no data is moved. storage_bucket/storage_etag stay
 NULL for these rows (local storage has neither). New uploads populate all four columns going
-forward via app/services/document_upload_service.py.
+forward via app/services/documents/upload_service.py.
 """
 from collections.abc import Sequence
 

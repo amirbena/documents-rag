@@ -15,7 +15,7 @@ from app.main import app
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.storage.local_storage import LocalFileStorage
-from tests.support.fake_document_session import FakeDocumentQuerySession
+from tests.support.documents.read.fake_session import FakeDocumentQuerySession
 
 client = TestClient(app)
 
