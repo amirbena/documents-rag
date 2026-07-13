@@ -30,7 +30,19 @@ genuine indexed state:
   reports `INDEXED` rather than fabricating a new status — the job itself is the authoritative
   completion signal — but this is a genuine, documented edge case, not a proven-impossible one.
 
-No `DELETING`/`DELETED` status exists — there is no delete endpoint in this codebase yet.
+## Deletion precedence (Phase 2.8.4)
+
+If a `DocumentDeletionJob` exists for the document, it always takes precedence over the
+ingestion-derived status above:
+
+- latest deletion job PENDING/PROCESSING -> DELETING.
+- latest deletion job PARTIALLY_FAILED -> DELETION_FAILED.
+- latest deletion job COMPLETED -> DELETED.
+- no deletion job at all -> fall through to the ingestion-derived rule above.
+
+Once a document is DELETED it can never appear INDEXED/PENDING/etc. again merely because its
+(unchanged) IngestionJob/indexing columns still describe a prior successful index — the deletion
+job's status is checked first and, if present, is authoritative.
 """
 
 from dataclasses import dataclass
@@ -39,6 +51,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.schemas.documents import (
     DocumentDetailResponse,
@@ -47,6 +60,10 @@ from app.schemas.documents import (
     DocumentSummaryResponse,
     IngestionFailureResponse,
     IngestionStatusResponse,
+)
+from app.services.document_deletion_service import (
+    get_latest_deletion_job,
+    get_latest_deletion_jobs_for_documents,
 )
 from app.storage.contract import FileStorage
 from app.storage.errors import StorageObjectNotFoundError, StorageReadError, StorageUnavailableError
@@ -65,9 +82,25 @@ _SAFE_INGESTION_FAILURE_MESSAGE = (
 
 
 def derive_lifecycle_status(
-    document: Document, latest_job: IngestionJob | None
+    document: Document,
+    latest_job: IngestionJob | None,
+    latest_deletion_job: DocumentDeletionJob | None = None,
 ) -> DocumentLifecycleStatus:
-    """Derive a document's lifecycle status from its latest ingestion job and indexed_at."""
+    """Derive a document's lifecycle status; a deletion job, if any, always takes precedence.
+
+    See the module docstring's "Deletion precedence" section for the full rule.
+    """
+    if latest_deletion_job is not None:
+        if latest_deletion_job.status in (
+            DocumentDeletionStatus.PENDING,
+            DocumentDeletionStatus.PROCESSING,
+        ):
+            return DocumentLifecycleStatus.DELETING
+        if latest_deletion_job.status == DocumentDeletionStatus.PARTIALLY_FAILED:
+            return DocumentLifecycleStatus.DELETION_FAILED
+        if latest_deletion_job.status == DocumentDeletionStatus.COMPLETED:
+            return DocumentLifecycleStatus.DELETED
+
     if latest_job is None:
         return DocumentLifecycleStatus.UPLOADED
     if latest_job.status == IngestionStatus.PENDING:
@@ -169,14 +202,18 @@ async def get_latest_jobs_for_documents(
     return latest_by_document
 
 
-def _to_summary(document: Document, latest_job: IngestionJob | None) -> DocumentSummaryResponse:
-    """Build a DocumentSummaryResponse from a Document and its (already-resolved) latest job."""
+def _to_summary(
+    document: Document,
+    latest_job: IngestionJob | None,
+    latest_deletion_job: DocumentDeletionJob | None,
+) -> DocumentSummaryResponse:
+    """Build a DocumentSummaryResponse from a Document and its (already-resolved) latest jobs."""
     return DocumentSummaryResponse(
         id=document.id,
         original_filename=document.original_filename,
         content_type=document.content_type,
         size_bytes=document.file_size,
-        status=derive_lifecycle_status(document, latest_job),
+        status=derive_lifecycle_status(document, latest_job, latest_deletion_job),
         created_at=document.created_at,
         latest_ingestion_activity_at=latest_job.updated_at if latest_job is not None else None,
     )
@@ -185,11 +222,19 @@ def _to_summary(document: Document, latest_job: IngestionJob | None) -> Document
 async def build_document_list_response(
     session: AsyncSession, *, limit: int, offset: int
 ) -> DocumentListResponse:
-    """List one page of documents with their derived lifecycle status; always HTTP 200."""
-    documents, total = await list_documents(session, limit=limit, offset=offset)
-    latest_jobs = await get_latest_jobs_for_documents(session, [document.id for document in documents])
+    """List one page of documents with their derived lifecycle status; always HTTP 200.
 
-    items = [_to_summary(document, latest_jobs.get(document.id)) for document in documents]
+    Deleted documents remain listed (lifecycle=DELETED) — this endpoint never filters them out.
+    """
+    documents, total = await list_documents(session, limit=limit, offset=offset)
+    document_ids = [document.id for document in documents]
+    latest_jobs = await get_latest_jobs_for_documents(session, document_ids)
+    latest_deletion_jobs = await get_latest_deletion_jobs_for_documents(session, document_ids)
+
+    items = [
+        _to_summary(document, latest_jobs.get(document.id), latest_deletion_jobs.get(document.id))
+        for document in documents
+    ]
     return DocumentListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
@@ -202,19 +247,24 @@ class DocumentDetailResult:
 
 
 async def get_document_detail_result(session: AsyncSession, document_id: str) -> DocumentDetailResult:
-    """Look up one document's detail view; 404 (empty response) if it does not exist."""
+    """Look up one document's detail view; 404 (empty response) if it does not exist.
+
+    A successfully deleted document remains inspectable here (lifecycle=DELETED) — this endpoint
+    never returns 404 for a document that exists but was deleted.
+    """
     document = await get_document(session, document_id)
     if document is None:
         return DocumentDetailResult(response=None, status_code=404)
 
     latest_job = await get_latest_ingestion_job(session, document_id)
+    latest_deletion_job = await get_latest_deletion_job(session, document_id)
     response = DocumentDetailResponse(
         id=document.id,
         original_filename=document.original_filename,
         content_type=document.content_type,
         size_bytes=document.file_size,
         storage_provider=document.storage_provider,
-        status=derive_lifecycle_status(document, latest_job),
+        status=derive_lifecycle_status(document, latest_job, latest_deletion_job),
         collection_name=document.collection_name,
         embedding_version=document.embedding_version,
         chunking_version=document.chunking_version,
@@ -321,14 +371,20 @@ async def download_document(
 ) -> DocumentDownloadResult:
     """Resolve a document, read its original bytes from `storage`, and return a typed result.
 
-    404 if the document row doesn't exist; 409 if the row exists but its storage object is
-    missing (a real document/storage inconsistency, not "not found" — the document is real);
-    503 if the storage backend itself is unreachable/failing for a reason other than not-found.
-    Never returns a raw storage exception message or a local filesystem path.
+    404 if the document row doesn't exist; 410 if the document was successfully deleted (Phase
+    2.8.4 — the Postgres resource still exists, only its content was intentionally removed, so
+    this is Gone rather than Not Found); 409 if the row exists but its storage object is
+    otherwise missing (a real document/storage inconsistency); 503 if the storage backend itself
+    is unreachable/failing for a reason other than not-found. Never returns a raw storage
+    exception message or a local filesystem path.
     """
     document = await get_document(session, document_id)
     if document is None:
         return DocumentDownloadResult(status_code=404, detail="Document not found.")
+
+    latest_deletion_job = await get_latest_deletion_job(session, document_id)
+    if latest_deletion_job is not None and latest_deletion_job.status == DocumentDeletionStatus.COMPLETED:
+        return DocumentDownloadResult(status_code=410, detail="Document has been deleted.")
 
     key = resolve_download_key(document)
     try:

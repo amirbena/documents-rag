@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob
 from app.models.ingestion_job import IngestionJob
 
 
@@ -56,11 +57,14 @@ class FakeDocumentQuerySession:
     def __init__(self) -> None:
         self.documents: dict[str, Document] = {}
         self.jobs: dict[str, IngestionJob] = {}
+        self.deletion_jobs: dict[str, DocumentDeletionJob] = {}
         self.execute_count = 0
 
     def add(self, instance: object) -> None:
         if isinstance(instance, Document):
             self.documents[instance.id] = instance
+        elif isinstance(instance, DocumentDeletionJob):
+            self.deletion_jobs[instance.id] = instance
         elif isinstance(instance, IngestionJob):
             self.jobs[instance.id] = instance
 
@@ -83,6 +87,8 @@ class FakeDocumentQuerySession:
             return _ListResult(self._select_documents(compiled))
         if entity is IngestionJob:
             return _ListResult(self._select_jobs(compiled))
+        if entity is DocumentDeletionJob:
+            return _ListResult(self._select_deletion_jobs(compiled))
         raise NotImplementedError(f"Unhandled fake query shape: {compiled}")
 
     def _select_documents(self, compiled: str) -> list[Document]:
@@ -110,6 +116,25 @@ class FakeDocumentQuerySession:
 
         if status_match:
             jobs = [job for job in jobs if job.status.value == status_match.group(1)]
+
+        jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
+
+        limit_match = re.search(r"LIMIT (\d+)", compiled)
+        if limit_match:
+            jobs = jobs[: int(limit_match.group(1))]
+        return jobs
+
+    def _select_deletion_jobs(self, compiled: str) -> list[DocumentDeletionJob]:
+        jobs = list(self.deletion_jobs.values())
+
+        in_match = re.search(r"document_id IN \(([^)]*)\)", compiled)
+        eq_match = re.search(r"document_id = '([^']*)'", compiled)
+
+        if in_match:
+            ids = {token.strip().strip("'") for token in in_match.group(1).split(",")}
+            jobs = [job for job in jobs if job.document_id in ids]
+        elif eq_match:
+            jobs = [job for job in jobs if job.document_id == eq_match.group(1)]
 
         jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
 

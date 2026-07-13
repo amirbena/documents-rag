@@ -63,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.document_deletion_service import get_latest_deletion_job
 
 # Fixed prefix for a stale-recovery FAILED job's error_message — machine-identifiable in raw
 # Postgres data/logs, but never exposed differently by the public API: `sanitize_ingestion_error()`
@@ -78,6 +79,7 @@ class RetryOutcome(StrEnum):
     CREATED = "created"
     ALREADY_ACTIVE = "already_active"
     ALREADY_COMPLETED = "already_completed"
+    DELETION_ACTIVE = "deletion_active"
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,11 @@ async def retry_ingestion(
       row (if any) is left completely unmodified.
     - latest job COMPLETED -> ALREADY_COMPLETED (route maps to 409 — re-index is a separate,
       already-existing endpoint, not this one).
+    - any DocumentDeletionJob exists for the document at all (PENDING/PROCESSING/
+      PARTIALLY_FAILED/COMPLETED — i.e. the document's lifecycle is DELETING/DELETION_FAILED/
+      DELETED, Phase 2.8.4) -> DELETION_ACTIVE (route maps to 409). Checked before any other
+      decision below, so a deletion in progress or already completed always blocks ingestion
+      retry — a document is never implicitly resurrected by retrying its ingestion.
 
     Takes a blocking `SELECT ... FOR UPDATE` on the document's existing job rows first, so two
     concurrent retries for an already-active document serialize instead of racing; a residual
@@ -166,6 +173,9 @@ async def retry_ingestion(
     document = await session.get(Document, document_id)
     if document is None:
         return IngestionRetryResult(outcome=RetryOutcome.DOCUMENT_NOT_FOUND, job=None)
+
+    if await get_latest_deletion_job(session, document_id) is not None:
+        return IngestionRetryResult(outcome=RetryOutcome.DELETION_ACTIVE, job=None)
 
     stmt = (
         select(IngestionJob)

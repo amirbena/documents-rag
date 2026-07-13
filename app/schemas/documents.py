@@ -12,6 +12,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from app.models.document_deletion_job import DocumentDeletionStatus
 from app.models.ingestion_job import IngestionStatus
 
 
@@ -21,6 +22,10 @@ class DocumentLifecycleStatus(StrEnum):
     Defined here (not in the service module) so `app/schemas/documents.py` and
     `app/services/document_query_service.py` don't import each other in a cycle: the service
     module builds these response schemas, so the schema module must not depend back on it.
+
+    `DELETING`/`DELETION_FAILED`/`DELETED` (Phase 2.8.4) always take precedence over any
+    ingestion-derived status once a `DocumentDeletionJob` exists for the document — see
+    `derive_lifecycle_status`'s precedence rule.
     """
 
     UPLOADED = "uploaded"
@@ -28,6 +33,9 @@ class DocumentLifecycleStatus(StrEnum):
     PROCESSING = "processing"
     INDEXED = "indexed"
     FAILED = "failed"
+    DELETING = "deleting"
+    DELETION_FAILED = "deletion_failed"
+    DELETED = "deleted"
 
 
 class DocumentUploadResponse(BaseModel):
@@ -127,3 +135,37 @@ class IngestionFailureResponse(BaseModel):
     status: IngestionStatus
     safe_message: str
     failed_at: datetime
+
+
+class DocumentDeletionResponse(BaseModel):
+    """Shape returned by DELETE /api/v1/documents/{document_id}.
+
+    `created=True` means a brand-new PENDING DocumentDeletionJob was inserted (202); `created=False`
+    means an already-active job was returned unchanged (202), or the document was already fully
+    deleted (200, `status=DELETED`) — see `app.services.document_deletion_service.
+    request_document_deletion` for the full decision table.
+    """
+
+    document_id: str
+    deletion_job_id: str
+    status: DocumentDeletionStatus
+    created: bool
+
+
+class DocumentDeletionStatusResponse(BaseModel):
+    """Shape returned by GET /api/v1/documents/{document_id}/deletion.
+
+    `safe_message` is a fixed, sanitized message (never the raw `DocumentDeletionJob.error_message`
+    — see `sanitize_deletion_error`), null when the latest attempt has no recorded failure. No
+    storage key/bucket, Qdrant collection name, or raw provider exception is ever included.
+    """
+
+    document_id: str
+    deletion_job_id: str
+    status: DocumentDeletionStatus
+    vector_cleanup_completed: bool
+    storage_cleanup_completed: bool
+    safe_message: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None

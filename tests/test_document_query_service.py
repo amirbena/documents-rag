@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from app.models.document import Document
+from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.schemas.documents import DocumentLifecycleStatus
 from app.services.document_query_service import (
@@ -195,8 +196,9 @@ async def test_list_documents_avoids_n_plus_1_queries() -> None:
 
     await build_document_list_response(session, limit=10, offset=0)
 
-    # Exactly 3 queries: COUNT(*), the page SELECT, and one batched latest-jobs SELECT.
-    assert session.execute_count == 3
+    # Exactly 4 queries: COUNT(*), the page SELECT, one batched latest-ingestion-jobs SELECT, and
+    # one batched latest-deletion-jobs SELECT (Phase 2.8.4) — still fixed regardless of page size.
+    assert session.execute_count == 4
 
 
 # --- get_latest_ingestion_job / get_latest_failed_ingestion_job ---------------------------------
@@ -491,3 +493,85 @@ async def test_download_document_storage_unavailable_is_503() -> None:
 
     assert result.status_code == 503
     assert result.content is None
+
+
+# --- Deletion precedence (Phase 2.8.4) ----------------------------------------------------------
+
+
+def _deletion_job(
+    document_id: str, status: DocumentDeletionStatus, *, minutes: int = 0
+) -> DocumentDeletionJob:
+    return DocumentDeletionJob(
+        id=str(uuid.uuid4()),
+        document_id=document_id,
+        status=status,
+        vector_cleanup_completed=False,
+        storage_cleanup_completed=False,
+        created_at=_BASE_TIME + timedelta(minutes=minutes),
+        updated_at=_BASE_TIME + timedelta(minutes=minutes),
+    )
+
+
+def test_derive_lifecycle_status_deleting_takes_precedence_over_indexed() -> None:
+    doc = _document()
+    completed_ingestion = _job(doc.id, IngestionStatus.COMPLETED)
+    deletion = _deletion_job(doc.id, DocumentDeletionStatus.PENDING)
+
+    assert derive_lifecycle_status(doc, completed_ingestion, deletion) == DocumentLifecycleStatus.DELETING
+
+
+def test_derive_lifecycle_status_processing_deletion_is_deleting() -> None:
+    doc = _document()
+    deletion = _deletion_job(doc.id, DocumentDeletionStatus.PROCESSING)
+
+    assert derive_lifecycle_status(doc, None, deletion) == DocumentLifecycleStatus.DELETING
+
+
+def test_derive_lifecycle_status_partially_failed_deletion_is_deletion_failed() -> None:
+    doc = _document()
+    deletion = _deletion_job(doc.id, DocumentDeletionStatus.PARTIALLY_FAILED)
+
+    assert derive_lifecycle_status(doc, None, deletion) == DocumentLifecycleStatus.DELETION_FAILED
+
+
+def test_derive_lifecycle_status_completed_deletion_is_deleted() -> None:
+    doc = _document()
+    completed_ingestion = _job(doc.id, IngestionStatus.COMPLETED)
+    deletion = _deletion_job(doc.id, DocumentDeletionStatus.COMPLETED)
+
+    assert derive_lifecycle_status(doc, completed_ingestion, deletion) == DocumentLifecycleStatus.DELETED
+
+
+def test_derive_lifecycle_status_no_deletion_job_falls_back_to_ingestion() -> None:
+    doc = _document()
+    pending_ingestion = _job(doc.id, IngestionStatus.PENDING)
+
+    assert derive_lifecycle_status(doc, pending_ingestion, None) == DocumentLifecycleStatus.PENDING
+
+
+async def test_download_document_completed_deletion_is_410_not_404() -> None:
+    session = FakeDocumentQuerySession()
+    doc = _document(0, storage_key="documents/abc/file.pdf")
+    session.add(doc)
+    session.add(_deletion_job(doc.id, DocumentDeletionStatus.COMPLETED))
+    storage = _FakeStorage(objects={"documents/abc/file.pdf": b"hello world"})
+
+    result = await download_document(session, doc.id, storage)
+
+    assert result.status_code == 410
+    assert result.content is None
+    assert storage.read_calls == []
+
+
+async def test_download_document_partially_failed_deletion_still_downloads() -> None:
+    """A PARTIALLY_FAILED deletion never blocks download — the object may still be present."""
+    session = FakeDocumentQuerySession()
+    doc = _document(0, storage_key="documents/abc/file.pdf")
+    session.add(doc)
+    session.add(_deletion_job(doc.id, DocumentDeletionStatus.PARTIALLY_FAILED))
+    storage = _FakeStorage(objects={"documents/abc/file.pdf": b"still here"})
+
+    result = await download_document(session, doc.id, storage)
+
+    assert result.status_code == 200
+    assert result.content == b"still here"
