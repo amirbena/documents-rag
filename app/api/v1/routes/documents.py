@@ -15,6 +15,7 @@ sanitization, N+1-avoidance, retry/deletion transaction semantics) lives in the 
 routes here only parse/inject/call/copy-status, per CLAUDE.md's "Route Layer Style".
 """
 
+import logging
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
@@ -30,10 +31,18 @@ from app.schemas.documents import (
     DocumentDeletionStatusResponse,
     DocumentDetailResponse,
     DocumentListResponse,
+    DocumentUploadOutcome,
     DocumentUploadResponse,
     IngestionFailureResponse,
     IngestionRetryResponse,
     IngestionStatusResponse,
+)
+from app.services.documents.dedup_service import (
+    DeletionActiveError,
+    DeletionIncompleteError,
+    DeletionInvariantViolationError,
+    MissingWinnerAfterRaceError,
+    UploadOutcome,
 )
 from app.services.documents.deletion_service import (
     DeletionRequestOutcome,
@@ -55,7 +64,16 @@ from app.services.ingestion.retry_service import RetryOutcome, retry_ingestion
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+_UPLOAD_OUTCOME_MAP: dict[UploadOutcome, DocumentUploadOutcome] = {
+    UploadOutcome.CREATED: DocumentUploadOutcome.CREATED,
+    UploadOutcome.REUSED_ACTIVE: DocumentUploadOutcome.REUSED_ACTIVE,
+    UploadOutcome.REUSED_INDEXED: DocumentUploadOutcome.REUSED_INDEXED,
+    UploadOutcome.REUSED_FAILED: DocumentUploadOutcome.REUSED_FAILED,
+}
 
 
 def get_file_storage() -> FileStorage:
@@ -71,20 +89,38 @@ def get_vector_store() -> VectorStore:
 @router.post(
     "/documents",
     response_model=DocumentUploadResponse,
-    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Identical content already exists; the existing document/job is "
+            "returned and no new ingestion job was scheduled (outcome REUSED_ACTIVE, "
+            "REUSED_INDEXED, or REUSED_FAILED)."
+        },
+        status.HTTP_202_ACCEPTED: {
+            "description": "A new document was created and a new ingestion job was scheduled "
+            "(outcome CREATED)."
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "A document matching this content exists but its deletion is active "
+            "or incomplete."
+        },
+    },
 )
 async def upload_document_route(
     file: UploadFile,
+    response: Response,
     db: AsyncSession = Depends(get_db_session),
     storage: FileStorage = Depends(get_file_storage),
 ) -> DocumentUploadResponse:
-    """Save the uploaded file, create Document + pending IngestionJob rows, return 202.
+    """Save a genuinely new upload, or return an existing document with identical content.
 
-    Content-hash deduplication (Phase 2.8.5) may resolve this to an existing document/job instead
-    of creating new ones — the response always reports the real, current document/job identities
-    either way, never a freshly generated id for a document that already existed. Public
-    status-code differentiation between "created" and "reused" is not implemented yet: every
-    successful call still returns 202 regardless of which happened.
+    Byte-identical content (exact SHA-256 match; content type and filename never affect this) is
+    deduplicated: reuse never re-saves storage or schedules a new ingestion job, and always
+    reports the authoritative existing document's own `original_filename`, not this request's
+    filename. `outcome=CREATED` returns 202 (a new ingestion attempt was scheduled); every
+    `REUSED_*` outcome returns 200 (nothing new was scheduled) — a `REUSED_FAILED` document's
+    ingestion can be retried via `POST .../ingestion/retry`, which this endpoint never invokes
+    itself. A matching document currently blocked by its own deletion lifecycle (active or
+    incomplete) is a 409, never a reuse outcome.
     """
     content = await file.read()
     if not content:
@@ -93,18 +129,43 @@ async def upload_document_route(
     original_filename = file.filename or "unnamed"
     content_type = file.content_type or "application/octet-stream"
 
-    result = await upload_document(
-        content=content,
-        original_filename=original_filename,
-        content_type=content_type,
-        storage=storage,
-        session=db,
-    )
+    try:
+        result = await upload_document(
+            content=content,
+            original_filename=original_filename,
+            content_type=content_type,
+            storage=storage,
+            session=db,
+        )
+    except DeletionActiveError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A document matching this content is currently being deleted.",
+        ) from exc
+    except DeletionIncompleteError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A document matching this content has a PARTIALLY_FAILED deletion that must "
+            "be resolved (retried to completion) before it can be reused.",
+        ) from exc
+    except (DeletionInvariantViolationError, MissingWinnerAfterRaceError) as exc:
+        logger.error("Upload failed due to an internal consistency error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal consistency error occurred while processing this upload.",
+        ) from exc
 
+    response.status_code = (
+        status.HTTP_202_ACCEPTED
+        if result.outcome == UploadOutcome.CREATED
+        else status.HTTP_200_OK
+    )
     return DocumentUploadResponse(
         document_id=result.document.id,
         job_id=result.ingestion_job.id,
         status=result.ingestion_job.status,
+        outcome=_UPLOAD_OUTCOME_MAP[result.outcome],
+        original_filename=result.document.original_filename,
     )
 
 
