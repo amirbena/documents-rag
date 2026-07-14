@@ -38,12 +38,36 @@ class DocumentLifecycleStatus(StrEnum):
     DELETED = "deleted"
 
 
+class DocumentUploadOutcome(StrEnum):
+    """Public mirror of `app.services.documents.dedup_service.UploadOutcome`.
+
+    Kept as a distinct schema-layer enum (rather than exposing the service enum directly) so the
+    public contract's casing/values are stable independent of internal refactors — see
+    `app.api.v1.routes.documents._UPLOAD_OUTCOME_MAP` for the mapping. Deletion-blocking states are
+    never represented here: they are public 409 conflicts, not upload outcomes.
+    """
+
+    CREATED = "CREATED"
+    REUSED_ACTIVE = "REUSED_ACTIVE"
+    REUSED_INDEXED = "REUSED_INDEXED"
+    REUSED_FAILED = "REUSED_FAILED"
+
+
 class DocumentUploadResponse(BaseModel):
-    """Shape returned by POST /api/v1/documents."""
+    """Shape returned by POST /api/v1/documents.
+
+    `outcome=CREATED` is a 202 (a new ingestion attempt was scheduled); every `REUSED_*` outcome is
+    a 200 (an existing document/job was returned, nothing new was scheduled). `original_filename`
+    is always the authoritative existing document's filename for a reuse, never the filename from
+    this request. No `content_hash`, storage key/bucket, or raw internal exception is ever
+    included.
+    """
 
     document_id: str
     job_id: str
     status: IngestionStatus
+    outcome: DocumentUploadOutcome
+    original_filename: str
 
 
 class DocumentSummaryResponse(BaseModel):

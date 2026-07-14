@@ -94,6 +94,11 @@ class FakeDocumentQuerySession:
 
     def _select_documents(self, compiled: str) -> list[Document]:
         docs = sorted(self.documents.values(), key=lambda d: (d.created_at, d.id), reverse=True)
+
+        content_hash_match = re.search(r"content_hash = '([^']*)'", compiled)
+        if content_hash_match:
+            docs = [doc for doc in docs if doc.content_hash == content_hash_match.group(1)]
+
         offset_match = re.search(r"OFFSET (\d+)", compiled)
         if offset_match:
             docs = docs[int(offset_match.group(1)) :]

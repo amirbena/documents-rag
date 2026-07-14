@@ -1092,6 +1092,51 @@ identity added by Phase 2.6/2.7 (`storage_provider`/`storage_bucket`/`storage_ke
 columns.py` — see "Storage Abstraction" above and "Backward compatibility for pre-migration
 documents" below.
 
+**Content-hash deduplication (Phase 2.8.5).** `Document.content_hash` (nullable `VARCHAR(64)`,
+migration `alembic/versions/4a4f5c0674f4_add_document_content_hash_column.py`) holds a lowercase
+hex SHA-256 digest of a document's uploaded bytes, enforced unique when non-null via the named
+index `uq_documents_content_hash` — a normal (non-partial) unique index is sufficient since
+PostgreSQL never treats two `NULL`s as equal. `app.services.documents.upload_service
+.upload_document()` computes this hash and calls `app.services.documents.dedup_service
+.decide_upload()` as a fast path before ever writing to storage: a matching document with no
+blocking deletion state is reused (no new object, no new `Document`, no new `IngestionJob`); a
+matching document with an active/incomplete deletion raises a typed internal exception instead of
+being treated as reusable. The database unique index — never the fast-path lookup — is what
+actually guarantees exactly one logical document survives two genuinely concurrent identical
+uploads: the losing commit's `IntegrityError` is inspected via the PostgreSQL diagnostic
+`constraint_name` (never message-text matching) to confirm it is specifically
+`uq_documents_content_hash` before being treated as a race, its own just-written object is
+best-effort deleted, and the winning row is reloaded and re-evaluated through the same lifecycle
+decision. `app.services.documents.deletion_worker.DocumentDeletionWorker` releases a document's
+hash (`content_hash = NULL`) only in the same commit as its deletion job reaching `COMPLETED` —
+never on `PENDING`/`PROCESSING`/`PARTIALLY_FAILED` — so a later upload of the same bytes may claim
+it again only once deletion has genuinely, fully finished. No existing row is backfilled.
+`POST /api/v1/documents` exposes this decision publicly (Phase 2.8.5 subtask 4):
+`DocumentUploadOutcome` (`CREATED`/`REUSED_ACTIVE`/`REUSED_INDEXED`/`REUSED_FAILED`) plus a
+dynamic `202`/`200` status, and `DeletionActiveError`/`DeletionIncompleteError` map to a sanitized
+`409` — never the raw internal exception, never `content_hash`/storage internals in the response
+body. See `app/api/v1/routes/documents.py`'s upload route and `app/schemas/documents.py`.
+
+Phase 2.8.5 status, as proven end-to-end (Backend E2E, local storage) by
+`tests/e2e/backend/documents/upload/`:
+
+- Hash persistence ✅
+- Sequential duplicate reuse ✅
+- Concurrent duplicate safety ✅
+- No duplicate ingestion lifecycle ✅
+- No duplicate logical vectors ✅
+- Filename-independent exact-byte identity ✅
+- Failed-ingestion reuse ✅
+- Deletion conflict behavior ✅
+- Completed deletion re-upload ✅
+- Local storage Backend E2E ✅
+
+MinIO parity for this feature has not been separately re-run at the Backend E2E tier — dedup
+decisions live above the storage provider, and Local/MinIO parity is already covered at the
+storage-abstraction unit/integration tier (see "Storage Abstraction"). Request idempotency keys,
+tenant-scoped deduplication, and backfilling existing pre-hash rows remain out of scope and are
+not implemented.
+
 PostgreSQL remains the source-of-truth for document lifecycle/metadata, storage identity, and
 active versions; `FileStorage` (local disk or MinIO, per `FILE_STORAGE_PROVIDER`) holds the
 original file content; Qdrant is a **derived** index, rebuildable at any time from the persisted

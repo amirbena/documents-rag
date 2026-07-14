@@ -45,6 +45,13 @@ class Document(Base):
     storage_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     storage_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Content-hash persistence foundation (Phase 2.8.5, subtask 1) — a lowercase hex SHA-256
+    # digest of the uploaded bytes, enforced unique when non-null via `uq_documents_content_hash`
+    # (multiple NULLs are allowed). Nullable and not yet populated by the upload flow: existing
+    # documents are intentionally not backfilled, and no upload/deduplication behavior reads or
+    # writes this column yet — see the migration adding it for the exact schema change.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     embedding_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
