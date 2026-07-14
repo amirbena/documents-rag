@@ -1110,9 +1110,32 @@ best-effort deleted, and the winning row is reloaded and re-evaluated through th
 decision. `app.services.documents.deletion_worker.DocumentDeletionWorker` releases a document's
 hash (`content_hash = NULL`) only in the same commit as its deletion job reaching `COMPLETED` —
 never on `PENDING`/`PROCESSING`/`PARTIALLY_FAILED` — so a later upload of the same bytes may claim
-it again only once deletion has genuinely, fully finished. No existing row is backfilled, and the
-public API does not yet expose the outcome of this decision (status codes/response fields are a
-later phase).
+it again only once deletion has genuinely, fully finished. No existing row is backfilled.
+`POST /api/v1/documents` exposes this decision publicly (Phase 2.8.5 subtask 4):
+`DocumentUploadOutcome` (`CREATED`/`REUSED_ACTIVE`/`REUSED_INDEXED`/`REUSED_FAILED`) plus a
+dynamic `202`/`200` status, and `DeletionActiveError`/`DeletionIncompleteError` map to a sanitized
+`409` — never the raw internal exception, never `content_hash`/storage internals in the response
+body. See `app/api/v1/routes/documents.py`'s upload route and `app/schemas/documents.py`.
+
+Phase 2.8.5 status, as proven end-to-end (Backend E2E, local storage) by
+`tests/e2e/backend/documents/upload/`:
+
+- Hash persistence ✅
+- Sequential duplicate reuse ✅
+- Concurrent duplicate safety ✅
+- No duplicate ingestion lifecycle ✅
+- No duplicate logical vectors ✅
+- Filename-independent exact-byte identity ✅
+- Failed-ingestion reuse ✅
+- Deletion conflict behavior ✅
+- Completed deletion re-upload ✅
+- Local storage Backend E2E ✅
+
+MinIO parity for this feature has not been separately re-run at the Backend E2E tier — dedup
+decisions live above the storage provider, and Local/MinIO parity is already covered at the
+storage-abstraction unit/integration tier (see "Storage Abstraction"). Request idempotency keys,
+tenant-scoped deduplication, and backfilling existing pre-hash rows remain out of scope and are
+not implemented.
 
 PostgreSQL remains the source-of-truth for document lifecycle/metadata, storage identity, and
 active versions; `FileStorage` (local disk or MinIO, per `FILE_STORAGE_PROVIDER`) holds the
