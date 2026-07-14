@@ -6,6 +6,12 @@ ARCHITECTURE.md. The sequence is: save the object to `FileStorage`, then persist
 delete of that object is attempted so a DB failure doesn't silently leave an orphaned object
 behind; the *original* DB exception is always what propagates, and a cleanup failure is logged
 (not raised, not hidden) rather than masking the original error.
+
+Every new `Document` also gets its `content_hash` populated (Phase 2.8.5, subtask 2) — the only
+new persistence behavior this subtask adds. This function does not yet look up or reuse an
+existing document with the same hash; that decision model lives in `dedup_service.py` and is not
+wired into this flow yet, so uploading identical bytes twice still creates two `Document` rows
+today, exactly as before.
 """
 
 import logging
@@ -16,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.models.document import Document
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.documents.dedup_service import compute_content_hash
 from app.storage.contract import FileStorage
 from app.storage.keys import generate_object_key
 
@@ -39,6 +46,7 @@ async def upload_document(
     settings = settings or get_settings()
     document_id = str(uuid.uuid4())
     key = generate_object_key(document_id, original_filename)
+    content_hash = compute_content_hash(content)
 
     stored = await storage.save(key, content, content_type=content_type)
 
@@ -54,6 +62,7 @@ async def upload_document(
         storage_bucket=bucket,
         storage_key=stored.key,
         storage_etag=stored.etag,
+        content_hash=content_hash,
     )
     session.add(document)
 

@@ -1,5 +1,6 @@
 """Tests for POST /api/v1/documents with a fake DB session and local temp storage."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,23 @@ def test_upload_creates_document_and_ingestion_job(tmp_path: Path) -> None:
     assert document.storage_provider == "local"
     assert document.storage_key is not None
     assert document.storage_key.startswith(f"documents/{document.id}/")
+
+
+def test_upload_persists_calculated_content_hash(tmp_path: Path) -> None:
+    """A new Document's content_hash must be the lowercase hex SHA-256 of the uploaded bytes."""
+    fake_session = _override_dependencies(tmp_path)
+    content = b"%PDF-1.4 fake content for hashing"
+
+    response = client.post(
+        "/api/v1/documents",
+        files={"file": ("report.pdf", content, "application/pdf")},
+    )
+
+    assert response.status_code == 202
+    document, _job = fake_session.added
+    assert document.content_hash == hashlib.sha256(content).hexdigest()
+    assert len(document.content_hash) == 64
+    assert document.content_hash == document.content_hash.lower()
 
 
 def test_upload_response_status_is_202(tmp_path: Path) -> None:
