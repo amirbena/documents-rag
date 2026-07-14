@@ -1092,6 +1092,15 @@ identity added by Phase 2.6/2.7 (`storage_provider`/`storage_bucket`/`storage_ke
 columns.py` — see "Storage Abstraction" above and "Backward compatibility for pre-migration
 documents" below.
 
+**Content-hash persistence (Phase 2.8.5, schema-only foundation).** `Document.content_hash`
+(nullable `VARCHAR(64)`, migration `alembic/versions/4a4f5c0674f4_add_document_content_hash_
+column.py`) will eventually hold a lowercase hex SHA-256 digest of a document's uploaded bytes,
+enforced unique when non-null via the named index `uq_documents_content_hash` — a normal
+(non-partial) unique index is sufficient since PostgreSQL never treats two `NULL`s as equal.
+**Not yet populated by the upload flow** — no hash is calculated, no duplicate lookup happens,
+and no existing row is backfilled. This is deliberately schema-only; the deduplication behavior
+itself is a separate, later phase.
+
 PostgreSQL remains the source-of-truth for document lifecycle/metadata, storage identity, and
 active versions; `FileStorage` (local disk or MinIO, per `FILE_STORAGE_PROVIDER`) holds the
 original file content; Qdrant is a **derived** index, rebuildable at any time from the persisted

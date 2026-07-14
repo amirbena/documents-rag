@@ -8,6 +8,7 @@ rules), so this runs against a real Postgres via Testcontainers instead.
 
 import asyncio
 import uuid
+from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import inspect, text
@@ -15,6 +16,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
+
+if TYPE_CHECKING:
+    from app.models.document import Document
 
 
 async def test_upgrade_head_creates_expected_tables(migrated_schema: None, postgres_url: str) -> None:
@@ -67,6 +71,7 @@ async def test_upgrade_head_creates_expected_columns(migrated_schema: None, post
         "storage_bucket",
         "storage_key",
         "storage_etag",
+        "content_hash",
     }
     assert job_columns == {
         "id",
@@ -302,3 +307,118 @@ async def test_upgrade_backfills_storage_identity_for_pre_migration_rows(
     assert document.storage_key == stored_filename
     assert document.storage_bucket is None
     assert document.storage_etag is None
+
+
+def _make_document(*, document_id: str | None = None, content_hash: str | None = None) -> "Document":
+    """Build a minimal valid Document row for content_hash persistence tests."""
+    from app.models.document import Document
+
+    return Document(
+        id=document_id or str(uuid.uuid4()),
+        original_filename="report.pdf",
+        stored_filename=f"{uuid.uuid4().hex}.pdf",
+        content_type="application/pdf",
+        file_size=10,
+        stored_path="storage/documents/report.pdf",
+        content_hash=content_hash,
+    )
+
+
+async def test_upgrade_from_prior_revision_adds_content_hash_column(
+    migrated_schema: None, postgres_url: str
+) -> None:
+    """Upgrading from c8f3a2b6d1e7 alone should add the nullable content_hash column."""
+    await asyncio.to_thread(run_alembic_downgrade, "c8f3a2b6d1e7")
+
+    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            document_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
+            )
+    finally:
+        await engine.dispose()
+
+    assert "content_hash" not in document_columns
+
+    await asyncio.to_thread(run_alembic_upgrade, "head")
+
+    engine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            document_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
+            )
+    finally:
+        await engine.dispose()
+
+    assert "content_hash" in document_columns
+
+
+async def test_content_hash_unique_index_exists(migrated_schema: None, postgres_url: str) -> None:
+    """The named unique index uq_documents_content_hash must exist after upgrading to head."""
+    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            indexes = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_indexes("documents"))
+    finally:
+        await engine.dispose()
+
+    by_name = {index["name"]: index for index in indexes}
+    assert "uq_documents_content_hash" in by_name
+    assert by_name["uq_documents_content_hash"]["unique"] is True
+    assert by_name["uq_documents_content_hash"]["column_names"] == ["content_hash"]
+
+
+async def test_multiple_documents_with_null_content_hash_are_allowed(
+    migrated_schema: None, integration_db_session: AsyncSession
+) -> None:
+    """PostgreSQL must allow any number of documents with content_hash = NULL."""
+    for _ in range(3):
+        integration_db_session.add(_make_document(content_hash=None))
+
+    await integration_db_session.commit()  # must not raise
+
+
+async def test_two_documents_with_different_content_hashes_are_allowed(
+    migrated_schema: None, integration_db_session: AsyncSession
+) -> None:
+    """Two distinct non-null hashes must be able to coexist."""
+    integration_db_session.add(_make_document(content_hash="a" * 64))
+    integration_db_session.add(_make_document(content_hash="b" * 64))
+
+    await integration_db_session.commit()  # must not raise
+
+
+async def test_duplicate_content_hash_violates_unique_index(
+    migrated_schema: None, integration_db_session: AsyncSession
+) -> None:
+    """Inserting two documents with the same non-null content_hash must raise IntegrityError."""
+    shared_hash = "c" * 64
+    integration_db_session.add(_make_document(content_hash=shared_hash))
+    await integration_db_session.commit()
+
+    integration_db_session.add(_make_document(content_hash=shared_hash))
+    with pytest.raises(IntegrityError):
+        await integration_db_session.commit()
+
+    await integration_db_session.rollback()
+
+
+async def test_content_hash_persists_and_loads_unchanged(
+    migrated_schema: None, integration_db_session: AsyncSession
+) -> None:
+    """A 64-character lowercase hex hash must round-trip through Postgres unchanged."""
+    sha256_hex = "d" * 64
+    document = _make_document(content_hash=sha256_hex)
+    integration_db_session.add(document)
+    await integration_db_session.commit()
+
+    result = await integration_db_session.execute(
+        text("SELECT content_hash FROM documents WHERE id = :id"), {"id": document.id}
+    )
+    stored_value = result.scalar_one()
+
+    assert stored_value == sha256_hex
+    assert len(stored_value) == 64
+    assert stored_value == stored_value.lower()
