@@ -78,7 +78,14 @@ async def upload_document_route(
     db: AsyncSession = Depends(get_db_session),
     storage: FileStorage = Depends(get_file_storage),
 ) -> DocumentUploadResponse:
-    """Save the uploaded file, create Document + pending IngestionJob rows, return 202."""
+    """Save the uploaded file, create Document + pending IngestionJob rows, return 202.
+
+    Content-hash deduplication (Phase 2.8.5) may resolve this to an existing document/job instead
+    of creating new ones — the response always reports the real, current document/job identities
+    either way, never a freshly generated id for a document that already existed. Public
+    status-code differentiation between "created" and "reused" is not implemented yet: every
+    successful call still returns 202 regardless of which happened.
+    """
     content = await file.read()
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
@@ -86,7 +93,7 @@ async def upload_document_route(
     original_filename = file.filename or "unnamed"
     content_type = file.content_type or "application/octet-stream"
 
-    document, job = await upload_document(
+    result = await upload_document(
         content=content,
         original_filename=original_filename,
         content_type=content_type,
@@ -94,7 +101,11 @@ async def upload_document_route(
         session=db,
     )
 
-    return DocumentUploadResponse(document_id=document.id, job_id=job.id, status=job.status)
+    return DocumentUploadResponse(
+        document_id=result.document.id,
+        job_id=result.ingestion_job.id,
+        status=result.ingestion_job.status,
+    )
 
 
 @router.get("/documents", response_model=DocumentListResponse)

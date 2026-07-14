@@ -1,10 +1,10 @@
 """Content-hash deduplication decision model for document upload (Phase 2.8.5).
 
-Internal only — nothing here is imported by `app/api/v1/routes/documents.py` yet, and no Pydantic
-schema exposes `UploadOutcome` or any of this module's exception types. `upload_service.py`'s
-actual upload flow is unchanged except for populating the newly computed hash on a new `Document`
-row; wiring this decision model into that flow (skipping storage/job creation on reuse, recovering
-from the content_hash unique-index race) is deliberately deferred to a later subtask.
+Internal only — no Pydantic schema exposes `UploadOutcome` or any of this module's exception
+types yet (that lands in a later subtask, alongside public status-code mapping).
+`upload_service.upload_document()` calls `decide_upload()` as its fast path before ever writing to
+storage, and `is_content_hash_violation()` to tell a genuine deduplication race apart from any
+other integrity failure after a commit fails — see that module for the full integration.
 
 ## Deletion precedence
 
@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
@@ -37,6 +38,8 @@ from app.models.document_deletion_job import DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
 from app.services.documents.deletion_service import get_latest_deletion_job
 from app.services.documents.query_service import get_latest_ingestion_job
+
+CONTENT_HASH_CONSTRAINT_NAME = "uq_documents_content_hash"
 
 
 def compute_content_hash(content: bytes) -> str:
@@ -102,6 +105,52 @@ class DeletionInvariantViolationError(Exception):
             f"Document {document_id} has a COMPLETED deletion but a non-null content_hash — "
             "the hash should have been released on deletion completion."
         )
+
+
+class MissingWinnerAfterRaceError(Exception):
+    """A content_hash unique-constraint conflict was raised, but no matching row could be reloaded.
+
+    Should be unreachable in practice — a committed conflicting INSERT means a winning row exists
+    — but if it is ever observed, this is a genuine data-consistency problem, never a cue to
+    silently create a second document with the same hash.
+    """
+
+    def __init__(self, content_hash: str) -> None:
+        self.content_hash = content_hash
+        super().__init__(
+            f"content_hash {content_hash!r} raised a unique-constraint conflict, but no "
+            "matching document could be reloaded afterward."
+        )
+
+
+def _diagnostic_constraint_name(exc: IntegrityError) -> str | None:
+    """Return the PostgreSQL diagnostic `constraint_name` for `exc`, if one is available.
+
+    SQLAlchemy's asyncpg dialect translates the raw driver exception into its own DBAPI-shaped
+    wrapper before exposing it as `exc.orig` — that wrapper copies over `sqlstate`/`pgcode` but
+    *not* `constraint_name`, and instead chains the original asyncpg exception (which does carry
+    `constraint_name`) as `exc.orig.__cause__` (`raise translated_error from error`). Checking
+    `exc.orig` directly first keeps this forward-compatible with a driver/dialect that stops
+    wrapping (or never did, e.g. a differently configured DBAPI in tests).
+    """
+    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
+        constraint_name = getattr(candidate, "constraint_name", None)
+        if constraint_name is not None:
+            return constraint_name
+    return None
+
+
+def is_content_hash_violation(exc: IntegrityError) -> bool:
+    """Return True only if `exc` was raised specifically by `uq_documents_content_hash`.
+
+    Inspects the underlying PostgreSQL diagnostic constraint name rather than matching on the
+    human-readable error message text, which is not a stable identifier across PostgreSQL
+    versions/locales. Deliberately does not import any driver-specific exception type — a missing
+    diagnostic returns `False`, so a `stored_filename` uniqueness failure, a foreign-key violation,
+    a NOT NULL violation, or any other unrelated integrity error is never misclassified as a
+    deduplication race.
+    """
+    return _diagnostic_constraint_name(exc) == CONTENT_HASH_CONSTRAINT_NAME
 
 
 @dataclass(frozen=True)
@@ -175,12 +224,15 @@ async def decide_upload(session: AsyncSession, content_hash: str) -> UploadDecis
 
 
 __all__ = [
+    "CONTENT_HASH_CONSTRAINT_NAME",
     "DeletionActiveError",
     "DeletionIncompleteError",
     "DeletionInvariantViolationError",
+    "MissingWinnerAfterRaceError",
     "UploadDecision",
     "UploadOutcome",
     "compute_content_hash",
     "decide_upload",
     "find_document_by_content_hash",
+    "is_content_hash_violation",
 ]

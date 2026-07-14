@@ -16,8 +16,26 @@ from app.storage.local_storage import LocalFileStorage
 client = TestClient(app)
 
 
+class _EmptyScalars:
+    """Stand-in for `Result.scalars()` that never matches anything — no document pre-exists."""
+
+    def first(self) -> None:
+        return None
+
+
+class _EmptyResult:
+    """Stand-in for a SQLAlchemy `Result` reporting no rows — used for the dedup fast-path SELECT."""
+
+    def scalars(self) -> _EmptyScalars:
+        return _EmptyScalars()
+
+
 class _FakeAsyncSession:
-    """Minimal AsyncSession stand-in: records added rows, no real DB behind it."""
+    """Minimal AsyncSession stand-in: records added rows, no real DB behind it.
+
+    `execute()` always reports "no match" — these tests never pre-seed a matching content_hash,
+    so every upload here takes the CREATED path, exactly as before content-hash deduplication.
+    """
 
     def __init__(self) -> None:
         self.added: list[object] = []
@@ -26,8 +44,14 @@ class _FakeAsyncSession:
     def add(self, instance: object) -> None:
         self.added.append(instance)
 
+    async def execute(self, stmt: object) -> _EmptyResult:
+        return _EmptyResult()
+
     async def commit(self) -> None:
         self.committed = True
+
+    async def rollback(self) -> None:
+        return None
 
 
 @pytest.fixture(autouse=True)

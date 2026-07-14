@@ -23,6 +23,15 @@ code path (there is no branch that reaches storage deletion without first observ
 matters because searchable derived content (vectors) must stop being searchable before the
 document is ever reported as deleted; the original object can safely be cleaned up afterward
 (and retried independently) since it plays no role in retrieval.
+
+## Content-hash release (Phase 2.8.5)
+
+Only the `COMPLETED` transition — the same commit that sets `job.status = COMPLETED` — also sets
+`document.content_hash = None`, releasing this document's content identity so a later upload of
+the same bytes may claim it again (see `app.services.documents.dedup_service`). Every other
+outcome (`PENDING`, `PROCESSING`, any `PARTIALLY_FAILED` branch, a crash before this point) leaves
+`content_hash` untouched — a document whose deletion did not genuinely finish must never look
+available for reuse.
 """
 
 from datetime import UTC, datetime
@@ -120,6 +129,10 @@ class DocumentDeletionWorker:
         job.completed_at = datetime.now(UTC)
         job.error_code = None
         job.error_message = None
+        # Release this document's content identity in the same commit as COMPLETED (Phase
+        # 2.8.5) — never on PENDING/PROCESSING/PARTIALLY_FAILED — so a later upload of the same
+        # bytes may claim the hash only once deletion has genuinely, fully finished.
+        document.content_hash = None
         await session.commit()
         return job
 

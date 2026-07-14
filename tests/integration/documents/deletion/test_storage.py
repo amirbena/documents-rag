@@ -31,8 +31,8 @@ class _NoopVectorStore:
         return None
 
 
-def _document(storage_key: str) -> Document:
-    return Document(
+def _document(storage_key: str, **overrides: object) -> Document:
+    fields: dict[str, object] = dict(
         id=str(uuid.uuid4()),
         original_filename="a.txt",
         stored_filename=f"{uuid.uuid4().hex}.txt",
@@ -42,6 +42,8 @@ def _document(storage_key: str) -> Document:
         storage_provider="local",
         storage_key=storage_key,
     )
+    fields.update(overrides)
+    return Document(**fields)  # type: ignore[arg-type]
 
 
 def _deletion_job(document_id: str) -> DocumentDeletionJob:
@@ -191,7 +193,7 @@ async def test_worker_minio_unreachable_marks_partially_failed_not_completed(
     )
     storage = MinioFileStorage(settings=settings)
 
-    document = _document("documents/a/unreachable.txt")
+    document = _document("documents/a/unreachable.txt", content_hash="a" * 64)
     integration_db_session.add(document)
     job = _deletion_job(document.id)
     integration_db_session.add(job)
@@ -205,3 +207,64 @@ async def test_worker_minio_unreachable_marks_partially_failed_not_completed(
     assert result.vector_cleanup_completed is True
     assert result.storage_cleanup_completed is False
     assert result.error_code == DeletionErrorCode.DOCUMENT_STORAGE_CLEANUP_FAILED
+    # A storage-cleanup failure (PARTIALLY_FAILED, not COMPLETED) must never release the hash.
+    assert document.content_hash == "a" * 64
+
+
+async def test_worker_completed_deletion_clears_content_hash(
+    migrated_schema: None, integration_db_session, tmp_path: Path
+) -> None:
+    """The COMPLETED transition must release content_hash back to NULL, against real Postgres."""
+    storage = LocalFileStorage(root=tmp_path)
+    key = "documents/a/notes.txt"
+    await storage.save(key, b"hello world")
+
+    document = _document(key, content_hash="b" * 64)
+    integration_db_session.add(document)
+    job = _deletion_job(document.id)
+    integration_db_session.add(job)
+    await integration_db_session.commit()
+
+    worker = DocumentDeletionWorker(vector_store=_NoopVectorStore(), file_storage=storage)
+    result = await worker.process_next_job(integration_db_session)
+
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.COMPLETED
+    assert document.content_hash is None
+
+    stored_value = await integration_db_session.execute(
+        text("SELECT content_hash FROM documents WHERE id = :id"), {"id": document.id}
+    )
+    assert stored_value.scalar_one() is None
+
+
+async def test_completed_deletion_allows_a_later_document_to_claim_the_same_hash(
+    migrated_schema: None, integration_db_session, tmp_path: Path
+) -> None:
+    """Once a document's deletion COMPLETEs and releases its hash, a genuinely new Document may
+    claim that same content_hash without violating uq_documents_content_hash.
+    """
+    storage = LocalFileStorage(root=tmp_path)
+    key = "documents/a/notes.txt"
+    await storage.save(key, b"hello world")
+    shared_hash = "c" * 64
+
+    document = _document(key, content_hash=shared_hash)
+    integration_db_session.add(document)
+    job = _deletion_job(document.id)
+    integration_db_session.add(job)
+    await integration_db_session.commit()
+
+    worker = DocumentDeletionWorker(vector_store=_NoopVectorStore(), file_storage=storage)
+    result = await worker.process_next_job(integration_db_session)
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.COMPLETED
+
+    later_document = _document("documents/b/notes-again.txt", content_hash=shared_hash)
+    integration_db_session.add(later_document)
+    await integration_db_session.commit()  # must not raise IntegrityError
+
+    hash_count = await integration_db_session.execute(
+        text("SELECT count(*) FROM documents WHERE content_hash = :hash"), {"hash": shared_hash}
+    )
+    assert hash_count.scalar_one() == 1

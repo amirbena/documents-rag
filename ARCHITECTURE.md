@@ -1092,14 +1092,27 @@ identity added by Phase 2.6/2.7 (`storage_provider`/`storage_bucket`/`storage_ke
 columns.py` — see "Storage Abstraction" above and "Backward compatibility for pre-migration
 documents" below.
 
-**Content-hash persistence (Phase 2.8.5, schema-only foundation).** `Document.content_hash`
-(nullable `VARCHAR(64)`, migration `alembic/versions/4a4f5c0674f4_add_document_content_hash_
-column.py`) will eventually hold a lowercase hex SHA-256 digest of a document's uploaded bytes,
-enforced unique when non-null via the named index `uq_documents_content_hash` — a normal
-(non-partial) unique index is sufficient since PostgreSQL never treats two `NULL`s as equal.
-**Not yet populated by the upload flow** — no hash is calculated, no duplicate lookup happens,
-and no existing row is backfilled. This is deliberately schema-only; the deduplication behavior
-itself is a separate, later phase.
+**Content-hash deduplication (Phase 2.8.5).** `Document.content_hash` (nullable `VARCHAR(64)`,
+migration `alembic/versions/4a4f5c0674f4_add_document_content_hash_column.py`) holds a lowercase
+hex SHA-256 digest of a document's uploaded bytes, enforced unique when non-null via the named
+index `uq_documents_content_hash` — a normal (non-partial) unique index is sufficient since
+PostgreSQL never treats two `NULL`s as equal. `app.services.documents.upload_service
+.upload_document()` computes this hash and calls `app.services.documents.dedup_service
+.decide_upload()` as a fast path before ever writing to storage: a matching document with no
+blocking deletion state is reused (no new object, no new `Document`, no new `IngestionJob`); a
+matching document with an active/incomplete deletion raises a typed internal exception instead of
+being treated as reusable. The database unique index — never the fast-path lookup — is what
+actually guarantees exactly one logical document survives two genuinely concurrent identical
+uploads: the losing commit's `IntegrityError` is inspected via the PostgreSQL diagnostic
+`constraint_name` (never message-text matching) to confirm it is specifically
+`uq_documents_content_hash` before being treated as a race, its own just-written object is
+best-effort deleted, and the winning row is reloaded and re-evaluated through the same lifecycle
+decision. `app.services.documents.deletion_worker.DocumentDeletionWorker` releases a document's
+hash (`content_hash = NULL`) only in the same commit as its deletion job reaching `COMPLETED` —
+never on `PENDING`/`PROCESSING`/`PARTIALLY_FAILED` — so a later upload of the same bytes may claim
+it again only once deletion has genuinely, fully finished. No existing row is backfilled, and the
+public API does not yet expose the outcome of this decision (status codes/response fields are a
+later phase).
 
 PostgreSQL remains the source-of-truth for document lifecycle/metadata, storage identity, and
 active versions; `FileStorage` (local disk or MinIO, per `FILE_STORAGE_PROVIDER`) holds the

@@ -178,6 +178,103 @@ async def test_worker_already_missing_storage_object_is_idempotent_success() -> 
     assert result.status == DocumentDeletionStatus.COMPLETED
 
 
+async def test_worker_completed_deletion_clears_content_hash() -> None:
+    """The COMPLETED transition must release the document's content_hash (Phase 2.8.5), in the
+    same commit — never left set once deletion genuinely, fully finishes.
+    """
+    session = FakeDocumentDeletionSession()
+    document = build_document(collection_name="documents__ollama__m__ev1__cv1__d768", content_hash="a" * 64)
+    session.documents[document.id] = document
+    job = build_deletion_job(document.id, DocumentDeletionStatus.PENDING)
+    session.deletion_jobs[job.id] = job
+
+    worker = DocumentDeletionWorker(vector_store=_FakeVectorStore(), file_storage=_FakeFileStorage())
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.COMPLETED
+    assert document.content_hash is None
+
+
+async def test_worker_partial_vector_failure_preserves_content_hash() -> None:
+    """A PARTIALLY_FAILED deletion (vector cleanup failure) must never release the content hash —
+    the old lifecycle still owns unresolved external resources.
+    """
+    session = FakeDocumentDeletionSession()
+    document = build_document(collection_name="broken_collection", content_hash="b" * 64)
+    session.documents[document.id] = document
+    job = build_deletion_job(document.id, DocumentDeletionStatus.PENDING)
+    session.deletion_jobs[job.id] = job
+
+    vector_store = _FakeVectorStore(fail_delete_for={"broken_collection"})
+    worker = DocumentDeletionWorker(vector_store=vector_store, file_storage=_FakeFileStorage())
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.PARTIALLY_FAILED
+    assert document.content_hash == "b" * 64
+
+
+async def test_worker_storage_failure_preserves_content_hash() -> None:
+    """A PARTIALLY_FAILED deletion (storage cleanup failure, after vector cleanup succeeded) must
+    also never release the content hash.
+    """
+    session = FakeDocumentDeletionSession()
+    document = build_document(collection_name="ok_collection", content_hash="c" * 64)
+    session.documents[document.id] = document
+    job = build_deletion_job(document.id, DocumentDeletionStatus.PENDING)
+    session.deletion_jobs[job.id] = job
+
+    file_storage = _FakeFileStorage(raise_on_delete=StorageUnavailableError("storage down"))
+    worker = DocumentDeletionWorker(vector_store=_FakeVectorStore(), file_storage=file_storage)
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.PARTIALLY_FAILED
+    assert document.content_hash == "c" * 64
+
+
+async def test_worker_reprocessing_after_completion_is_safe_and_hash_stays_released() -> None:
+    """A second process_next_job() call after completion must find no more pending work and must
+    never re-touch the already-released content_hash.
+    """
+    session = FakeDocumentDeletionSession()
+    document = build_document(collection_name="documents__ollama__m__ev1__cv1__d768", content_hash="d" * 64)
+    session.documents[document.id] = document
+    job = build_deletion_job(document.id, DocumentDeletionStatus.PENDING)
+    session.deletion_jobs[job.id] = job
+
+    worker = DocumentDeletionWorker(vector_store=_FakeVectorStore(), file_storage=_FakeFileStorage())
+    first = await worker.process_next_job(session)
+    assert first is not None
+    assert first.status == DocumentDeletionStatus.COMPLETED
+    assert document.content_hash is None
+
+    second = await worker.process_next_job(session)
+
+    assert second is None
+    assert document.content_hash is None
+
+
+async def test_worker_clearing_one_document_hash_does_not_touch_unrelated_documents() -> None:
+    """Completing one document's deletion must never affect another, unrelated document's hash."""
+    session = FakeDocumentDeletionSession()
+    target = build_document(collection_name="documents__ollama__m__ev1__cv1__d768", content_hash="e" * 64)
+    unrelated = build_document(content_hash="f" * 64)
+    session.documents[target.id] = target
+    session.documents[unrelated.id] = unrelated
+    job = build_deletion_job(target.id, DocumentDeletionStatus.PENDING)
+    session.deletion_jobs[job.id] = job
+
+    worker = DocumentDeletionWorker(vector_store=_FakeVectorStore(), file_storage=_FakeFileStorage())
+    result = await worker.process_next_job(session)
+
+    assert result is not None
+    assert result.status == DocumentDeletionStatus.COMPLETED
+    assert target.content_hash is None
+    assert unrelated.content_hash == "f" * 64
+
+
 async def test_worker_claims_oldest_pending_job_first() -> None:
     session = FakeDocumentDeletionSession()
     doc_a = build_document()
