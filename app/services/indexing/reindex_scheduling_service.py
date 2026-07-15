@@ -142,6 +142,24 @@ async def get_active_reindex_job(session: AsyncSession, document_id: str) -> Rei
     return result.scalars().first()
 
 
+async def get_completed_reindex_target_collections(session: AsyncSession, document_id: str) -> list[str]:
+    """Return every distinct `target_collection_name` from a COMPLETED ReindexJob for `document_id`.
+
+    Used by `app.services.indexing.vector_deletion_service.delete_all_tracked_document_vectors()`
+    (Phase 2.8.6, subtask 3): a COMPLETED job is durable proof that a full target vector set may
+    already exist in its target collection, even while `Document.collection_name` still points at
+    the serving collection (build-ahead, not yet activated). `PENDING`/`PROCESSING`/`FAILED` jobs
+    are deliberately excluded — none of them durably prove a complete vector set exists. Selects
+    only the `target_collection_name` column, never full `ReindexJob` rows, since nothing else
+    about a completed job is needed for this resolution step.
+    """
+    stmt = select(ReindexJob.target_collection_name).where(
+        ReindexJob.document_id == document_id, ReindexJob.status == ReindexJobStatus.COMPLETED
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def _latest_ingestion_job(session: AsyncSession, document_id: str) -> IngestionJob | None:
     """Return `document_id`'s most recent IngestionJob — duplicated locally, see module docstring."""
     stmt = (
@@ -273,6 +291,7 @@ __all__ = [
     "ReindexSchedulingOutcome",
     "ReindexSchedulingResult",
     "get_active_reindex_job",
+    "get_completed_reindex_target_collections",
     "get_latest_reindex_job",
     "is_active_reindex_job_violation",
     "schedule_reindex",

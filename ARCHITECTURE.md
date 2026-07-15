@@ -1286,29 +1286,36 @@ directly instead.
 **Two separate vector-deletion operations, deliberately not one.**
 `delete_current_document_vectors(document, vector_store)` targets only the document's
 currently-tracked collection (`document.collection_name`) — it never consults
-`VectorCleanupJob` (no `session` parameter at all), so it is explicitly a *partial* operation,
-valid only for call sites that provably have no historical cleanup to check (e.g. a document
-never re-indexed) or that intentionally want the narrower scope (rollback, current-index
-repair). `delete_all_tracked_document_vectors(document, vector_store, session)` is the *full*
-operation — `session` is mandatory, since a full deletion requires a PostgreSQL lookup of every
-`VectorCleanupJob` still `pending`/`failed` for the document; those rows are the sole source of
-truth for which historical collections might still hold vectors. It attempts the document's
-active collection plus every distinct historical collection from those jobs (deduplicated,
-preserving first-seen order), and — critically — attempts *every* resolved collection
-independently: one collection's delete failing never stops, skips, or aborts attempts against
-the others, and never falls back to active-only semantics. It returns a typed
-`VectorDeletionResult` (`document_id`, `attempted_collections`, and one
-`CollectionVectorDeletionResult` per collection with `succeeded`/`error`, plus a
-`fully_deleted` convenience property) rather than a bare `None`/`bool`, precisely because a
-partial cleanup must never be reported — or silently treated by a caller — as a complete
-document deletion. Calling it again after a partial failure safely retries every tracked
-collection, not just the ones that failed previously (deletes are idempotent against Qdrant).
-Any user-facing or lifecycle-level document deletion must call
-`delete_all_tracked_document_vectors()` — no such endpoint exists yet in this phase. This
-function does not mutate `VectorCleanupJob` bookkeeping, does not delete the `Document` row,
-object-storage file, or ingestion job — those remain separate, deliberate operations for a
-future document-deletion endpoint. Completed cleanup jobs are retained (audit trail), never
-auto-deleted.
+`VectorCleanupJob` or `ReindexJob` (no `session` parameter at all), so it is explicitly a
+*partial* operation, valid only for call sites that provably have no historical cleanup to check
+(e.g. a document never re-indexed) or that intentionally want the narrower scope (rollback,
+current-index repair). `delete_all_tracked_document_vectors(document, vector_store, session)` is
+the *full* operation — `session` is mandatory, since a full deletion requires a PostgreSQL lookup
+of every collection the document's vectors could still exist in. Its tracked-collection set is
+resolved from **three** sources: (1) `document.collection_name`, when non-null; (2) every distinct
+historical collection from a `pending`/`failed` `VectorCleanupJob` for the document (see
+`get_pending_cleanup_jobs()`); (3) every distinct `target_collection_name` from a **COMPLETED**
+`ReindexJob` for the document (see `get_completed_reindex_target_collections()`, Phase 2.8.6,
+subtask 3) — durable proof that a build-ahead re-index target may already hold a full vector set
+even though `Document.collection_name` still points at the serving collection, not yet activated.
+`PENDING`/`PROCESSING`/`FAILED` re-index jobs never contribute a target collection: `PENDING` has
+built nothing yet, `PROCESSING` may still be writing (and is already prevented from racing
+deletion by the scheduling interlock — see "Re-index job scheduling" above), and `FAILED` is not
+durable proof a complete vector set exists. All three sources are merged with deterministic
+deduplication (a collection seen from more than one source is attempted exactly once), and —
+critically — every resolved collection is attempted independently: one collection's delete
+failing never stops, skips, or aborts attempts against the others, and never falls back to
+active-only semantics. It returns a typed `VectorDeletionResult` (`document_id`,
+`attempted_collections`, and one `CollectionVectorDeletionResult` per collection with
+`succeeded`/`error`, plus a `fully_deleted` convenience property) rather than a bare `None`/`bool`,
+precisely because a partial cleanup must never be reported — or silently treated by a caller — as
+a complete document deletion. Calling it again after a partial failure safely retries every
+tracked collection, not just the ones that failed previously (deletes are idempotent against
+Qdrant). Any user-facing or lifecycle-level document deletion must call
+`delete_all_tracked_document_vectors()` — `deletion_worker.py`'s full document deletion already
+does. This function does not mutate `VectorCleanupJob`/`ReindexJob` bookkeeping, does not delete
+the `Document` row, object-storage file, or ingestion job — those remain separate, deliberate
+operations. Completed cleanup jobs are retained (audit trail), never auto-deleted.
 
 `app/services/indexing/collection_registry.py` additionally provides `get_stale_documents()` (list every
 document whose `collection_name` isn't the active one) and `retire_collection()`
