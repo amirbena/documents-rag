@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob
 from app.models.ingestion_job import IngestionJob
+from app.models.reindex_job import ReindexJob
 from app.models.vector_cleanup_job import VectorCleanupJob, VectorCleanupStatus
 
 
@@ -61,6 +62,7 @@ class FakeDocumentDeletionSession:
         self.ingestion_jobs: dict[str, IngestionJob] = {}
         self.deletion_jobs: dict[str, DocumentDeletionJob] = {}
         self.cleanup_jobs: dict[str, VectorCleanupJob] = {}
+        self.reindex_jobs: dict[str, ReindexJob] = {}
         self._pending_new: list[Any] = []
         self.commit_count = 0
         self.rollback_count = 0
@@ -77,6 +79,8 @@ class FakeDocumentDeletionSession:
             self.ingestion_jobs[instance.id] = instance
         elif isinstance(instance, VectorCleanupJob):
             self.cleanup_jobs[instance.id] = instance
+        elif isinstance(instance, ReindexJob):
+            self.reindex_jobs[instance.id] = instance
 
     async def get(self, model: type, instance_id: str) -> object | None:
         if model is Document:
@@ -117,6 +121,21 @@ class FakeDocumentDeletionSession:
             eq_match = re.search(r"ingestion_jobs\.document_id = '([^']*)'", compiled)
             if eq_match:
                 jobs = [job for job in jobs if job.document_id == eq_match.group(1)]
+            jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
+            limit_match = re.search(r"LIMIT (\d+)", compiled)
+            if limit_match:
+                jobs = jobs[: int(limit_match.group(1))]
+            return _ListResult(jobs)
+
+        if "reindex_jobs" in compiled:
+            jobs = list(self.reindex_jobs.values())
+            eq_match = re.search(r"reindex_jobs\.document_id = '([^']*)'", compiled)
+            if eq_match:
+                jobs = [job for job in jobs if job.document_id == eq_match.group(1)]
+            in_match = re.search(r"reindex_jobs\.status IN \(([^)]*)\)", compiled)
+            if in_match:
+                statuses = {token.strip().strip("'") for token in in_match.group(1).split(",")}
+                jobs = [job for job in jobs if job.status.value in statuses]
             jobs.sort(key=lambda job: (job.created_at, job.id), reverse=True)
             limit_match = re.search(r"LIMIT (\d+)", compiled)
             if limit_match:

@@ -11,6 +11,7 @@ from datetime import timedelta
 
 from app.models.document_deletion_job import DocumentDeletionStatus
 from app.models.ingestion_job import IngestionStatus
+from app.models.reindex_job import ReindexJobStatus
 from app.services.documents.deletion_service import (
     DeletionErrorCode,
     DeletionRequestOutcome,
@@ -22,6 +23,7 @@ from tests.support.documents.deletion.builders import (
     build_deletion_job,
     build_document,
     build_ingestion_job,
+    build_reindex_job,
 )
 from tests.support.documents.deletion.fake_session import FakeDocumentDeletionSession
 
@@ -199,6 +201,60 @@ async def test_request_deletion_concurrent_insert_race_returns_existing_active_j
     assert result.job is not None
     assert result.job.id == winning_job.id
     assert session.rollback_count == 1
+
+
+# --- active-reindex interlock (Phase 2.8.6) -----------------------------------------------------
+
+
+async def test_request_deletion_active_reindex_pending_blocks_with_409() -> None:
+    session = FakeDocumentDeletionSession()
+    document = build_document()
+    session.documents[document.id] = document
+    active = build_reindex_job(document.id, ReindexJobStatus.PENDING)
+    session.reindex_jobs[active.id] = active
+
+    result = await request_document_deletion(session, document.id)
+
+    assert result.outcome == DeletionRequestOutcome.REINDEX_ACTIVE
+    assert result.job is None
+    assert session.commit_count == 0
+
+
+async def test_request_deletion_active_reindex_processing_also_blocks() -> None:
+    session = FakeDocumentDeletionSession()
+    document = build_document()
+    session.documents[document.id] = document
+    active = build_reindex_job(document.id, ReindexJobStatus.PROCESSING)
+    session.reindex_jobs[active.id] = active
+
+    result = await request_document_deletion(session, document.id)
+
+    assert result.outcome == DeletionRequestOutcome.REINDEX_ACTIVE
+    assert result.job is None
+    assert session.commit_count == 0
+    assert len(session.deletion_jobs) == 0
+
+
+async def test_request_deletion_failed_reindex_does_not_block() -> None:
+    session = FakeDocumentDeletionSession()
+    document = build_document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = build_reindex_job(document.id, ReindexJobStatus.FAILED)
+
+    result = await request_document_deletion(session, document.id)
+
+    assert result.outcome == DeletionRequestOutcome.CREATED
+
+
+async def test_request_deletion_completed_reindex_does_not_block() -> None:
+    session = FakeDocumentDeletionSession()
+    document = build_document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = build_reindex_job(document.id, ReindexJobStatus.COMPLETED)
+
+    result = await request_document_deletion(session, document.id)
+
+    assert result.outcome == DeletionRequestOutcome.CREATED
 
 
 # --- sanitize_deletion_error() ------------------------------------------------------------------

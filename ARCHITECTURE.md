@@ -1210,6 +1210,48 @@ Neither primitive is wired into a worker, script, or public API yet — that is 
 scope for this subtask; only later Phase 2.8.6 subtasks add scheduling, concurrency guarantees, and
 exposure.
 
+### Re-index job scheduling (`app/services/indexing/reindex_scheduling_service.py`)
+
+`ReindexJob` (`app/models/reindex_job.py`; migration `a8685da857f3`) is the durable, append-only
+record of one re-index build attempt — mirroring `IngestionJob`/`DocumentDeletionJob`'s lifecycle
+style exactly: a `FAILED` row is never reset or reused, retrying always inserts a brand-new
+`PENDING` row, and at most one `PENDING`/`PROCESSING` ("active") row may exist per document at a
+time, enforced by the partial unique index `ix_reindex_jobs_one_active_per_document` — the database,
+not application logic alone. `target_collection_name` is a mandatory foreign key into
+`IndexCollection` (never a duplicated copy of the target's provider/model/dimension/version
+identity); `target_chunk_size`/`target_chunk_overlap` are mandatory, pinned numeric values —
+`EmbeddingIndexConfig` only carries the `chunking_version` label, never these numbers, so a job's
+build snapshot would be irreproducible without persisting them explicitly on every row.
+
+`schedule_reindex(session, document, vector_store, target_config, *, target_chunk_size,
+target_chunk_overlap)` decides whether a build may be scheduled, in this order: a document with
+`collection_name IS NULL` (never successfully indexed) is `INELIGIBLE_NEVER_INDEXED` — re-indexing
+is never a second initial-ingestion recovery mechanism, that stays exclusively
+`retry_service.py`'s concern; already matching the target is `ALREADY_CURRENT`; an existing active
+`ReindexJob` is `ALREADY_ACTIVE` (the existing job is returned, never duplicated); an active
+(`PENDING`/`PROCESSING`) `IngestionJob` is `INGESTION_ACTIVE`; the latest `DocumentDeletionJob`
+being `PENDING`/`PROCESSING`/`PARTIALLY_FAILED`/`COMPLETED` is `DELETION_ACTIVE`/
+`DELETION_INCOMPLETE`/`DOCUMENT_DELETED` respectively; otherwise `ensure_active_collection()`
+persists the target `IndexCollection` row and one `PENDING` `ReindexJob` is inserted and committed
+-> `CREATED`. This subtask schedules only — no build, activation, Qdrant write, or object-storage
+read happens here.
+
+Two sessions may both pass the active-job check before either commits; the partial unique index is
+the actual guarantee. The losing insert's `IntegrityError` is classified via the PostgreSQL
+diagnostic `constraint_name` (never message-text matching, mirroring
+`dedup_service.is_content_hash_violation()`'s exact approach) to confirm it is specifically
+`ix_reindex_jobs_one_active_per_document`; any other integrity error is re-raised unchanged. On a
+confirmed race, the loser rolls back and reloads the winning job, returning `ALREADY_ACTIVE` — or
+raises `MissingActiveReindexJobAfterRaceError` in the should-be-unreachable case where no winner
+can be reloaded.
+
+**Active re-index blocks document deletion.** `deletion_service.request_document_deletion()`
+rejects with `REINDEX_ACTIVE` (`409`) while an active `ReindexJob` exists for the document,
+symmetric with its existing `INGESTION_ACTIVE` check — deletion must never race an in-flight
+re-index build. Full-deletion tracking of a completed-but-not-yet-activated target build (so
+`delete_all_tracked_document_vectors()` can prove and clean both the serving and target collections
+for a document deleted mid-build) is explicitly deferred to a later subtask, not implemented here.
+
 ### Zero-chunk behavior
 
 A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still a
