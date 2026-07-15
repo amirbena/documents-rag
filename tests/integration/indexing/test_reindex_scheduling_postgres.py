@@ -59,25 +59,6 @@ async def _clean_tables(migrated_schema: None, postgres_url: str) -> AsyncIterat
         await engine.dispose()
 
 
-async def _seed_document(session: AsyncSession, **overrides: object) -> Document:
-    fields: dict[str, object] = dict(
-        id=str(uuid.uuid4()),
-        original_filename="report.pdf",
-        stored_filename=f"{uuid.uuid4().hex}.pdf",
-        content_type="application/pdf",
-        file_size=10,
-        stored_path="storage/documents/report.pdf",
-        storage_provider="local",
-        storage_key=f"storage/documents/{uuid.uuid4().hex}.pdf",
-        collection_name="documents__ollama__old-model__ev0__cv0__d768",
-    )
-    fields.update(overrides)
-    document = Document(**fields)  # type: ignore[arg-type]
-    session.add(document)
-    await session.commit()
-    return document
-
-
 def _target_config(**overrides: object) -> EmbeddingIndexConfig:
     fields: dict[str, object] = dict(
         collection_prefix="documents",
@@ -91,7 +72,17 @@ def _target_config(**overrides: object) -> EmbeddingIndexConfig:
     return EmbeddingIndexConfig(**fields)  # type: ignore[arg-type]
 
 
+# The "old"/currently-serving config every seeded document defaults to `collection_name` under.
+# `Document.collection_name` carries a foreign key into `index_collections` (migration
+# 07f849bf2b95) — a document can never reference a collection that isn't itself persisted there.
+_OLD_CONFIG = _target_config(model="old-model", embedding_version="v0", chunking_version="v0")
+
+
 async def _seed_index_collection(session: AsyncSession, config: EmbeddingIndexConfig) -> IndexCollection:
+    existing = await session.get(IndexCollection, config.collection_name)
+    if existing is not None:
+        return existing
+
     record = IndexCollection(
         collection_name=config.collection_name,
         embedding_provider=config.provider,
@@ -104,6 +95,27 @@ async def _seed_index_collection(session: AsyncSession, config: EmbeddingIndexCo
     session.add(record)
     await session.commit()
     return record
+
+
+async def _seed_document(session: AsyncSession, **overrides: object) -> Document:
+    await _seed_index_collection(session, _OLD_CONFIG)
+
+    fields: dict[str, object] = dict(
+        id=str(uuid.uuid4()),
+        original_filename="report.pdf",
+        stored_filename=f"{uuid.uuid4().hex}.pdf",
+        content_type="application/pdf",
+        file_size=10,
+        stored_path="storage/documents/report.pdf",
+        storage_provider="local",
+        storage_key=f"storage/documents/{uuid.uuid4().hex}.pdf",
+        collection_name=_OLD_CONFIG.collection_name,
+    )
+    fields.update(overrides)
+    document = Document(**fields)  # type: ignore[arg-type]
+    session.add(document)
+    await session.commit()
+    return document
 
 
 # --- migration ------------------------------------------------------------------------------

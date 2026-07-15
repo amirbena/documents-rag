@@ -213,21 +213,27 @@ async def schedule_reindex(
     `MissingActiveReindexJobAfterRaceError` in the (should-be-unreachable) case where no winner can
     be reloaded.
     """
+    # Captured once, up front: a rollback later in this function (the race-recovery path) expires
+    # every object in the session, including `document` — any attribute access on it afterward
+    # would trigger an unsafe synchronous lazy-load under an AsyncSession. Every subsequent lookup
+    # in this function uses this plain string, never `document.id` again.
+    document_id = document.id
+
     if document.collection_name is None:
         return _result(ReindexSchedulingOutcome.INELIGIBLE_NEVER_INDEXED, document, target_config)
 
     if document.collection_name == target_config.collection_name:
         return _result(ReindexSchedulingOutcome.ALREADY_CURRENT, document, target_config)
 
-    active_reindex = await get_active_reindex_job(session, document.id)
+    active_reindex = await get_active_reindex_job(session, document_id)
     if active_reindex is not None:
         return _result(ReindexSchedulingOutcome.ALREADY_ACTIVE, document, target_config, active_reindex)
 
-    latest_ingestion = await _latest_ingestion_job(session, document.id)
+    latest_ingestion = await _latest_ingestion_job(session, document_id)
     if latest_ingestion is not None and latest_ingestion.status in _ACTIVE_INGESTION_STATUSES:
         return _result(ReindexSchedulingOutcome.INGESTION_ACTIVE, document, target_config)
 
-    latest_deletion = await _latest_deletion_job(session, document.id)
+    latest_deletion = await _latest_deletion_job(session, document_id)
     if latest_deletion is not None:
         if latest_deletion.status in _ACTIVE_DELETION_STATUSES:
             return _result(ReindexSchedulingOutcome.DELETION_ACTIVE, document, target_config)
@@ -240,7 +246,7 @@ async def schedule_reindex(
 
     job = ReindexJob(
         id=str(uuid.uuid4()),
-        document_id=document.id,
+        document_id=document_id,
         target_collection_name=target_config.collection_name,
         target_chunk_size=target_chunk_size,
         target_chunk_overlap=target_chunk_overlap,
@@ -254,9 +260,9 @@ async def schedule_reindex(
         if not is_active_reindex_job_violation(exc):
             raise
 
-        winner = await get_active_reindex_job(session, document.id)
+        winner = await get_active_reindex_job(session, document_id)
         if winner is None:
-            raise MissingActiveReindexJobAfterRaceError(document.id) from exc
+            raise MissingActiveReindexJobAfterRaceError(document_id) from exc
         return _result(ReindexSchedulingOutcome.ALREADY_ACTIVE, document, target_config, winner)
 
     return _result(ReindexSchedulingOutcome.CREATED, document, target_config, job)
