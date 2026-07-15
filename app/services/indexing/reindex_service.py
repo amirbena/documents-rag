@@ -1,128 +1,235 @@
-"""Backend re-index capability: re-derives a Document's vectors from its already-persisted
-stored file, using the platform's *current* active EmbeddingIndexConfig — no new upload required.
+"""Backend re-index primitives: build a replacement index for a document under an explicit
+target configuration, and — as a separate operation — activate it (Phase 2.8.6, subtask 1).
 
-Document -> re-load stored file -> re-extract -> re-chunk (active chunking config) -> re-embed
-(active embedding config) -> validate real vector dimensions -> upsert into the active versioned
-collection -> persist new indexing metadata -> attempt to retire the document's vectors in its
-previous collection, if any and if different.
+Two deliberately distinct operations, never combined into one function:
 
-Idempotent: point IDs are derived identically to the initial-ingest path (see
-app.services.ingestion.worker.to_vector_point), so re-running against the same active collection
-overwrites the same points rather than duplicating them.
+`build_reindex_target()` re-derives a Document's vectors from its already-persisted stored file —
+no new upload required — and writes them into the *target* collection identified by an explicit,
+caller-supplied `EmbeddingIndexConfig`. It never touches the document's current serving state:
+`Document.collection_name`/`embedding_*`/`chunking_version`/`indexed_at` are left exactly as they
+are, and nothing about the document's *previous* (currently-serving) collection is read, deleted,
+or scheduled for deletion. A successful build proves only "target B was built successfully" — it
+does not mean "target B is active." This is what makes build-ahead migration safe: the running
+process keeps serving whatever `Document.collection_name` already says, untouched, for as long as
+the operator wants, regardless of how many documents have already been built toward a new target.
 
-Transaction/failure semantics — read carefully, this is intentionally NOT one atomic transaction
-across Qdrant and PostgreSQL, and the two systems can observe different outcomes for the same
-attempt:
+`activate_reindexed_document()` is the separate, later operation that actually switches a
+document's serving identity to a target configuration — updating `Document.collection_name`/
+`embedding_*`/`chunking_version`/`indexed_at` and, in the same commit, persisting a
+`VectorCleanupJob` for whatever collection the document is leaving behind. It never deletes Qdrant
+vectors itself; actual old-vector removal is left entirely to the existing, independently-retryable
+`cleanup_job_service.retry_cleanup_job()` path. Nothing in this module wires either primitive into
+a worker, script, or API yet — that is deliberately out of scope for this subtask.
 
-- Extraction/chunking/embedding/validation/collection/upsert failure (before the Postgres commit
-  below): the exception propagates, no Document indexing metadata is ever mutated-and-committed,
-  and no previously-valid vectors are touched. `is_document_stale()` still reports the document as
-  stale afterward.
-- The Qdrant upsert can succeed and the following Postgres commit can still fail (e.g. a
-  connection drop). In that case: the new points already exist in Qdrant (deterministic point IDs
-  make this retry-safe — the next successful re-index attempt overwrites the same points rather
-  than duplicating them), but the Document row is rolled back and re-`expire()`d so no in-memory
-  attribute change survives the failed commit — the document remains exactly as stale as before.
-  This attempt is *not* indistinguishable from one that never ran (Qdrant now holds orphaned
-  points until a retry succeeds or a future cleanup pass removes them) — do not describe it that
-  way in documentation.
-- After the new collection/Document-metadata commit succeeds, deleting the immediately-previous
-  collection's vectors is attempted separately. Failure there does not undo or reclassify the
-  re-index itself (the document IS current) — it is tracked as a pending VectorCleanupJob (see
-  app/services/indexing/cleanup_job_service.py) and reported via
-  ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING, retryable later via `retry_cleanup_job()` even
-  once the document is no longer stale.
+Both primitives resolve their embedding provider/model/chunking config from an explicit,
+caller-pinned target — never from whatever the live process's `Settings` currently say — via
+`build_settings_for_target()`, so a build can never silently generate embeddings under one model
+while writing them into a collection whose identity claims another.
 """
 
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.models.document import Document
-from app.rag.embedding_config import get_active_embedding_config
+from app.models.vector_cleanup_job import VectorCleanupJob, VectorCleanupStatus
+from app.rag.embedding_config import EmbeddingIndexConfig, get_active_embedding_config
 from app.rag.embedding_validation import validate_embeddings
 from app.rag.providers.provider_factory import get_embedding_provider, get_vector_store
 from app.services.documents.chunker import DocumentChunker
 from app.services.documents.text_extractor import DocumentTextExtractor
-from app.services.indexing.cleanup_job_service import create_cleanup_job
-from app.services.indexing.collection_registry import (
-    ensure_active_collection,
-    is_document_stale,
-    mark_document_indexed,
-)
+from app.services.indexing.collection_registry import ensure_active_collection, mark_document_indexed
 from app.services.ingestion.worker import to_vector_point
 from app.storage.contract import FileStorage
-from app.storage.factory import create_file_storage
 
 
-class ReindexOutcome(StrEnum):
-    """The distinct outcomes reindex_document() can report for a successful call.
+class TargetConfigurationMismatchError(ValueError):
+    """Raised when settings derived for a build do not reproduce the exact requested target.
 
-    A raised exception (rather than a returned ReindexResult) means the re-index itself did not
-    complete — see the module docstring for exactly which failure modes raise vs. which are
-    represented here.
+    A build must never proceed if the settings actually used to resolve the embedding provider/
+    model/vector store would produce an `EmbeddingIndexConfig` different from the one the caller
+    explicitly pinned — that would mean generating embeddings under one identity while writing
+    them into a collection whose name claims another.
     """
 
-    ALREADY_CURRENT = "already_current"
-    REINDEXED = "reindexed"
-    REINDEXED_WITH_CLEANUP_PENDING = "reindexed_with_cleanup_pending"
-    REINDEXED_EMPTY = "reindexed_empty"
+    def __init__(self, expected: EmbeddingIndexConfig, actual: EmbeddingIndexConfig) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Settings derived for this build resolve to {actual!r}, but the requested target "
+            f"configuration was {expected!r} — refusing to build under a mismatched identity."
+        )
+
+
+def build_settings_for_target(
+    base_settings: Settings,
+    target_config: EmbeddingIndexConfig,
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> Settings:
+    """Return a new Settings instance scoped to `target_config`, never mutating `base_settings`.
+
+    Every field `get_active_embedding_config()`/the embedding provider/the chunker actually read is
+    explicitly overridden: `embedding_provider`, both `embedding_model` and `ollama_embedding_model`
+    (kept identical — `OllamaEmbeddingProvider` reads `ollama_embedding_model` directly, while
+    `resolved_embedding_model` prefers `embedding_model`; a build must never let these diverge),
+    `vector_size`, `embedding_version`, `chunking_version`, `qdrant_collection_name` (the collection
+    *prefix* `target_config.collection_prefix` was itself derived from), and the explicit numeric
+    `chunk_size`/`chunk_overlap` — never re-derived from the chunking-version label, live settings,
+    or environment defaults, since `EmbeddingIndexConfig` does not carry them.
+    """
+    return base_settings.model_copy(
+        update={
+            "embedding_provider": target_config.provider,
+            "embedding_model": target_config.model,
+            "ollama_embedding_model": target_config.model,
+            "vector_size": target_config.dimension,
+            "embedding_version": target_config.embedding_version,
+            "chunking_version": target_config.chunking_version,
+            "qdrant_collection_name": target_config.collection_prefix,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+        }
+    )
+
+
+class ReindexBuildOutcome(StrEnum):
+    """The distinct outcomes `build_reindex_target()` can report for a successful build."""
+
+    BUILT = "built"
+    BUILT_EMPTY = "built_empty"
 
 
 @dataclass(frozen=True)
-class ReindexResult:
-    """The outcome of one reindex_document() call, plus the (possibly updated) Document."""
+class ReindexBuildResult:
+    """The outcome of one `build_reindex_target()` call.
 
-    outcome: ReindexOutcome
-    document: Document
+    Proves only that the target collection was built successfully — never that it is active. Not
+    a durable readiness record itself; a future `ReindexJob(COMPLETED)` row is what later subtasks
+    will treat as the durable proof of a successful build, so this type deliberately carries only
+    what an in-process caller needs immediately after the call returns.
+    """
+
+    outcome: ReindexBuildOutcome
+    target_collection_name: str
+    chunk_count: int
+    vector_count: int
 
 
-async def reindex_document(
+def _resolved_config_matches_target(
+    settings: Settings, target_config: EmbeddingIndexConfig
+) -> EmbeddingIndexConfig | None:
+    """Return the config `settings` actually resolves to, or None if it matches `target_config`."""
+    resolved = get_active_embedding_config(settings)
+    return None if resolved == target_config else resolved
+
+
+async def build_reindex_target(
     document: Document,
     session: AsyncSession,
-    settings: Settings | None = None,
-    file_storage: FileStorage | None = None,
-) -> ReindexResult:
-    """Re-extract/re-chunk/re-embed/re-upsert one Document under the active configuration.
+    settings: Settings,
+    file_storage: FileStorage,
+    target_config: EmbeddingIndexConfig,
+    *,
+    target_chunk_size: int,
+    target_chunk_overlap: int,
+) -> ReindexBuildResult:
+    """Re-derive `document`'s vectors under `target_config` and write them into its collection.
 
-    Returns ALREADY_CURRENT (no-op) if the document already matches the active configuration.
-    Otherwise re-indexes and returns REINDEXED_EMPTY if extraction/chunking produced zero chunks
-    (the document is marked current with no searchable content — see "Zero-chunk behavior" in
-    ARCHITECTURE.md), REINDEXED_WITH_CLEANUP_PENDING if the new collection/metadata committed but
-    deleting the previous collection's vectors failed, or REINDEXED otherwise. Raises on any
-    extraction/embedding/validation/vector-store-write/Postgres-commit failure — see the module
-    docstring for the exact per-failure-mode contract.
+    Never touches the document's current serving state: `Document.collection_name`/`embedding_*`/
+    `chunking_version`/`indexed_at` are left exactly as they are, and the document's *previous*
+    (currently-serving) collection is never read, deleted, or scheduled for deletion here — see the
+    module docstring. Raises `TargetConfigurationMismatchError` before any storage read, extraction,
+    or embedding call if the settings derived for this build do not reproduce `target_config`
+    exactly. Raises on any extraction/chunking/embedding/validation/vector-store-write failure;
+    since no Document metadata is ever mutated by this function, such a failure leaves the document
+    exactly as it was before the call.
     """
-    settings = settings or get_settings()
-    active_config = get_active_embedding_config(settings)
+    build_settings = build_settings_for_target(
+        settings, target_config, chunk_size=target_chunk_size, chunk_overlap=target_chunk_overlap
+    )
+    mismatch = _resolved_config_matches_target(build_settings, target_config)
+    if mismatch is not None:
+        raise TargetConfigurationMismatchError(expected=target_config, actual=mismatch)
 
-    if not is_document_stale(document, active_config):
-        return ReindexResult(outcome=ReindexOutcome.ALREADY_CURRENT, document=document)
-
-    previous_collection_name = document.collection_name
-
-    file_storage = file_storage or create_file_storage(settings)
     extracted = await DocumentTextExtractor(storage=file_storage).extract(document)
-    chunker = DocumentChunker(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+    chunker = DocumentChunker(
+        chunk_size=build_settings.chunk_size, chunk_overlap=build_settings.chunk_overlap
+    )
     chunks = chunker.chunk(extracted)
 
-    vector_store = get_vector_store(settings)
+    vector_store = get_vector_store(build_settings)
 
     if chunks:
-        embedding_provider = get_embedding_provider(settings)
+        embedding_provider = get_embedding_provider(build_settings)
         vectors = await embedding_provider.embed([chunk.text for chunk in chunks])
-        validate_embeddings(vectors, expected_count=len(chunks), expected_dimension=active_config.dimension)
+        validate_embeddings(vectors, expected_count=len(chunks), expected_dimension=target_config.dimension)
         points = [
             to_vector_point(chunk, vector, document.original_filename)
             for chunk, vector in zip(chunks, vectors, strict=True)
         ]
 
-        await ensure_active_collection(vector_store, session, active_config)
-        await vector_store.upsert_vectors(active_config.collection_name, points)
+        await ensure_active_collection(vector_store, session, target_config)
+        await vector_store.upsert_vectors(target_config.collection_name, points)
 
-    mark_document_indexed(document, active_config)
+    return ReindexBuildResult(
+        outcome=ReindexBuildOutcome.BUILT if chunks else ReindexBuildOutcome.BUILT_EMPTY,
+        target_collection_name=target_config.collection_name,
+        chunk_count=len(chunks),
+        vector_count=len(chunks) if chunks else 0,
+    )
+
+
+@dataclass(frozen=True)
+class ReindexActivationResult:
+    """The outcome of one `activate_reindexed_document()` call.
+
+    `activated=False` means the document already carried `target_config`'s identity — a no-op,
+    idempotent re-activation; `cleanup_job` is always `None` in that case, since there is nothing
+    to vacate. `activated=True` means the document's serving identity was switched this call;
+    `cleanup_job` is populated only if there was a previous collection to vacate (never for a
+    document that had never been indexed before).
+    """
+
+    document: Document
+    activated: bool
+    cleanup_job: VectorCleanupJob | None
+
+
+async def activate_reindexed_document(
+    document: Document, session: AsyncSession, target_config: EmbeddingIndexConfig
+) -> ReindexActivationResult:
+    """Atomically switch `document`'s serving identity to `target_config` and defer old cleanup.
+
+    Never deletes Qdrant vectors itself — actual removal of the vacated collection's vectors is
+    left entirely to `cleanup_job_service.retry_cleanup_job()`, run later and independently. The
+    document-metadata switch and the new `VectorCleanupJob` (when one is needed) are persisted in
+    exactly one commit — a crash between them is impossible by construction, never "metadata
+    committed, cleanup job to follow." Idempotent: calling this again once the document already
+    carries `target_config`'s identity does nothing and creates no cleanup job.
+    """
+    if document.collection_name == target_config.collection_name:
+        return ReindexActivationResult(document=document, activated=False, cleanup_job=None)
+
+    previous_collection_name = document.collection_name
+    mark_document_indexed(document, target_config)
+
+    cleanup_job: VectorCleanupJob | None = None
+    if previous_collection_name is not None:
+        cleanup_job = VectorCleanupJob(
+            id=str(uuid.uuid4()),
+            document_id=document.id,
+            collection_name=previous_collection_name,
+            status=VectorCleanupStatus.PENDING,
+            attempts=0,
+            last_error=None,
+        )
+        session.add(cleanup_job)
+
     try:
         await session.commit()
     except Exception:
@@ -130,13 +237,15 @@ async def reindex_document(
         session.expire(document)
         raise
 
-    outcome = ReindexOutcome.REINDEXED if chunks else ReindexOutcome.REINDEXED_EMPTY
+    return ReindexActivationResult(document=document, activated=True, cleanup_job=cleanup_job)
 
-    if previous_collection_name and previous_collection_name != active_config.collection_name:
-        try:
-            await vector_store.delete_by_document_id(previous_collection_name, document.id)
-        except Exception as exc:
-            await create_cleanup_job(session, document.id, previous_collection_name, error=str(exc))
-            outcome = ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
 
-    return ReindexResult(outcome=outcome, document=document)
+__all__ = [
+    "ReindexActivationResult",
+    "ReindexBuildOutcome",
+    "ReindexBuildResult",
+    "TargetConfigurationMismatchError",
+    "activate_reindexed_document",
+    "build_reindex_target",
+    "build_settings_for_target",
+]

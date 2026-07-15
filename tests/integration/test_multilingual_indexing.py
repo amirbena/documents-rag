@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.models.document import Document
 from app.models.index_collection import IndexCollection
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.models.vector_cleanup_job import VectorCleanupStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorPoint
@@ -28,7 +29,11 @@ from app.services.indexing.cleanup_job_service import (
     retry_cleanup_job,
 )
 from app.services.indexing.collection_registry import ensure_active_collection, is_document_stale
-from app.services.indexing.reindex_service import ReindexOutcome, reindex_document
+from app.services.indexing.reindex_service import (
+    ReindexBuildOutcome,
+    activate_reindexed_document,
+    build_reindex_target,
+)
 from app.services.indexing.vector_deletion_service import delete_all_tracked_document_vectors
 from app.services.ingestion.worker import IngestionWorker
 from app.storage.local_storage import LocalFileStorage
@@ -193,10 +198,11 @@ async def test_stale_document_detection_after_embedding_version_change(
     assert is_document_stale(document, bumped_config) is True
 
 
-async def test_reindex_writes_to_the_new_collection_and_updates_metadata(
+async def test_build_and_activate_writes_to_the_new_collection_and_updates_metadata(
     migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
 ) -> None:
-    """A successful re-index after a version bump must write into the new collection."""
+    """A successful build+activate after a version bump must write into and switch to the new
+    collection — build alone must never switch serving metadata (Phase 2.8.6, subtask 1)."""
     _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
     settings = get_settings()
 
@@ -215,11 +221,22 @@ async def test_reindex_writes_to_the_new_collection_and_updates_metadata(
         document = (await session.execute(select(Document))).scalar_one()
         assert is_document_stale(document, new_config) is True
 
-        result = await reindex_document(
-            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        build_result = await build_reindex_target(
+            document,
+            session,
+            settings,
+            LocalFileStorage(root=tmp_path),
+            new_config,
+            target_chunk_size=settings.chunk_size,
+            target_chunk_overlap=settings.chunk_overlap,
         )
+        assert build_result.outcome == ReindexBuildOutcome.BUILT
+        # Build alone must never switch the document's serving identity.
+        assert document.collection_name != new_config.collection_name
+        assert is_document_stale(document, new_config) is True
 
-        assert result.outcome == ReindexOutcome.REINDEXED
+        activation_result = await activate_reindexed_document(document, session, new_config)
+        assert activation_result.activated is True
         assert document.collection_name == new_config.collection_name
         assert document.embedding_version == "v2-multilingual"
         assert is_document_stale(document, new_config) is False
@@ -231,10 +248,10 @@ async def test_reindex_writes_to_the_new_collection_and_updates_metadata(
     assert len(results) > 0
 
 
-async def test_failed_reindex_does_not_mark_document_current(
+async def test_failed_build_does_not_mark_document_current(
     migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
 ) -> None:
-    """A re-index failure must leave the document's stored indexing metadata untouched."""
+    """A build failure must leave the document's stored indexing metadata untouched."""
     _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
     settings = get_settings()
 
@@ -261,16 +278,26 @@ async def test_failed_reindex_does_not_mark_document_current(
         original_collection_name = document.collection_name
 
         with pytest.raises(RuntimeError, match="embedding provider unavailable"):
-            await reindex_document(document, session, settings, file_storage=LocalFileStorage(root=tmp_path))
+            await build_reindex_target(
+                document,
+                session,
+                settings,
+                LocalFileStorage(root=tmp_path),
+                new_config,
+                target_chunk_size=settings.chunk_size,
+                target_chunk_overlap=settings.chunk_overlap,
+            )
 
         assert document.collection_name == original_collection_name
         assert is_document_stale(document, new_config) is True
 
 
-async def test_reindex_cleanup_failure_persists_job_and_retry_succeeds_against_real_qdrant(
+async def test_activation_cleanup_job_retry_succeeds_against_real_qdrant(
     migrated_schema: None, postgres_url: str, qdrant_url: str, tmp_path, monkeypatch
 ) -> None:
-    """A legacy-collection delete failure is persisted, retryable, and idempotent against real Qdrant."""
+    """activate_reindexed_document() always defers old-collection cleanup to a fresh PENDING
+    VectorCleanupJob; retry_cleanup_job() removes the old collection's vectors later, independently,
+    against real Qdrant (Phase 2.8.6, subtask 1 — activation itself never deletes vectors)."""
     _use_multilingual_fake_embeddings(monkeypatch, ingestion_worker_module)
     settings = get_settings()
 
@@ -288,43 +315,27 @@ async def test_reindex_cleanup_failure_persists_job_and_retry_succeeds_against_r
 
     real_vector_store = QdrantVectorStore(settings=settings)
 
-    class _FailOnceForOldCollection:
-        """Wraps the real QdrantVectorStore, simulating one transient delete failure."""
-
-        def __init__(self) -> None:
-            self.delete_calls: list[str] = []
-
-        async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
-            await real_vector_store.create_collection_if_not_exists(collection_name, vector_size)
-
-        async def upsert_vectors(self, collection_name: str, points: list) -> None:
-            await real_vector_store.upsert_vectors(collection_name, points)
-
-        async def get_collection_vector_size(self, collection_name: str) -> int | None:
-            return await real_vector_store.get_collection_vector_size(collection_name)
-
-        async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
-            self.delete_calls.append(collection_name)
-            if collection_name == original_config.collection_name:
-                raise RuntimeError("simulated transient Qdrant failure")
-            await real_vector_store.delete_by_document_id(collection_name, document_id)
-
-    failing_store = _FailOnceForOldCollection()
-    monkeypatch.setattr(reindex_service_module, "get_vector_store", lambda settings=None: failing_store)
-
     async with _new_session(postgres_url) as session:
         document = (await session.execute(select(Document))).scalar_one()
-        result = await reindex_document(
-            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        await build_reindex_target(
+            document,
+            session,
+            settings,
+            LocalFileStorage(root=tmp_path),
+            new_config,
+            target_chunk_size=settings.chunk_size,
+            target_chunk_overlap=settings.chunk_overlap,
         )
-        assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
+        activation_result = await activate_reindexed_document(document, session, new_config)
+        assert activation_result.cleanup_job is not None
         assert document.collection_name == new_config.collection_name
 
     async with _new_session(postgres_url) as session:
         jobs = await get_pending_cleanup_jobs(session, document_id=document.id)
         assert len(jobs) == 1
         assert jobs[0].collection_name == original_config.collection_name
-        assert jobs[0].attempts == 1
+        assert jobs[0].status == VectorCleanupStatus.PENDING
+        assert jobs[0].attempts == 0
 
         succeeded = await retry_cleanup_job(session, real_vector_store, jobs[0])
         assert succeeded is True
@@ -367,31 +378,19 @@ async def test_full_document_deletion_cleans_pending_historical_collection_again
 
     real_vector_store = QdrantVectorStore(settings=settings)
 
-    class _AlwaysFailForOldCollection:
-        async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:
-            await real_vector_store.create_collection_if_not_exists(collection_name, vector_size)
-
-        async def upsert_vectors(self, collection_name: str, points: list) -> None:
-            await real_vector_store.upsert_vectors(collection_name, points)
-
-        async def get_collection_vector_size(self, collection_name: str) -> int | None:
-            return await real_vector_store.get_collection_vector_size(collection_name)
-
-        async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
-            if collection_name == original_config.collection_name:
-                raise RuntimeError("simulated persistent Qdrant failure")
-            await real_vector_store.delete_by_document_id(collection_name, document_id)
-
-    monkeypatch.setattr(
-        reindex_service_module, "get_vector_store", lambda settings=None: _AlwaysFailForOldCollection()
-    )
-
     async with _new_session(postgres_url) as session:
         document = (await session.execute(select(Document))).scalar_one()
-        result = await reindex_document(
-            document, session, settings, file_storage=LocalFileStorage(root=tmp_path)
+        await build_reindex_target(
+            document,
+            session,
+            settings,
+            LocalFileStorage(root=tmp_path),
+            new_config,
+            target_chunk_size=settings.chunk_size,
+            target_chunk_overlap=settings.chunk_overlap,
         )
-        assert result.outcome == ReindexOutcome.REINDEXED_WITH_CLEANUP_PENDING
+        activation_result = await activate_reindexed_document(document, session, new_config)
+        assert activation_result.cleanup_job is not None
 
     async with _new_session(postgres_url) as session:
         jobs = await get_pending_cleanup_jobs(session, document_id=document.id)

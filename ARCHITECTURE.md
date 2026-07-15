@@ -1159,76 +1159,87 @@ special-casing at the call site.
 
 ### Re-index (`app/services/indexing/reindex_service.py`)
 
-`reindex_document(document, session, settings, file_storage=None) -> ReindexResult` re-derives a
-document's vectors from its already-persisted stored content — no new upload required (`
-file_storage` defaults to `create_file_storage(settings)` if omitted). Flow: re-extract
-(`DocumentTextExtractor`, reading via the injected `FileStorage`) -> re-chunk (`DocumentChunker`,
-active `chunking_version`) -> re-embed (active `EmbeddingIndexConfig`) -> validate real vector
-dimensions (`app/rag/embedding_validation.py`) -> `ensure_active_collection()` -> upsert into the
-new collection -> `mark_document_indexed()` + commit -> attempt to delete the document's vectors
-from
-its *previous* tracked collection (if any, and if different from the new one).
+**Build and activation are two separate operations (Phase 2.8.6, subtask 1) — never one combined
+function.** This is the foundation for operator-controlled build-ahead migration: a document's
+vectors can be built into a new target collection while the running process keeps serving that
+document from its current collection, untouched, for as long as an operator wants. Scheduling,
+concurrency, a worker, and any public API around these two primitives are later subtasks — this
+phase only establishes the safe split itself.
 
-`ReindexResult` (`outcome: ReindexOutcome`, `document`) replaces the old plain-`bool` return —
-`bool` could not represent the distinct outcomes below:
+`build_reindex_target(document, session, settings, file_storage, target_config, *,
+target_chunk_size, target_chunk_overlap) -> ReindexBuildResult` re-derives a document's vectors
+from its already-persisted stored content under an explicit, caller-pinned `target_config` — no
+new upload required. Flow: derive a target-scoped `Settings` copy via `build_settings_for_target()`
+-> validate that those derived settings actually reproduce `target_config` exactly (raising
+`TargetConfigurationMismatchError` before any storage read otherwise) -> re-extract
+(`DocumentTextExtractor`) -> re-chunk (`DocumentChunker`, the explicit pinned `target_chunk_size`/
+`target_chunk_overlap` — never live settings, never the chunking-version label alone) -> re-embed
+(the target's own provider/model, resolved via the derived settings) -> validate real vector
+dimensions -> `ensure_active_collection()` -> upsert into the target collection. **It never calls
+`mark_document_indexed()`, never modifies `Document.collection_name`/`embedding_*`/
+`chunking_version`/`indexed_at`, and never reads, deletes, or schedules cleanup for the document's
+previous (currently-serving) collection.** A successful build proves only that the target was
+built — not that it is active. Idempotent: point IDs are derived identically to the initial-ingest
+path (`app.services.ingestion.worker.to_vector_point`), so re-running against the same target
+overwrites rather than duplicates. Any extraction/chunking/embedding/validation/vector-store-write
+failure propagates with the document's metadata completely untouched, since this function never
+commits anything about the `Document` row at all.
 
-- `ALREADY_CURRENT` — no-op, the document already matches the active configuration.
-- `REINDEXED` — successful, non-empty re-index.
-- `REINDEXED_EMPTY` — the document produced zero chunks (see "Zero-chunk behavior" below); marked
-  current anyway, with no vectors written.
-- `REINDEXED_WITH_CLEANUP_PENDING` — the new collection/metadata committed successfully, but
-  deleting the previous collection's vectors failed; see "Legacy-vector cleanup" below. The
-  re-index itself is **not** reported as a failure.
+`build_settings_for_target()` explicitly overrides every field the build actually reads —
+`embedding_provider`, both `embedding_model` **and** `ollama_embedding_model` (kept identical,
+since `OllamaEmbeddingProvider` reads `ollama_embedding_model` directly while
+`resolved_embedding_model` prefers `embedding_model` — letting these diverge would mean generating
+embeddings under one model while writing them into a collection whose name claims another),
+`vector_size`, `embedding_version`, `chunking_version`, `qdrant_collection_name`, and the explicit
+numeric `chunk_size`/`chunk_overlap` (not part of `EmbeddingIndexConfig`, since chunking-version is
+only a label — these must be supplied explicitly by the caller) — via `Settings.model_copy()`,
+never mutating the base `Settings` instance passed in.
 
-Idempotent: point IDs are derived identically to the initial-ingest path
-(`app.services.ingestion.worker.to_vector_point`, made public specifically so
-`reindex_service.py` can reuse it), so re-running against the same active collection overwrites
-rather than duplicates.
+`activate_reindexed_document(document, session, target_config) -> ReindexActivationResult` is the
+separate, later operation that actually switches a document's serving identity: it calls
+`mark_document_indexed()` for `target_config`, and — in the exact same commit, never a second one
+—persists a fresh `VectorCleanupJob` (`PENDING`, `attempts=0`) for whatever collection the document
+is leaving behind, if any. It never deletes Qdrant vectors itself; actual removal of the vacated
+collection is left entirely to `cleanup_job_service.retry_cleanup_job()`, run independently and
+later. Idempotent: calling it again once the document already carries `target_config`'s identity
+is a no-op and creates no cleanup job. A commit failure rolls back both the metadata switch and
+the cleanup-job row together (`session.rollback()` + `session.expire(document)`), so a crash can
+never leave a document "activated" without its corresponding cleanup obligation durably recorded.
 
-**Transaction semantics — Qdrant and PostgreSQL are never one atomic transaction.** Three
-distinct failure modes, each with different observable state:
-
-1. **Extraction/chunking/embedding/validation/collection/upsert failure** (before the metadata
-   commit): the exception propagates, no Document indexing metadata is ever committed, and no
-   previously-valid vectors are touched. `is_document_stale()` still reports the document stale.
-2. **The Qdrant upsert succeeds but the following Postgres commit fails** (e.g. a dropped
-   connection): `reindex_document()` calls `session.rollback()` then `session.expire(document)`
-   before re-raising, so no mutated in-memory attribute survives the failed commit and the next
-   access re-reads the true (unchanged) persisted state. **This is intentionally not
-   indistinguishable from an attempt that never ran** — the new points already exist in Qdrant.
-   Deterministic point IDs make this safe: the next successful re-index attempt overwrites the
-   same points rather than duplicating them, and no cleanup ever runs against orphaned points
-   from a failed attempt (cleanup only triggers after a *successful* metadata commit).
-3. **The previous-collection vector delete fails after a successful metadata commit** — tracked
-   as a `REINDEXED_WITH_CLEANUP_PENDING` outcome, described next; the document IS current, this is
-   not classified as a re-index failure.
+Neither primitive is wired into a worker, script, or public API yet — that is deliberately out of
+scope for this subtask; only later Phase 2.8.6 subtasks add scheduling, concurrency guarantees, and
+exposure.
 
 ### Zero-chunk behavior
 
-A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still
-marked indexed — via the same `mark_document_indexed()` call, with zero vectors written — rather
-than being silently left permanently stale. Both `IngestionWorker`'s default processing step and
-`reindex_document()` (as `ReindexOutcome.REINDEXED_EMPTY`) apply this identically: no false claim
-that searchable content exists, and predictable no-results behavior at retrieval time (there is
-simply nothing in the collection for that document to match against).
+A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still a
+valid build — `build_reindex_target()` reports `ReindexBuildOutcome.BUILT_EMPTY` and writes zero
+vectors, never failing merely because there was nothing to embed. `IngestionWorker`'s default
+processing step applies the equivalent behavior on the initial-ingest path (marking the document
+indexed with zero vectors) — no false claim that searchable content exists, and predictable
+no-results behavior at retrieval time.
 
 ### Legacy-vector cleanup (`VectorCleanupJob`)
 
 `VectorCleanupJob` (`app/models/vector_cleanup_job.py`; migration
 `alembic/versions/1c2d9f3a7b4e_...py`) durably tracks a legacy collection's vectors still needing
-deletion after a re-index, independently of whether the document itself is still considered
-stale — so a cleanup failure is never silently lost or conflated with re-index failure, and stays
-discoverable/retryable even once the document is current. One row per `(document_id,
-collection_name)`, with `status` (`pending`/`failed`/`completed`), `attempts`, `last_error`,
-`created_at`, `completed_at`. Multiple pending rows for the same document (different historical
-collections) are supported and never overwrite each other.
+deletion after a document's serving identity is switched to a new collection, independently of
+whether the document itself is still considered stale relative to any other configuration — so a
+cleanup obligation is never silently lost or conflated with build/activation failure, and stays
+discoverable/retryable indefinitely. One row per `(document_id, collection_name)`, with `status`
+(`pending`/`failed`/`completed`), `attempts`, `last_error`, `created_at`, `completed_at`. Multiple
+pending rows for the same document (different historical collections) are supported and never
+overwrite each other.
 
-`app/services/indexing/cleanup_job_service.py` provides: `create_cleanup_job()` (called by
-`reindex_document()` immediately after a failed delete, recording the first attempt's error),
-`get_pending_cleanup_jobs()` (every `pending`/`failed` row, optionally scoped to one document),
-and `retry_cleanup_job()` (retries the delete; marks `completed` on success or increments
-`attempts`/records `last_error` and stays `failed` otherwise — idempotent, since retrying a delete
-against already-empty vectors is a harmless no-op).
+`app/services/indexing/cleanup_job_service.py` provides `get_pending_cleanup_jobs()` (every
+`pending`/`failed` row, optionally scoped to one document) and `retry_cleanup_job()` (retries the
+delete; marks `completed` on success or increments `attempts`/records `last_error` and stays
+`failed` otherwise — idempotent, since retrying a delete against already-empty vectors is a
+harmless no-op). `create_cleanup_job()` remains available as a standalone, independently-committing
+helper for other callers, but `activate_reindexed_document()` does not use it — a cleanup job
+created as part of activation must share activation's own single commit with the metadata switch,
+so `activate_reindexed_document()` constructs and `session.add()`s a `VectorCleanupJob` row
+directly instead.
 
 **Two separate vector-deletion operations, deliberately not one.**
 `delete_current_document_vectors(document, vector_store)` targets only the document's
@@ -1345,8 +1356,8 @@ ingesting documents. `EMBEDDING_VERSION`'s default moved from `v1` to `v2` in th
 an installation upgrading from Phase 2.5 (which defaulted to `nomic-embed-text`/768-dim/`v1`)
 never silently reuses that now-incompatible collection: the active `EmbeddingIndexConfig`'s
 `collection_name` changes, existing documents are reported stale by `is_document_stale()`, and
-must go through `reindex_document()` (see "Re-index and collection migration" below) to be
-searchable again under the new config. **The previous `nomic-embed-text`/`v1` collection and its
+must go through a build (`build_reindex_target()`) and activation (`activate_reindexed_document()`)
+— see "Re-index" below — to be searchable again under the new config. **The previous `nomic-embed-text`/`v1` collection and its
 vectors are never deleted automatically** — `retire_collection()` remains a bookkeeping-only
 status flip.
 
@@ -1767,8 +1778,8 @@ outside Docker. `app/core/config.py` (`Settings`) is the single source of truth 
     `get_stale_documents()`, `retire_collection()`; `vector_deletion_service.py` —
     `delete_current_document_vectors()`, `delete_all_tracked_document_vectors()`;
     `cleanup_job_service.py` — `create_cleanup_job()`, `get_pending_cleanup_jobs()`,
-    `retry_cleanup_job()`; and `reindex_service.py`'s `reindex_document()`, the backend re-index
-    capability.
+    `retry_cleanup_job()`; and `reindex_service.py`'s `build_reindex_target()`/
+    `activate_reindexed_document()`, the backend re-index build/activation capability.
   - `app/services/ollama_client.py` — `OllamaClient`, a thin async HTTP client scoped strictly to
     reachability and model-availability checks — it intentionally does not call generation or
     embedding endpoints.
