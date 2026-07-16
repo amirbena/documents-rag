@@ -1248,9 +1248,58 @@ can be reloaded.
 **Active re-index blocks document deletion.** `deletion_service.request_document_deletion()`
 rejects with `REINDEX_ACTIVE` (`409`) while an active `ReindexJob` exists for the document,
 symmetric with its existing `INGESTION_ACTIVE` check — deletion must never race an in-flight
-re-index build. Full-deletion tracking of a completed-but-not-yet-activated target build (so
+re-index build. Full-deletion tracking of a completed-but-not-yet-activated target build — so
 `delete_all_tracked_document_vectors()` can prove and clean both the serving and target collections
-for a document deleted mid-build) is explicitly deferred to a later subtask, not implemented here.
+for a document deleted mid-build — is implemented too: it also resolves every distinct
+`target_collection_name` from a `COMPLETED` `ReindexJob` for the document (via
+`get_completed_reindex_target_collections()`), never `PENDING`/`PROCESSING`/`FAILED` ones. See
+"Two separate vector-deletion operations, deliberately not one" above.
+
+### Re-index worker (`app/services/indexing/reindex_worker.py`)
+
+**Build-only — the worker never activates anything.** `ReindexWorker.process_next_job(session,
+settings)` claims one `PENDING` `ReindexJob` (`SELECT ... FOR UPDATE SKIP LOCKED`, mirroring
+`IngestionWorker`/`DocumentDeletionWorker` exactly, ordered `created_at ASC, id ASC`), commits the
+`PENDING -> PROCESSING` transition before any external I/O, reconstructs the job's pinned target
+`EmbeddingIndexConfig` from its `IndexCollection` foreign key plus its own persisted
+`target_chunk_size`/`target_chunk_overlap`, and delegates entirely to
+`reindex_service.build_reindex_target()` — the worker never duplicates
+extraction/chunking/embedding/validation/collection/upsert logic itself. `ReindexJob.status ==
+COMPLETED` means only **"the pinned target build succeeded"** — never "the target is active or
+serving." `Document.collection_name`/`embedding_*`/`chunking_version`/`indexed_at` are never
+touched by this worker, no `VectorCleanupJob` is ever created by it, and no vector is ever deleted
+from any collection by it. Activation (`reindex_service.activate_reindexed_document()`, added in
+subtask 1) remains completely unwired into any runtime code as of this subtask.
+
+`IndexCollection` does not itself persist the `collection_prefix` used to derive its
+`collection_name` (only the fully joined name is a column) — the worker sources it from its own
+base `Settings.qdrant_collection_name` (a platform-wide constant that should never legitimately
+differ from what was used at scheduling time) and then verifies the reconstructed config's
+`collection_name` matches the job's pinned `target_collection_name` exactly before building,
+failing the job cleanly rather than silently building into the wrong collection if it does not.
+
+**Defense in depth against deletion races.** `schedule_reindex()` already refuses to create a new
+`ReindexJob` while a document's deletion is active/incomplete/completed, but the worker re-checks
+the same condition immediately before building anyway, against the residual window between
+scheduling and a worker actually claiming the job. A blocked build is recorded as
+`ReindexJob.status = FAILED` (the existing status vocabulary — no new database status is
+introduced for this) with a stable internal error message; the worker's own return value
+additionally distinguishes this case (`ReindexWorkerOutcome.SKIPPED_DELETED`) from a genuine build
+exception (`FAILED`) for the caller's benefit, without any corresponding DB-level distinction.
+
+**Transaction boundaries.** Claiming is its own committed transaction before any external I/O; no
+row lock is held across storage reads, extraction, chunking, embedding, or the Qdrant upsert.
+Resolving the terminal status is a second, separate commit. The failure path always rolls back
+first, then reloads the job strictly by its captured scalar `id` — never by re-accessing the
+original (possibly now-expired) ORM object's attributes, which is exactly the `MissingGreenlet`
+defect found and fixed in subtask 2's PostgreSQL verification.
+
+**No stale-`PROCESSING` recovery yet.** If a worker process crashes between claiming a job and
+marking it terminal, that `ReindexJob` row remains `PROCESSING` indefinitely in this subtask —
+there is no automatic reset back to `PENDING`. This mirrors `IngestionJob`'s own
+`recover_stale_ingestion_jobs()` precedent (script-only, never HTTP-triggered, never run by `make
+verify`/CI) — a future task would extend that same convention to `ReindexJob`, not invent a new
+mechanism; this subtask does not register or extend it.
 
 ### Zero-chunk behavior
 
