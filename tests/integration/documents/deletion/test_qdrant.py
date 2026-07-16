@@ -344,6 +344,7 @@ async def test_full_deletion_cleans_a_completed_reindex_target_collection_agains
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=target_document.id,
+            source_collection_name=serving_collection,
             target_collection_name=target_collection,
             target_chunk_size=500,
             target_chunk_overlap=50,

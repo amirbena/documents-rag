@@ -142,6 +142,7 @@ async def test_migration_creates_reindex_jobs_table_with_expected_columns(
     assert columns == {
         "id",
         "document_id",
+        "source_collection_name",
         "target_collection_name",
         "target_chunk_size",
         "target_chunk_overlap",
@@ -150,6 +151,7 @@ async def test_migration_creates_reindex_jobs_table_with_expected_columns(
         "created_at",
         "updated_at",
         "completed_at",
+        "activated_at",
     }
     assert "ix_reindex_jobs_one_active_per_document" in index_names
 
@@ -193,6 +195,7 @@ async def test_document_foreign_key_is_enforced(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=str(uuid.uuid4()),
+            source_collection_name=target.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -214,6 +217,7 @@ async def test_target_collection_foreign_key_is_enforced(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name="never-persisted-collection",
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -239,6 +243,7 @@ async def test_one_pending_job_is_allowed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -259,6 +264,7 @@ async def test_second_active_job_for_same_document_is_rejected(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -271,6 +277,7 @@ async def test_second_active_job_for_same_document_is_rejected(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -294,6 +301,7 @@ async def test_multiple_historical_terminal_jobs_are_allowed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -304,6 +312,7 @@ async def test_multiple_historical_terminal_jobs_are_allowed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -329,6 +338,7 @@ async def test_new_active_job_allowed_after_previous_becomes_failed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -341,6 +351,7 @@ async def test_new_active_job_allowed_after_previous_becomes_failed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -361,6 +372,7 @@ async def test_new_active_job_allowed_after_previous_becomes_completed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,
@@ -373,6 +385,7 @@ async def test_new_active_job_allowed_after_previous_becomes_completed(
         ReindexJob(
             id=str(uuid.uuid4()),
             document_id=document.id,
+            source_collection_name=_OLD_CONFIG.collection_name,
             target_collection_name=target.collection_name,
             target_chunk_size=500,
             target_chunk_overlap=50,

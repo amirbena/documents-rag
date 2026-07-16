@@ -160,6 +160,7 @@ def _reindex_job(document_id: str, target_collection_name: str, **overrides: obj
     fields: dict[str, object] = dict(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name="serving-collection",  # matches _document()'s default collection_name
         target_collection_name=target_collection_name,
         target_chunk_size=500,
         target_chunk_overlap=50,

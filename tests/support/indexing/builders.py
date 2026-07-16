@@ -46,6 +46,7 @@ def build_reindex_job(
     document_id: str,
     status: ReindexJobStatus,
     *,
+    source_collection_name: str = "documents__ollama__source-model__ev0__cv0__d768",
     target_collection_name: str = "documents__ollama__target-model__ev1__cv1__d768",
     created_at: datetime | None = None,
     **overrides: object,
@@ -54,6 +55,7 @@ def build_reindex_job(
     fields: dict[str, object] = dict(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name=source_collection_name,
         target_collection_name=target_collection_name,
         target_chunk_size=500,
         target_chunk_overlap=50,

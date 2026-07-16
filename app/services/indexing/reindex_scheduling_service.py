@@ -234,11 +234,16 @@ async def schedule_reindex(
     # Captured once, up front: a rollback later in this function (the race-recovery path) expires
     # every object in the session, including `document` — any attribute access on it afterward
     # would trigger an unsafe synchronous lazy-load under an AsyncSession. Every subsequent lookup
-    # in this function uses this plain string, never `document.id` again.
+    # in this function uses these plain values, never `document.*` again. `source_collection_name`
+    # is the document's serving collection *at scheduling time* — pinned onto the job so
+    # `reindex_activation.activate_reindexed_document()` (subtask 5) can later detect whether the
+    # document has since moved to a third collection before ever overwriting it.
     document_id = document.id
 
     if document.collection_name is None:
         return _result(ReindexSchedulingOutcome.INELIGIBLE_NEVER_INDEXED, document, target_config)
+
+    source_collection_name = document.collection_name
 
     if document.collection_name == target_config.collection_name:
         return _result(ReindexSchedulingOutcome.ALREADY_CURRENT, document, target_config)
@@ -265,6 +270,7 @@ async def schedule_reindex(
     job = ReindexJob(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name=source_collection_name,
         target_collection_name=target_config.collection_name,
         target_chunk_size=target_chunk_size,
         target_chunk_overlap=target_chunk_overlap,

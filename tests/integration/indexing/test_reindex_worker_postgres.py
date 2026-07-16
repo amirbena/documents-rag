@@ -128,6 +128,7 @@ async def _seed_reindex_job(
     job = ReindexJob(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name=_SERVING_CONFIG.collection_name,
         target_collection_name=target_config.collection_name,
         target_chunk_size=500,
         target_chunk_overlap=50,
@@ -297,6 +298,7 @@ async def test_historical_terminal_jobs_remain_unchanged(
     old_completed = ReindexJob(
         id=str(uuid.uuid4()),
         document_id=document.id,
+        source_collection_name=_SERVING_CONFIG.collection_name,
         target_collection_name=_TARGET_CONFIG.collection_name,
         target_chunk_size=500,
         target_chunk_overlap=50,

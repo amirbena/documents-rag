@@ -1301,6 +1301,55 @@ there is no automatic reset back to `PENDING`. This mirrors `IngestionJob`'s own
 verify`/CI) — a future task would extend that same convention to `ReindexJob`, not invent a new
 mechanism; this subtask does not register or extend it.
 
+### Re-index activation (`app/services/indexing/reindex_activation.py`)
+
+**Build completion and activation are separate, independently-durable states.** `ReindexJob.status
+== COMPLETED` (set by the worker above) means only "the pinned target build succeeded" — it says
+nothing about whether the document is actually being served from that target. Activation is the
+explicit, separate operation that performs the cutover: `activate_reindexed_document(session,
+reindex_job_id) -> ReindexActivationResult` locks the `ReindexJob` and its `Document`
+(`SELECT ... FOR UPDATE`, not `SKIP LOCKED` — a caller intentionally targeting one specific job
+should wait for a concurrent activator rather than silently skip), re-validates every precondition
+against current state (job exists / is `COMPLETED` / is not already activated; document exists and
+its deletion lifecycle isn't active/incomplete/completed; the document's *current*
+`collection_name` still equals the job's pinned `source_collection_name`; the target
+`IndexCollection` row still exists), and — in that same transaction — atomically switches
+`Document.collection_name`/`embedding_provider`/`embedding_model`/`embedding_dimension`/
+`embedding_version`/`chunking_version`/`indexed_at` to the target's own persisted `IndexCollection`
+columns, creates one `VectorCleanupJob` for the vacated source collection, and sets
+`ReindexJob.activated_at` (added by this subtask, alongside `ReindexJob.source_collection_name` —
+the document's serving collection *as captured by `schedule_reindex()` at scheduling time*, used
+for the staleness check above). The document cutover and the cleanup-job creation share one commit
+— activation never durably exposes a document already pointing at the target with no cleanup job
+yet recorded for the source, or vice versa.
+
+**Never rebuilds, never touches Qdrant, never consults live Settings.** Unlike the worker, this
+module reconstructs the target's embedding/chunking identity purely from the target
+`IndexCollection` row's own columns — never from a reconstructed `EmbeddingIndexConfig` (which
+would require a `collection_prefix` that isn't itself a persisted column) and never from live
+`Settings`, so a stale `QDRANT_COLLECTION_NAME` on the activating process can never corrupt a
+cutover. It never calls `build_reindex_target()`, never issues a Qdrant write or delete, and never
+retires or otherwise mutates the target `IndexCollection`'s own status.
+
+**Old vectors remain present after activation; cleanup execution is asynchronous and not part of
+this subtask.** The `VectorCleanupJob` row created here is picked up by the existing
+`cleanup_job_service.retry_cleanup_job()` machinery on its own schedule — activation only records
+the obligation, it never executes it inline. A document therefore has live, searchable vectors in
+*both* its old and new collections for an indeterminate window after activation, by design.
+
+**Idempotent via row locking, not a new unique constraint.** Two concurrent activation attempts
+against the *same* `ReindexJob` id serialize on that row's `FOR UPDATE` lock; the second caller
+proceeds only after the first commits, then observes `activated_at` already set and returns
+`ALREADY_ACTIVATED` with no further mutation and no duplicate `VectorCleanupJob`. This differs from
+`ix_reindex_jobs_one_active_per_document` (a multi-row insert race) because activation contention
+is always over one already-existing row.
+
+**Out of scope for this subtask (all remain future work):** no public HTTP API is exposed for
+activation; no batch/campaign orchestration across multiple documents or jobs; no collection
+retirement; no automatic write-freeze or process-restart coordination around a cutover (that
+remains an external operational concern); no automated end-to-end migration workflow — build,
+schedule, and activate remain three separately-invoked operations, not one automated pipeline.
+
 ### Zero-chunk behavior
 
 A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still a
