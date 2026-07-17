@@ -1655,6 +1655,66 @@ recall/ranking evaluation on a larger corpus remains future work, and this proje
 suites deliberately never pull or call a real embedding/LLM model (see "AI-provider policy in
 tests" below).
 
+## Reconciliation: read-only document lifecycle audit (`app/services/reconciliation/`, Phase 2.8.7, subtask 1)
+
+**Reconciliation begins with a read-only audit, never a repair.** `audit_document_lifecycle(session,
+document_id, settings, file_storage, vector_store)` (`app/services/reconciliation/
+document_audit_service.py`) inspects one document's state across PostgreSQL, Object Storage, and
+Qdrant, and classifies whether it is currently consistent — it never mutates anything (no
+`session.add()`, no field mutation, no `session.commit()` required at all), never repairs, retries,
+deletes, re-indexes, or executes cleanup, and never discovers ownership from external systems.
+
+**PostgreSQL remains authoritative; external resources are inspected only through resources it
+already claims to own.** The audit never scans an Object Storage bucket or lists Qdrant
+collections looking for orphans — it inspects exactly the `storage_key` and `collection_name`
+already persisted on the `Document` row, nothing else. This module lives outside both
+`app/services/documents/` and `app/services/indexing/` specifically because an audit spans both
+domains; it imports the existing public lookup helpers from both packages directly
+(`get_document`/`get_latest_ingestion_job`, `get_latest_deletion_job`, `get_latest_reindex_job`,
+`get_pending_cleanup_jobs`) rather than duplicating any of them — a new sibling package depending
+on both `documents/*` and `indexing/*` does not violate CLAUDE.md's one-directional
+`indexing/* -> documents/*` prohibition, since it isn't `indexing/*` doing the importing.
+
+**Dependency failure is never treated as resource absence.** A `StorageError` or
+`QdrantVectorStoreError` raised while inspecting Object Storage/Qdrant becomes its own finding
+(`STORAGE_INSPECTION_UNAVAILABLE`/`VECTOR_INSPECTION_UNAVAILABLE`) with a fixed, sanitized message
+— the raw provider exception text is never stored in a finding, mirroring
+`sanitize_ingestion_error()`/`sanitize_deletion_error()`/`sanitize_reindex_error()`'s existing
+"never expose the raw exception" convention. A collection genuinely not existing (Qdrant's 404) is
+distinguishable from Qdrant being unreachable — `QdrantVectorStore.get_collection_vector_size()`
+already returns `None` unambiguously for the former; any other failure raises
+`QdrantVectorStoreError`, which the audit only ever maps to `*_INSPECTION_UNAVAILABLE`.
+
+**Findings distinguish healthy/transitional/degraded/inconsistent via severity, not a new
+persisted status.** Every finding carries `FindingSeverity` (`INFO`/`WARNING`/`ERROR`); the
+top-level `AuditOverallStatus` (`NOT_FOUND`/`CONSISTENT`/`INCONSISTENT`) is `INCONSISTENT` only when
+at least one `ERROR`-severity finding exists — a `WARNING`/`INFO` finding (an in-progress job, an
+incomplete deletion, a built-but-unactivated re-index target, an unresolved cleanup obligation)
+never flips the overall result to `INCONSISTENT` on its own, matching the requirement that "not
+every incomplete job is an invalid state." A completed deletion (`DocumentDeletionJob.status ==
+COMPLETED`) suppresses the Object Storage/Qdrant checks entirely — those resources are *expected*
+to be gone by then (deletion never nulls `Document.collection_name`/`storage_key` — see "Content-hash
+release" above — so checking them post-deletion would just be permanent, misleading noise, not a
+genuine finding). A historical re-index/cleanup job whose collection no longer matches the
+platform's *current* desired configuration never drives classification either — only a `ReindexJob`
+whose `target_collection_name` still matches what the document is being judged against can produce
+`REINDEX_TARGET_BUILT_NOT_ACTIVATED`/`REINDEX_CLEANUP_PENDING`.
+
+**Bounded queries only.** One `Document` lookup, one latest-job lookup per lifecycle type
+(ingestion/deletion/re-index), one bounded cleanup-jobs lookup, one Object Storage `exists()` call,
+and at most two Qdrant calls (`get_collection_vector_size()` + `count_document_vectors()`, added to
+`VectorStore`/`QdrantVectorStore` for this subtask specifically to answer "does at least one vector
+exist for this document" via Qdrant's `/points/count` endpoint — never a similarity search, never a
+payload retrieval, never a full-collection scroll).
+
+**Deferred, not silently ignored.** `STALE_REINDEX_JOB` is not implemented: no approved stale
+threshold exists yet for `ReindexJob` (only `Settings.ingestion_stale_after_seconds` exists, and
+only for `IngestionJob`) — inventing one here would be exactly the kind of un-asked-for scope this
+subtask must avoid. Orphan object/vector discovery, storage-bucket/Qdrant-collection scanning,
+batch audit, a reconciliation worker/scheduler, and a public API (a future `GET
+/api/v1/documents/{document_id}/audit` may expose this once the result contract stabilizes) are all
+explicitly out of scope for this subtask — no repair exists yet at all.
+
 ## Streaming chat endpoint
 
 `POST /api/v1/chat` (`app/api/v1/routes/chat.py`) is the first public endpoint that produces an
