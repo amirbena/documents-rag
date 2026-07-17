@@ -1,13 +1,14 @@
-"""Backend E2E: the manual single-document re-index lifecycle, through the real HTTP boundary
-(Phase 2.8.6, subtask 6).
+"""Backend E2E: the complete manual re-index lifecycle, through the real HTTP boundary and the real
+historical-cleanup worker (Phase 2.8.6, subtasks 6 and 7 — the canonical complete lifecycle test).
 
 Same real-HTTP, real-Postgres/Qdrant, fake-AI-provider setup as
 test_successful_deletion.py/test_ingestion_retry_recovery.py (see tests/e2e/backend/conftest.py).
-Drives inspect -> schedule -> real ReindexWorker build -> inspect -> activate -> inspect entirely
-through `app_client`, never calling a service function directly except to run the existing
-out-of-band `ReindexWorker` (mirroring how `process_pending_job`/`process_pending_deletion` drive
-their respective workers in sibling E2E modules) — the cleanup worker is deliberately never run
-here, since cleanup execution is out of scope for this subtask.
+Drives inspect -> schedule -> real ReindexWorker build -> inspect -> activate -> inspect -> real
+historical cleanup entirely through `app_client` plus the existing out-of-band
+`ReindexWorker`/`process_next_vector_cleanup_job()` (mirroring how `process_pending_job`/
+`process_pending_deletion` drive their respective workers in sibling E2E modules) — cleanup
+execution is deliberately never triggered through the API itself, only through the same
+out-of-band worker function a real deployment's own scheduled runner would call.
 """
 
 import uuid
@@ -19,15 +20,36 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.services.indexing.reindex_service as reindex_service_module
 from app.core.config import get_settings
+from app.models.ingestion_job import IngestionStatus
 from app.models.vector_cleanup_job import VectorCleanupStatus
 from app.rag.embedding_config import get_active_embedding_config
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
+from app.services.indexing.cleanup_job_service import (
+    VectorCleanupWorkerOutcome,
+    process_next_vector_cleanup_job,
+)
 from app.services.indexing.reindex_worker import ReindexWorker, ReindexWorkerOutcome
 from app.storage.local_storage import LocalFileStorage
 from tests.e2e.backend.documents.deletion.support import upload_and_ingest
 from tests.e2e.backend.fakes import FakeEmbeddingProvider
 
 pytestmark = pytest.mark.e2e
+
+
+async def _upload_and_ingest_unrelated(app_client: httpx.AsyncClient, process_pending_job) -> str:
+    """Upload a second, content-distinct document and drive it to COMPLETED — distinct content
+    avoids Phase 2.8.5 upload deduplication reusing the first document's row/vectors."""
+    upload = await app_client.post(
+        "/api/v1/documents",
+        files={"file": ("unrelated.txt", b"An unrelated document's content.\n", "text/plain")},
+    )
+    assert upload.status_code == 202
+    document_id = upload.json()["document_id"]
+
+    result = await process_pending_job()
+    assert result is not None
+    assert result.status == IngestionStatus.COMPLETED
+    return document_id
 
 
 @pytest.fixture
@@ -47,19 +69,38 @@ def process_pending_reindex(
     return _process
 
 
-async def test_reindex_lifecycle_inspect_schedule_build_activate(
+@pytest.fixture
+def process_pending_cleanup(
+    e2e_session_factory: async_sessionmaker[AsyncSession],
+    isolated_test_state: None,
+):
+    """Run process_next_vector_cleanup_job() against one pending cleanup job (real Qdrant)."""
+    vector_store = QdrantVectorStore(settings=get_settings())
+
+    async def _process():
+        async with e2e_session_factory() as session:
+            return await process_next_vector_cleanup_job(session, vector_store)
+
+    return _process
+
+
+async def test_reindex_lifecycle_inspect_schedule_build_activate_cleanup(
     app_client: httpx.AsyncClient,
     process_pending_job,
     process_pending_reindex,
+    process_pending_cleanup,
     fake_embedding_provider: FakeEmbeddingProvider,
     e2e_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Document indexed in A; desired config bumped to B; inspect -> schedule -> build -> activate."""
+    """Document indexed in A; desired config bumped to B; inspect -> schedule -> build -> activate
+    -> historical cleanup. An unrelated document stays in A throughout, proving cleanup is scoped
+    to exactly one document's vectors."""
     monkeypatch.setattr(
         reindex_service_module, "get_embedding_provider", lambda settings=None: fake_embedding_provider
     )
     document_id = await upload_and_ingest(app_client, process_pending_job)
+    unrelated_document_id = await _upload_and_ingest_unrelated(app_client, process_pending_job)
 
     settings = get_settings()
     original_config = get_active_embedding_config(settings)
@@ -157,3 +198,53 @@ async def test_reindex_lifecycle_inspect_schedule_build_activate(
     assert len(cleanup_rows) == 1
     assert cleanup_rows[0].collection_name == original_config.collection_name
     assert cleanup_rows[0].status == VectorCleanupStatus.PENDING
+
+    # 7. Run the existing historical-cleanup worker -> the cleanup job succeeds.
+    cleanup_result = await process_pending_cleanup()
+    assert cleanup_result.outcome == VectorCleanupWorkerOutcome.COMPLETED
+    assert cleanup_result.collection_name == original_config.collection_name
+
+    async with e2e_session_factory() as session:
+        completed_cleanup_rows = (
+            await session.execute(
+                text("SELECT status FROM vector_cleanup_jobs WHERE document_id = :id"), {"id": document_id}
+            )
+        ).all()
+    assert len(completed_cleanup_rows) == 1
+    assert completed_cleanup_rows[0].status == VectorCleanupStatus.COMPLETED
+
+    # ReindexJob build/activation fields are untouched by cleanup.
+    reindex_state_after_cleanup = await app_client.get(f"/api/v1/documents/{document_id}/reindex")
+    assert reindex_state_after_cleanup.json()["latest_attempt"]["status"] == "completed"
+    assert reindex_state_after_cleanup.json()["latest_attempt"]["activated_at"] is not None
+
+    # Document vectors are now absent from A — only this document's vectors were removed.
+    results_in_original_after_cleanup = await vector_store.search_similar(
+        original_config.collection_name, query_vector, limit=10
+    )
+    assert all(r.document_id != document_id for r in results_in_original_after_cleanup)
+
+    # The unrelated document's vectors in A remain untouched by this document's cleanup.
+    assert any(r.document_id == unrelated_document_id for r in results_in_original_after_cleanup)
+
+    # Document vectors remain in B — cleanup never touches the active/target collection.
+    results_in_target_after_cleanup = await vector_store.search_similar(
+        target_config.collection_name, query_vector, limit=10
+    )
+    assert any(r.document_id == document_id for r in results_in_target_after_cleanup)
+
+    # Document still serves B after cleanup — cleanup never mutates serving metadata.
+    document_detail_after_cleanup = await app_client.get(f"/api/v1/documents/{document_id}")
+    assert document_detail_after_cleanup.json()["collection_name"] == target_config.collection_name
+
+    # Neither collection A nor B was deleted — only individual document vectors were removed.
+    assert await vector_store.get_collection_vector_size(original_config.collection_name) is not None
+    assert await vector_store.get_collection_vector_size(target_config.collection_name) is not None
+
+    # Object Storage remains unchanged — the original downloadable content is still intact.
+    download_after_cleanup = await app_client.get(f"/api/v1/documents/{document_id}/download")
+    assert download_after_cleanup.status_code == 200
+    unrelated_download_after_cleanup = await app_client.get(
+        f"/api/v1/documents/{unrelated_document_id}/download"
+    )
+    assert unrelated_download_after_cleanup.status_code == 200

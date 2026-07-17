@@ -1441,6 +1441,42 @@ created as part of activation must share activation's own single commit with the
 so `activate_reindexed_document()` constructs and `session.add()`s a `VectorCleanupJob` row
 directly instead.
 
+**Historical cleanup execution (`process_next_vector_cleanup_job()`, Phase 2.8.6, subtask 7).**
+`activate_reindexed_document()` creates the `VectorCleanupJob` for the vacated source collection,
+but never executes it — this is the minimal claim/execute wiring that was missing.
+`process_next_vector_cleanup_job(session, vector_store)` claims one eligible (`pending`/`failed`)
+row (`SELECT ... FOR UPDATE SKIP LOCKED`, oldest first — mirrors `reindex_worker.py`'s claim
+exactly), commits immediately to release the row lock before any Qdrant call, then delegates the
+actual delete-and-mark-terminal work entirely to the existing `retry_cleanup_job()` — no new
+cleanup state machine, no `PROCESSING` status (`VectorCleanupJob` never gained one; a claimed row's
+transaction simply commits with no status mutation, since there is no intermediate status to set).
+Processes at most one job per call — the *caller* (a script or scheduled runner) is responsible for
+looping, exactly like `ReindexWorker`/`IngestionWorker`/`DocumentDeletionWorker`. Cleanup execution
+remains asynchronous and internal — no public HTTP endpoint triggers it, and the existing re-index
+inspection/schedule/activate API (Phase 2.8.6, subtask 6) does not expose cleanup state.
+
+**Active-serving-collection safety guard.** `retry_cleanup_job()` now refuses to delete when
+`job.collection_name` equals the document's *current* `collection_name` exactly — protection
+against a stale or invalid cleanup record accidentally deleting vectors a document is still
+actively served from. A missing document (already fully deleted) never blocks cleanup, only an
+exact match against a still-existing document's active collection does — "prefer safe, idempotent
+handling over recreating lifecycle state." A blocked attempt is recorded using the *existing*
+`failed` status and a fixed internal message, never a new persisted status invented solely to
+distinguish this case. This guard, plus a defensive bounded/truncated `last_error` and a
+commit-failure rollback (mirroring `reindex_activation.py`'s exact convention — capture scalars,
+roll back, expire, re-raise, never touch an expired ORM attribute afterward), are the only changes
+made to `retry_cleanup_job()` itself.
+
+**Historical vectors remain present until cleanup succeeds, and cleanup never touches the target
+collection or retires anything.** After activation, a document's old vectors in the vacated source
+collection stay live and searchable for an indeterminate window — cleanup is asynchronous, not
+part of activation. Cleanup deletes only this one document's vectors from the one collection its
+`VectorCleanupJob` names; it never deletes the whole collection, never clears it, and never invokes
+full document deletion (`delete_all_tracked_document_vectors()`) — those remain entirely separate
+operations reserved for lifecycle-level document deletion. Collection-wide retirement
+(`collection_registry.retire_collection()`) is unrelated to and untouched by this cleanup path.
+Stale-`PROCESSING` recovery does not apply here (there is no `PROCESSING` status to recover from).
+
 **Two separate vector-deletion operations, deliberately not one.**
 `delete_current_document_vectors(document, vector_store)` targets only the document's
 currently-tracked collection (`document.collection_name`) — it never consults
