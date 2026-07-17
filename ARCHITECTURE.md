@@ -1344,11 +1344,71 @@ proceeds only after the first commits, then observes `activated_at` already set 
 `ix_reindex_jobs_one_active_per_document` (a multi-row insert race) because activation contention
 is always over one already-existing row.
 
-**Out of scope for this subtask (all remain future work):** no public HTTP API is exposed for
-activation; no batch/campaign orchestration across multiple documents or jobs; no collection
-retirement; no automatic write-freeze or process-restart coordination around a cutover (that
-remains an external operational concern); no automated end-to-end migration workflow — build,
-schedule, and activate remain three separately-invoked operations, not one automated pipeline.
+**Out of scope for this subtask (all remain future work):** no batch/campaign orchestration across
+multiple documents or jobs; no collection retirement; no automatic write-freeze or process-restart
+coordination around a cutover (that remains an external operational concern); no automated
+end-to-end migration workflow — build, schedule, and activate remain three separately-invoked
+operations, not one automated pipeline. A single-document HTTP API for this lifecycle was added in
+subtask 6 — see "Single-document re-index API" below.
+
+### Single-document re-index API (`app/api/v1/routes/reindex.py`, Phase 2.8.6, subtask 6)
+
+**A thin HTTP boundary over the lifecycle above — inspect, schedule, activate, nothing more.**
+Three endpoints, all under `/api/v1/documents/{document_id}/reindex`:
+
+- `GET .../reindex` — read-only inspection. Delegates entirely to
+  `app.services.indexing.reindex_inspection_service.inspect_document_reindex_state()`, which
+  derives `is_stale` from the existing `collection_registry.is_document_stale()` primitive (never
+  a new comparison), reports the document's `active_index` (read straight off `Document`'s own
+  persisted columns) alongside the platform's current `desired_index` (from
+  `get_active_embedding_config()` — the one legitimate live-`Settings` read anywhere in this
+  service), the document's `latest_job` (if any, unconditionally — even one that targeted a
+  now-superseded configuration, purely for operator visibility), and a derived
+  `ReindexLifecycleState` (`not_indexed`/`up_to_date`/`stale`/`reindex_pending`/
+  `reindex_processing`/`target_built`/`activated`/`failed`/`deletion_blocked` — purely derived,
+  never a new persisted `ReindexJob` status; see CLAUDE.md's High-Risk Invariants). A historical job
+  only drives this derived state when its `target_collection_name` still matches the *current*
+  desired collection — an old, already-activated job for an abandoned configuration can never keep
+  reporting `activated` forever once the desired configuration has moved on again. 404 only when
+  the document itself doesn't exist.
+- `POST .../reindex` — schedules one append-only attempt. Delegates entirely to the existing
+  `reindex_scheduling_service.schedule_reindex()`; the route only loads the `Document` (via a
+  service-owned `get_document()` lookup, never a raw `session.get()` in the route itself — see
+  CLAUDE.md's Route Layer Style) and maps `schedule_reindex()`'s outcome enum to a status code via a
+  lookup table, exactly like `_RETRY_OUTCOME_ERRORS` in `documents.py`. 202 (`created=true`) for a
+  newly-inserted `PENDING` job; 200 (`created=false`) for an already-active job returned unchanged;
+  404 if the document doesn't exist; 409 for every other blocking outcome
+  (`INELIGIBLE_NEVER_INDEXED`/`ALREADY_CURRENT`/`INGESTION_ACTIVE`/`DELETION_ACTIVE`/
+  `DELETION_INCOMPLETE`/`DOCUMENT_DELETED`). Never builds inline — the `PENDING` row is picked up by
+  the existing out-of-band `ReindexWorker`, run separately (a script/process, not this request).
+- `POST .../reindex/activate` — activates one completed attempt. Delegates entirely to
+  `reindex_activation.activate_reindexed_document()`. Accepts an optional `?job_id=` query
+  parameter; when omitted, resolves to the document's latest attempt. When `job_id` *is* supplied,
+  the route first confirms that job actually belongs to `document_id` in the URL (a plain
+  resource-ownership check, not a re-derivation of activation's own precondition chain) — without
+  it, a caller could pass a `job_id` belonging to a different document and silently activate that
+  document instead of the one named in the path. 200 for both a fresh activation and an idempotent
+  already-activated call (`already_activated` in the response body distinguishes the two); 404 if
+  no matching job can be found; 409 for `NOT_READY`/`SOURCE_CHANGED`/`BLOCKED_BY_DELETION`. Never
+  executes the `VectorCleanupJob` activation creates — that remains a separate, out-of-band
+  operation, exactly as in the service layer itself.
+
+**`can_schedule`/`can_activate` on the inspection response are best-effort hints, not guarantees.**
+Reproducing every precondition `schedule_reindex()`/`activate_reindexed_document()` actually
+enforce inside the read path (active-ingestion checks, a row-locked re-validation of source
+staleness) would duplicate business logic this subtask's spec explicitly forbids. Both flags do
+account for the document's blocking deletion status (that lookup is already required to derive
+`deletion_blocked` state, so reusing it is free), but the `POST` endpoints remain the sole authority
+on whether a given call actually succeeds — either can still return `409` for a condition the read
+path did not attempt to predict, most plausibly a concurrent change between the `GET` and the
+following `POST`.
+
+**Bounded batch eligibility listing was deferred, not built.** The original Phase 2.8.6 roadmap
+mentioned a bounded-eligibility read operation (`list_reindex_eligible_documents()`); this subtask
+has no current consumer for it (no frontend, no operational script), so per its own spec ("If no
+current consumer requires this operation, document it as deferred rather than creating unused API
+surface") it was not implemented — a future subtask should add it once a real consumer exists,
+reusing `is_document_stale()`/`get_active_reindex_job()` rather than a new comparison.
 
 ### Zero-chunk behavior
 
