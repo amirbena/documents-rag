@@ -1,4 +1,5 @@
-"""Single-document re-index inspection/schedule/activate endpoints (Phase 2.8.6, subtask 6).
+"""Single-document re-index inspection/schedule/activate endpoints (Phase 2.8.6, subtask 6), plus
+a job-id-scoped operator activation endpoint (Phase 2.8.7, subtask 4).
 
 Thin HTTP boundary over the already-implemented re-index lifecycle: inspection
 (`reindex_inspection_service.inspect_document_reindex_state`), scheduling
@@ -6,11 +7,12 @@ Thin HTTP boundary over the already-implemented re-index lifecycle: inspection
 (`reindex_activation.activate_reindexed_document`). This module never builds a target, writes a
 Qdrant vector, reads/writes object storage, or executes cleanup — `POST .../reindex` only ever
 inserts a PENDING `ReindexJob` row (picked up separately by `ReindexWorker`, run out-of-band, never
-inline in this request), and `POST .../reindex/activate` only ever performs the metadata cutover
-already implemented by `activate_reindexed_document()`. All business/lifecycle-derivation/
-staleness-comparison/locking logic lives in the service modules — routes here only
-parse/inject/call/copy-status, per CLAUDE.md's "Route Layer Style" (same convention as
-`app/api/v1/routes/documents.py`).
+inline in this request), and both `POST .../reindex/activate` and
+`POST /reindex/jobs/{job_id}/activate` only ever perform the metadata cutover already implemented
+by `activate_reindexed_document()` — a single shared service call, never duplicated eligibility
+logic. All business/lifecycle-derivation/staleness-comparison/locking logic lives in the service
+modules — routes here only parse/inject/call/copy-status, per CLAUDE.md's "Route Layer Style"
+(same convention as `app/api/v1/routes/documents.py`).
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -26,6 +28,7 @@ from app.schemas.reindex import (
     IndexConfigSnapshotResponse,
     ReindexActivateResponse,
     ReindexAttemptResponse,
+    ReindexJobActivationResponse,
     ReindexScheduleResponse,
     ReindexStateResponse,
 )
@@ -249,4 +252,46 @@ async def activate_document_reindex_route(
         status=result.job.status,
         activated_at=result.job.activated_at,
         already_activated=result.outcome == ReindexActivationOutcome.ALREADY_ACTIVATED,
+    )
+
+
+@router.post("/reindex/jobs/{job_id}/activate", response_model=ReindexJobActivationResponse)
+async def activate_reindex_job_route(
+    job_id: str,
+    response: Response,
+    db: AsyncSession = Depends(get_db_session),
+) -> ReindexJobActivationResponse:
+    """Explicit, job-id-scoped operator activation (Phase 2.8.7, subtask 4).
+
+    The same cutover as `POST .../documents/{document_id}/reindex/activate`, without requiring the
+    caller to already know the document id — everything needed is resolved from `job_id` alone by
+    `activate_reindexed_document()` itself. Delegates to that same service function exactly once;
+    see its own docstring for the full deterministic precondition order (job existence ->
+    already-activated -> build completion -> document existence -> deletion blocking -> source
+    staleness -> target existence). 200 for both a fresh activation and an idempotent
+    already-activated repeat call (see `already_activated`); 404 if the job does not exist; 409 for
+    every other blocking condition (see `_ACTIVATION_OUTCOME_ERRORS`, shared with the sibling
+    document-scoped route above — no duplicated outcome-to-status mapping). Never builds a target,
+    waits for a pending/processing job, or executes the vector cleanup it creates — the
+    `VectorCleanupJob` activation creates is picked up by the existing cleanup machinery
+    separately, out-of-band.
+    """
+    result = await activate_reindexed_document(db, job_id)
+
+    if result.outcome in _ACTIVATION_OUTCOME_ERRORS:
+        status_code, detail = _ACTIVATION_OUTCOME_ERRORS[result.outcome]
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    assert result.job is not None
+    assert result.job.activated_at is not None
+    response.status_code = status.HTTP_200_OK
+    return ReindexJobActivationResponse(
+        job_id=result.job.id,
+        document_id=result.job.document_id,
+        status=result.job.status,
+        activated=True,
+        already_activated=result.outcome == ReindexActivationOutcome.ALREADY_ACTIVATED,
+        activated_at=result.job.activated_at,
+        previous_collection_name=result.job.source_collection_name,
+        active_collection_name=result.job.target_collection_name,
     )

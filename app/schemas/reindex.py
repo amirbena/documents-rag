@@ -128,3 +128,28 @@ class ReindexActivateResponse(BaseModel):
     status: ReindexJobStatus
     activated_at: datetime
     already_activated: bool
+
+
+class ReindexJobActivationResponse(BaseModel):
+    """Shape returned by POST /api/v1/reindex/jobs/{job_id}/activate (Phase 2.8.7, subtask 4).
+
+    Job-id-scoped counterpart to `ReindexActivateResponse` — an explicit operator action that
+    resolves everything it needs from `job_id` alone, without requiring the caller to already know
+    the document id. `activated=True` for both a fresh activation and an idempotent
+    already-activated repeat call (`already_activated` distinguishes the two); both return 200.
+    `previous_collection_name`/`active_collection_name` are the job's own pinned
+    `source_collection_name`/`target_collection_name` — never recomputed, always read directly off
+    the `ReindexJob` row. This endpoint never executes the `VectorCleanupJob` activation creates —
+    it remains a separate, out-of-band operation, exactly like the sibling endpoint. It does not
+    report a cleanup-job identifier — `activate_reindexed_document()`'s existing result type is
+    reused entirely unchanged, so this endpoint requires no service modification.
+    """
+
+    job_id: str
+    document_id: str
+    status: ReindexJobStatus
+    activated: bool
+    already_activated: bool
+    activated_at: datetime
+    previous_collection_name: str
+    active_collection_name: str

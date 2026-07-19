@@ -425,10 +425,10 @@ resurrected once deletion has begun.
 
 ### Re-index scheduling and activation
 
-Manual, operator-triggered re-indexing of an already-ingested document under the platform's
-current active embedding/chunking configuration — see "Single-document re-index API" in
+See "Single-document re-index API" and "Job-id-scoped operator activation endpoint" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full precondition chains, locking behavior, and
-rollback guarantees.
+rollback guarantees. Every re-index endpoint is manual/operator-triggered — there is no automatic
+activation after a build completes, no scheduler, and no activation-history persistence.
 
 ```bash
 # Inspect staleness + the latest attempt (404 if the document doesn't exist).
@@ -439,9 +439,14 @@ curl "http://localhost:8000/api/v1/documents/<document_id>/reindex"
 # band).
 curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex"
 
-# Activate a completed build — defaults to the document's latest attempt; accepts an optional
-# ?job_id= to target a specific one:
+# Activate a completed build — document-scoped: resolves the relevant job through the document
+# (defaults to the document's latest attempt; accepts an optional ?job_id= to target a specific
+# one):
 curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex/activate"
+
+# Activate a completed build — job-scoped: targets one explicit re-index job directly by id, so
+# the caller doesn't need to already know the owning document:
+curl -X POST "http://localhost:8000/api/v1/reindex/jobs/<job_id>/activate"
 ```
 
 `POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — the existing out-of-band
@@ -450,25 +455,32 @@ writes the target's vectors into a new collection but **never switches which col
 document serves from** — the running process keeps serving the document's current collection
 untouched, for as long as the operator wants, until an explicit activation call.
 
-`POST .../reindex/activate` performs one atomic, `SELECT ... FOR UPDATE`-locked transaction that
-switches the document's serving collection/embedding/chunking metadata, sets `activated_at`, and
-persists a `VectorCleanupJob` for the vacated collection — in the same commit. A failure anywhere
-in that transaction rolls back entirely; the document is never left pointing at a new collection
-unless `activated_at` was actually persisted. Calling activation again on an already-activated job
-is idempotent — `200` with `already_activated: true` in the response, no second switch, no second
-`activated_at`, no duplicate cleanup job. Activation never executes the `VectorCleanupJob` it
-creates inline — that remains a separate, out-of-band operation. `process_next_vector_cleanup_job()`
-claims one pending/failed cleanup job at a time (oldest first), refuses to delete a collection that
-is still the document's *current* active collection (a defensive safety guard), and marks the job
-`COMPLETED`/`FAILED` on completion; processing more than one job per call, and looping, is left to
-whatever caller invokes it — there is no dedicated Makefile target or script for this yet in this
-codebase (unlike full document deletion's `make process-pending-document-deletions`). The vacated
-collection's vectors remain in place — readable, unused — until that cleanup step actually runs.
+Both activation endpoints delegate to the exact same `activate_reindexed_document()` service call
+— one atomic, `SELECT ... FOR UPDATE`-locked transaction that switches the document's serving
+collection/embedding/chunking metadata, sets `activated_at`, and persists a `VectorCleanupJob` for
+the vacated collection — in the same commit. A failure anywhere in that transaction rolls back
+entirely; the document is never left pointing at a new collection unless `activated_at` was
+actually persisted. Calling activation again on an already-activated job is idempotent — `200`
+with `already_activated: true` in the response, no second switch, no second `activated_at`, no
+duplicate cleanup job; 404 if the job/document can't be found; 409 if the job isn't `COMPLETED`,
+its source collection changed since scheduling, or the document has a blocking deletion in
+progress. Activation never executes the `VectorCleanupJob` it creates inline — that remains a
+separate, out-of-band operation. `process_next_vector_cleanup_job()` claims one pending/failed
+cleanup job at a time (oldest first), refuses to delete a collection that is still the document's
+*current* active collection (a defensive safety guard), and marks the job `COMPLETED`/`FAILED` on
+completion; processing more than one job per call, and looping, is left to whatever caller invokes
+it — there is no dedicated Makefile target or script for this yet in this codebase (unlike full
+document deletion's `make process-pending-document-deletions`). The vacated collection's vectors
+remain in place — readable, unused — until that cleanup step actually runs.
+
+**Document-scoped vs. job-scoped activation:** the document-scoped route resolves which
+`ReindexJob` to activate *through the document* (its latest attempt, or an explicit `?job_id=`
+belonging to that document); the job-scoped route targets one explicit re-index job directly by
+`job_id` alone, without requiring the caller to already know the owning document — useful when an
+operator already has a job id (e.g. from the schedule response) and wants to activate it directly.
 
 **Explicitly not included in this API surface:**
 - no automatic activation — a build completing never activates itself
-- no job-id-scoped activation endpoint yet (`?job_id=` on the document-scoped route above is the
-  only way to target a specific attempt)
 - no reconciliation/audit API of any kind
 - no scheduler or cron loop — the worker and cleanup processor are both invoked out-of-band,
   manually or via an external scheduler you control
