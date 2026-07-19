@@ -343,8 +343,9 @@ written before this feature remain readable.
 Five read-only endpoints let you inspect a document's lifecycle and download its original
 content — see "Document read APIs and original download (Phase 2.8.2)" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for full contract details, the lifecycle-status derivation
-table, and the 404/409/503 mapping rationale. None of them mutate anything (no delete/re-index/
-reconciliation endpoint exists yet — retry is a separate, mutating endpoint, see below).
+table, and the 404/409/503 mapping rationale. None of them mutate anything (delete/re-index are
+separate, mutating endpoints, see below; the read-only batch reconciliation endpoint is documented
+further down).
 
 ```bash
 # List (paginated, newest first)
@@ -870,6 +871,46 @@ An `error` event ends the stream — no `done` event follows it. The route does 
 full answer: each `OrchestratorToken` is written to the response as soon as the engine yields it,
 so `curl -N` (no-buffer mode, shown above) prints tokens as they arrive rather than all at once at
 the end. This event shape is identical regardless of which `RagEngine` produced it.
+
+### Batch document lifecycle audit (read-only)
+
+`GET /api/v1/reconciliation/documents/audit` (`app/api/v1/routes/reconciliation.py`) is a
+read-only diagnostic endpoint over the existing bounded batch auditor — see "Reconciliation:
+bounded batch lifecycle audit" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full contract. It
+never mutates anything; there is no repair, scheduler, CLI, or persisted audit history yet.
+
+```bash
+curl "http://localhost:8000/api/v1/reconciliation/documents/audit?limit=20"
+```
+
+Query parameters: `limit` (optional, 1-50, default 20 — out-of-range values are rejected with
+`422`) and `cursor` (optional, opaque — pass back the previous page's `next_cursor` verbatim to
+continue; a malformed cursor is rejected with `400`). Response:
+
+```json
+{
+  "items": [
+    {
+      "document_id": "...",
+      "original_filename": "report.pdf",
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "overall_status": "consistent",
+      "classification": "warning",
+      "issues": [{"code": "...", "severity": "warning", "summary": "...", "...": "..."}]
+    }
+  ],
+  "summary": {
+    "total": 20, "consistent": 15, "transitional": 2, "warning": 2,
+    "inconsistent": 1, "not_found": 0, "dependency_unavailable": 0,
+    "finding_counts": {"stale_ingestion_job": 1}
+  },
+  "limit": 20,
+  "next_cursor": "opaque-cursor-or-null"
+}
+```
+
+Documents are always returned oldest-first (deterministic keyset pagination); an empty repository
+returns `200` with empty `items`/zeroed `summary`/`next_cursor: null`, never `404`.
 
 ## Verification
 

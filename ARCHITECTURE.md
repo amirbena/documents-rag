@@ -1710,10 +1710,100 @@ payload retrieval, never a full-collection scroll).
 **Deferred, not silently ignored.** `STALE_REINDEX_JOB` is not implemented: no approved stale
 threshold exists yet for `ReindexJob` (only `Settings.ingestion_stale_after_seconds` exists, and
 only for `IngestionJob`) — inventing one here would be exactly the kind of un-asked-for scope this
-subtask must avoid. Orphan object/vector discovery, storage-bucket/Qdrant-collection scanning,
-batch audit, a reconciliation worker/scheduler, and a public API (a future `GET
+subtask must avoid. Orphan object/vector discovery, storage-bucket/Qdrant-collection scanning, a
+reconciliation worker/scheduler, and a public API (a future `GET
 /api/v1/documents/{document_id}/audit` may expose this once the result contract stabilizes) are all
 explicitly out of scope for this subtask — no repair exists yet at all.
+
+## Reconciliation: bounded batch lifecycle audit (`app/services/reconciliation/`, Phase 2.8.7, subtask 2)
+
+**A bounded page of documents, audited with the exact same auditor, one at a time.**
+`audit_document_lifecycle_batch(session, settings, file_storage, vector_store, *, limit=20,
+cursor=None)` (`app/services/reconciliation/document_audit_batch_service.py`) selects a
+deterministic bounded page of `Document` rows and calls `audit_document_lifecycle()` — unchanged,
+exactly once per selected document — reusing its entire result contract
+(`DocumentLifecycleAuditResult`/`DocumentLifecycleFinding`/`DocumentLifecycleFindingCode`/
+`AuditOverallStatus`/`FindingSeverity`) without adding a second finding taxonomy.
+
+**Sequential, not concurrent, by necessity.** `audit_document_lifecycle()` takes one `AsyncSession`;
+that same session is shared across every document audited in a batch run, and concurrent use of a
+single `AsyncSession` is unsafe. Documents are therefore audited one at a time, in ascending page
+order — a bounded N+1 query pattern accepted because `limit` is capped at 50 and this is an
+on-demand diagnostic operation, not a hot request path.
+
+**Keyset pagination, not offset.** Pages are selected via `Document.created_at ASC, Document.id
+ASC` with a `WHERE (created_at, id) > (:cursor_created_at, :cursor_id)` keyset predicate and a
+`limit + 1` lookahead row to compute `has_more` without a separate `COUNT(*)`. This is a distinct
+query from `app.services.documents.query_service.list_documents()` (offset-paginated,
+`created_at DESC`) — the two are not unified, since the batch audit's forward, oldest-first sweep
+and the document-list API's newest-first browsing serve different purposes. The continuation
+cursor (`encode_audit_cursor()`/`decode_audit_cursor()`) is a URL-safe Base64-encoded JSON payload
+of `{created_at, id}` — not a security boundary, no encryption or signing — that fails closed via
+`InvalidAuditCursorError` on any malformed input rather than silently restarting at page one.
+
+**Aggregation derives from existing severity/status, not a new persisted state.** Each audited
+document lands in exactly one bucket: `not_found_count` (NOT_FOUND), `inconsistent_count`
+(INCONSISTENT), `consistent_count` (CONSISTENT with no findings), `transitional_count` (CONSISTENT,
+all findings INFO), or `warning_count` (CONSISTENT, at least one WARNING finding) — `ERROR`-severity
+findings always accompany `INCONSISTENT` in the single-document auditor's own contract, so no
+separate ERROR-with-CONSISTENT case exists to adjudicate. `finding_counts` tallies every
+`DocumentLifecycleFindingCode` occurrence across the page; `dependency_unavailable_count` counts
+*documents* containing at least one `STORAGE_INSPECTION_UNAVAILABLE`/`VECTOR_INSPECTION_UNAVAILABLE`
+finding, not the findings themselves — a document can contribute to both this and `warning_count`.
+
+**Read-only; unexpected failures propagate.** No `session.add()`/`.delete()`/`.commit()`, no
+lifecycle-row mutation, no repair/retry/re-index/cleanup triggered. Expected Object
+Storage/Qdrant inspection failures are already handled by the single-document auditor's own
+`*_INSPECTION_UNAVAILABLE` findings; malformed cursors and invalid `limit` values fail through
+`InvalidAuditCursorError`/`InvalidAuditBatchLimitError` before any document is audited. Any other
+exception raised while auditing a document is never folded into a finding — it propagates, since an
+unexpected exception is not proof that the audited document is inconsistent.
+
+**Deferred, not silently ignored.** No public/admin endpoint, CLI, scheduler, background worker, or
+dashboard is added — this subtask produces an internal service and typed result contract only, for
+a future consumer to build on once the result shape is reviewed. No audit run is persisted; no
+repair, retry, or orphan discovery is implemented. Object Storage bucket scanning and Qdrant
+collection-wide scanning remain out of scope, exactly as in subtask 1 — only documents already
+selected from PostgreSQL are ever inspected.
+
+## Reconciliation: batch lifecycle audit API (`app/api/v1/routes/reconciliation.py`, Phase 2.8.7, subtask 3)
+
+**One read-only GET endpoint, no new audit logic.** `GET /api/v1/reconciliation/documents/audit`
+is a thin route over `audit_document_lifecycle_batch()` — it parses/validates query parameters,
+injects `AsyncSession`/`FileStorage`/`VectorStore` the same way every other route does (local
+`get_file_storage()`/`get_vector_store()` wrappers, `get_settings()` called directly, never
+`Depends`), calls the batch service exactly once, and maps its result into
+`app/schemas/reconciliation.py`'s typed response models. It never audits a document itself, never
+mutates a `Document`/job row, and never recalculates a classification or summary count — every
+value in the response traces directly to a field the service already computed.
+
+**One service addition, made for this subtask: `DocumentAuditClassification`.** Before this
+subtask, `DocumentAuditSummary` carried only `overall_status`/`findings` — enough for the batch
+service's own aggregate counts, but not enough for a per-document API field without recomputing
+the same bucket logic in the router (exactly the duplication CLAUDE.md's route-layer rule
+forbids). `document_audit_batch_service.py` now derives both the per-document `classification`
+field and the aggregate `*_count` fields from one shared `_classify()` function, so the two can
+never drift, and also stamps `created_at` onto `DocumentAuditSummary` (trivial — it was already
+fetched in the page query) since the API item needs it. Both are additive: existing unit/
+integration tests for the batch service needed no changes, and `audit_document_lifecycle_batch()`'s
+signature, cursor format, and pagination behavior are all unchanged.
+
+**Validation and error mapping.** `limit` is validated twice, deliberately: FastAPI's
+`Query(ge=MIN_BATCH_LIMIT, le=MAX_BATCH_LIMIT)` rejects most out-of-range values with a `422`
+before the service ever runs (mirroring `documents.py`'s own list-route precedent), and the
+service's own `InvalidAuditBatchLimitError` is still caught and mapped to `400` as defense in depth
+— the service remains the authoritative validator either way. `cursor` is opaque at the API layer:
+no format is validated in the route; `InvalidAuditCursorError` maps to a fixed `400` detail message
+("The cursor is invalid or has expired.") that never repeats the service's own
+Base64/JSON-specific error text, so no cursor implementation detail leaks through the HTTP
+boundary. Any other exception (an unexpected service/database failure) is left to propagate as a
+normal `500` — never silently downgraded to a partial 200.
+
+**Read-only guarantee, same as the service.** An empty repository returns `200` with empty
+`items`, zeroed `summary` counts, and `next_cursor: null` — never `404`. No audit run is persisted;
+no repair, activation, cleanup, or scheduling endpoint exists. Pagination is exclusively the
+service's existing opaque keyset cursor — this subtask adds no new pagination mechanism, and no
+offset-based alternative.
 
 ## Streaming chat endpoint
 
