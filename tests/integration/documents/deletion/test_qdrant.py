@@ -1,9 +1,12 @@
-"""Real-Qdrant integration tests for DocumentDeletionWorker's vector cleanup step.
+"""Real-Qdrant integration tests for DocumentDeletionWorker's vector cleanup step, plus
+delete_all_tracked_document_vectors()'s completed-re-index-target ownership (Phase 2.8.6,
+subtask 3).
 
 Proves delete_all_tracked_document_vectors() is genuinely called (active collection + every
-distinct historical pending/failed VectorCleanupJob collection), that unrelated documents' vectors
-are never touched, that repeated deletion is idempotent, and that a genuine per-collection failure
-blocks storage cleanup — against a real, ephemeral Qdrant container, not a mocked httpx transport.
+distinct historical pending/failed VectorCleanupJob collection + every distinct COMPLETED
+ReindexJob target collection), that unrelated documents' vectors are never touched, that repeated
+deletion is idempotent, and that a genuine per-collection failure blocks storage cleanup —
+against a real, ephemeral Qdrant container, not a mocked httpx transport.
 """
 
 import uuid
@@ -13,13 +16,16 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.config import get_settings
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.index_collection import IndexCollection
+from app.models.reindex_job import ReindexJob, ReindexJobStatus
 from app.models.vector_cleanup_job import VectorCleanupJob, VectorCleanupStatus
 from app.rag.providers.qdrant_vector_store import QdrantVectorStore
 from app.rag.providers.vector_store import VectorPoint
 from app.services.documents.deletion_worker import DocumentDeletionWorker
+from app.services.indexing.vector_deletion_service import delete_all_tracked_document_vectors
 
 _VECTOR_SIZE = 4
 
@@ -61,8 +67,8 @@ async def _clean_tables(migrated_schema: None, postgres_url: str) -> AsyncIterat
         async with session_factory() as session:
             await session.execute(
                 text(
-                    "TRUNCATE TABLE document_deletion_jobs, vector_cleanup_jobs, ingestion_jobs, "
-                    "documents, index_collections RESTART IDENTITY CASCADE"
+                    "TRUNCATE TABLE document_deletion_jobs, vector_cleanup_jobs, reindex_jobs, "
+                    "ingestion_jobs, documents, index_collections RESTART IDENTITY CASCADE"
                 )
             )
             await session.commit()
@@ -289,3 +295,91 @@ async def test_worker_partial_collection_failure_blocks_storage_and_is_reported(
     assert result.status == DocumentDeletionStatus.PARTIALLY_FAILED
     assert result.vector_cleanup_completed is False
     assert result.storage_cleanup_completed is False
+
+
+async def test_full_deletion_cleans_a_completed_reindex_target_collection_against_real_qdrant(
+    migrated_schema: None, qdrant_url: str, integration_db_session: AsyncSession
+) -> None:
+    """delete_all_tracked_document_vectors() must clean a completed build-ahead re-index target
+    collection too — not just the document's serving collection — while leaving an unrelated
+    document's vectors in both collections untouched, against real Qdrant (Phase 2.8.6, subtask 3).
+    """
+    settings = get_settings()
+    vector_store = QdrantVectorStore(settings=settings)
+
+    serving_collection = f"serving-{uuid.uuid4().hex}"
+    target_collection = f"target-{uuid.uuid4().hex}"
+
+    target_document = Document(
+        id=str(uuid.uuid4()),
+        original_filename="target.txt",
+        stored_filename=f"{uuid.uuid4().hex}.txt",
+        content_type="text/plain",
+        file_size=5,
+        stored_path="target.txt",
+        storage_provider="local",
+        storage_key="target.txt",
+        collection_name=serving_collection,
+    )
+    unrelated_document = Document(
+        id=str(uuid.uuid4()),
+        original_filename="unrelated.txt",
+        stored_filename=f"{uuid.uuid4().hex}.txt",
+        content_type="text/plain",
+        file_size=5,
+        stored_path="unrelated.txt",
+        storage_provider="local",
+        storage_key="unrelated.txt",
+        collection_name=serving_collection,
+    )
+    integration_db_session.add(_index_collection(serving_collection))
+    integration_db_session.add(_index_collection(target_collection))
+    await integration_db_session.commit()
+
+    integration_db_session.add(target_document)
+    integration_db_session.add(unrelated_document)
+    await integration_db_session.commit()
+
+    integration_db_session.add(
+        ReindexJob(
+            id=str(uuid.uuid4()),
+            document_id=target_document.id,
+            target_collection_name=target_collection,
+            target_chunk_size=500,
+            target_chunk_overlap=50,
+            status=ReindexJobStatus.COMPLETED,
+        )
+    )
+    await integration_db_session.commit()
+
+    for collection in (serving_collection, target_collection):
+        await vector_store.create_collection_if_not_exists(collection, _VECTOR_SIZE)
+
+    # Document.collection_name still points at `serving_collection` — the document has not been
+    # activated onto `target_collection` yet, even though its build already succeeded.
+    await vector_store.upsert_vectors(serving_collection, [_point(target_document.id)])
+    await vector_store.upsert_vectors(serving_collection, [_point(unrelated_document.id)])
+    await vector_store.upsert_vectors(target_collection, [_point(target_document.id)])
+    await vector_store.upsert_vectors(target_collection, [_point(unrelated_document.id)])
+
+    result = await delete_all_tracked_document_vectors(
+        target_document, vector_store, integration_db_session
+    )
+
+    assert set(result.attempted_collections) == {serving_collection, target_collection}
+    assert result.fully_deleted is True
+
+    query_vector = [0.1, 0.2, 0.3, 0.4]
+    remaining_serving = await vector_store.search_similar(serving_collection, query_vector, limit=10)
+    assert all(point.document_id != target_document.id for point in remaining_serving)
+    assert any(point.document_id == unrelated_document.id for point in remaining_serving)
+
+    remaining_target = await vector_store.search_similar(target_collection, query_vector, limit=10)
+    assert all(point.document_id != target_document.id for point in remaining_target)
+    assert any(point.document_id == unrelated_document.id for point in remaining_target)
+
+    # Repeated deletion remains idempotent — already-empty collections, no error.
+    second_result = await delete_all_tracked_document_vectors(
+        target_document, vector_store, integration_db_session
+    )
+    assert second_result.fully_deleted is True

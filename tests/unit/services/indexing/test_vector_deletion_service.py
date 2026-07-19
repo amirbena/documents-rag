@@ -3,13 +3,15 @@ cleanup, no real database/Qdrant.
 """
 
 import inspect
+import uuid
 
+from app.models.reindex_job import ReindexJobStatus
 from app.services.indexing.cleanup_job_service import create_cleanup_job
 from app.services.indexing.vector_deletion_service import (
     delete_all_tracked_document_vectors,
     delete_current_document_vectors,
 )
-from tests.support.indexing.builders import build_document
+from tests.support.indexing.builders import build_document, build_reindex_job
 from tests.support.indexing.fakes import FakeIndexSession, FakeVectorStore
 
 
@@ -177,3 +179,189 @@ async def test_delete_all_tracked_document_vectors_retries_all_collections_after
     # The active collection (which already succeeded the first time) was attempted again too.
     assert vector_store.deleted.count(("current-collection", document.id)) == 2
     assert vector_store.deleted.count(("legacy-collection-1", document.id)) == 1
+
+
+async def test_delete_all_tracked_document_vectors_includes_a_pending_cleanup_collection() -> None:
+    """A PENDING (never-yet-attempted) cleanup job's collection must also be attempted."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="current-collection")
+    await create_cleanup_job(session, document.id, "legacy-collection-1")  # no error -> PENDING
+
+    result = await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert "legacy-collection-1" in result.attempted_collections
+
+
+# --- completed re-index targets (Phase 2.8.6, subtask 3) -----------------------------------------
+
+
+async def test_delete_all_tracked_document_vectors_includes_a_completed_reindex_target() -> None:
+    """A COMPLETED re-index job's target collection must be attempted, even though
+    Document.collection_name still points at the (different) serving collection."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+    vector_store = FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert set(result.attempted_collections) == {"serving-collection", "target-b"}
+    assert ("target-b", document.id) in vector_store.deleted
+
+
+async def test_delete_all_tracked_document_vectors_excludes_a_pending_reindex_target() -> None:
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.PENDING, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    result = await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert "target-b" not in result.attempted_collections
+
+
+async def test_delete_all_tracked_document_vectors_excludes_a_processing_reindex_target() -> None:
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.PROCESSING, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    result = await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert "target-b" not in result.attempted_collections
+
+
+async def test_delete_all_tracked_document_vectors_excludes_a_failed_reindex_target() -> None:
+    """A FAILED re-index job never proves a complete target vector set exists — must be excluded."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.FAILED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    result = await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert "target-b" not in result.attempted_collections
+
+
+async def test_completed_reindex_target_equal_to_current_collection_is_deduplicated() -> None:
+    """After activation, Document.collection_name may equal a completed job's own target — one attempt."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="target-b")
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+    vector_store = FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert result.attempted_collections == ("target-b",)
+    assert vector_store.deleted.count(("target-b", document.id)) == 1
+
+
+async def test_completed_reindex_target_equal_to_cleanup_job_collection_is_deduplicated() -> None:
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    await create_cleanup_job(session, document.id, "legacy-a", error="boom")
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="legacy-a")
+    session.reindex_jobs[job.id] = job
+    vector_store = FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert result.attempted_collections.count("legacy-a") == 1
+    assert vector_store.deleted.count(("legacy-a", document.id)) == 1
+
+
+async def test_multiple_completed_reindex_targets_are_all_attempted() -> None:
+    """A -> B completed, B -> C completed: both B and C must be attempted, not just the latest."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="collection-a")
+    job_b = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="collection-b")
+    job_c = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="collection-c")
+    session.reindex_jobs[job_b.id] = job_b
+    session.reindex_jobs[job_c.id] = job_c
+    vector_store = FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert set(result.attempted_collections) == {"collection-a", "collection-b", "collection-c"}
+
+
+async def test_duplicate_historical_completed_targets_result_in_one_attempt_per_collection() -> None:
+    """Two separate COMPLETED jobs both targeting the same collection must be attempted once."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="collection-a")
+    job_1 = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="collection-b")
+    job_2 = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="collection-b")
+    session.reindex_jobs[job_1.id] = job_1
+    session.reindex_jobs[job_2.id] = job_2
+    vector_store = FakeVectorStore()
+
+    result = await delete_all_tracked_document_vectors(document, vector_store, session)
+
+    assert result.attempted_collections.count("collection-b") == 1
+    assert vector_store.deleted.count(("collection-b", document.id)) == 1
+
+
+async def test_completed_reindex_target_from_an_unrelated_document_is_excluded() -> None:
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    other_document_id = str(uuid.uuid4())
+    job = build_reindex_job(other_document_id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    result = await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert "target-b" not in result.attempted_collections
+
+
+async def test_full_deletion_never_touches_object_storage() -> None:
+    """Full vector deletion must never read/write object storage — it is a Qdrant-only operation."""
+    source = inspect.getsource(delete_all_tracked_document_vectors)
+    assert "FileStorage" not in source
+    assert "file_storage" not in source
+
+
+async def test_full_deletion_does_not_modify_document_metadata() -> None:
+    session = FakeIndexSession()
+    document = build_document(
+        collection_name="serving-collection",
+        embedding_provider="ollama",
+        embedding_model="serving-model",
+        embedding_version="v-serving",
+        chunking_version="v-serving",
+    )
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert document.collection_name == "serving-collection"
+    assert document.embedding_provider == "ollama"
+    assert document.embedding_model == "serving-model"
+    assert document.embedding_version == "v-serving"
+    assert document.chunking_version == "v-serving"
+
+
+async def test_full_deletion_does_not_change_reindex_job_status() -> None:
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert session.reindex_jobs[job.id].status == ReindexJobStatus.COMPLETED
+
+
+async def test_full_deletion_does_not_create_or_mutate_a_cleanup_job_for_a_completed_reindex_target() -> None:
+    """Resolving a completed re-index target must be read-only — no VectorCleanupJob side effect."""
+    session = FakeIndexSession()
+    document = build_document(collection_name="serving-collection")
+    job = build_reindex_job(document.id, ReindexJobStatus.COMPLETED, target_collection_name="target-b")
+    session.reindex_jobs[job.id] = job
+
+    await delete_all_tracked_document_vectors(document, FakeVectorStore(), session)
+
+    assert session.cleanup_jobs == {}
+    assert len(session.reindex_jobs) == 1  # only the one seeded above — nothing new was added

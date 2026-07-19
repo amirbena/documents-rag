@@ -5,6 +5,13 @@
 *lifecycle* deletion must use `delete_all_tracked_document_vectors()` instead, so a partial
 cleanup is never silently mistaken for a complete one (see CLAUDE.md's "Full Document Deletion
 Style" and "Multilingual RAG Style" governance rules).
+
+Full deletion's tracked-collection set (Phase 2.8.6, subtask 3) is resolved from three sources:
+the document's current collection, every pending/failed `VectorCleanupJob` collection, and every
+distinct `target_collection_name` from a **COMPLETED** `ReindexJob` for the document — durable
+proof that a build-ahead re-index target may already hold a full vector set even though
+`Document.collection_name` still points at the serving collection (not yet activated).
+`PENDING`/`PROCESSING`/`FAILED` re-index jobs never contribute a target collection here.
 """
 
 from dataclasses import dataclass
@@ -14,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.document import Document
 from app.rag.providers.vector_store import VectorStore
 from app.services.indexing.cleanup_job_service import get_pending_cleanup_jobs
+from app.services.indexing.reindex_scheduling_service import get_completed_reindex_target_collections
 
 
 async def delete_current_document_vectors(document: Document, vector_store: VectorStore) -> None:
@@ -66,13 +74,17 @@ async def delete_all_tracked_document_vectors(
     """Attempt to delete a document's vectors from every collection they could still exist in.
 
     The FULL cleanup operation — this is what any document lifecycle/deletion path must call.
-    Targets the document's currently tracked collection (`collection_name`) *and* every distinct
+    Targets the document's currently tracked collection (`collection_name`), every distinct
     historical collection still tracked by a pending/failed VectorCleanupJob for this document
-    (see `get_pending_cleanup_jobs()`), so a document deleted after one or more failed re-index
-    cleanups never leaves vectors behind in an old collection merely because the failure happened
-    to occur before this deletion. `session` is mandatory — there is no way to check historical
-    cleanup tracking without it, and defaulting it to `None` would let a caller silently get only
-    partial cleanup while believing deletion was complete.
+    (see `get_pending_cleanup_jobs()`), and every distinct target collection from a COMPLETED
+    ReindexJob for this document (see `get_completed_reindex_target_collections()`) — so a document
+    deleted mid build-ahead migration (vectors already built in a target collection the document
+    hasn't been activated onto yet) never leaves that target's vectors behind, and a document
+    deleted after one or more failed re-index cleanups never leaves vectors behind in an old
+    collection merely because the failure happened to occur before this deletion. `session` is
+    mandatory — there is no way to check historical cleanup or completed-build tracking without
+    it, and defaulting it to `None` would let a caller silently get only partial cleanup while
+    believing deletion was complete.
 
     Every resolved collection is attempted independently: a failure deleting from one collection
     is recorded and does not stop, skip, or abort attempts against any other collection (active
@@ -101,6 +113,10 @@ async def delete_all_tracked_document_vectors(
     for job in await get_pending_cleanup_jobs(session, document_id=document.id):
         if job.collection_name not in collections_to_attempt:
             collections_to_attempt.append(job.collection_name)
+
+    for collection_name in await get_completed_reindex_target_collections(session, document.id):
+        if collection_name not in collections_to_attempt:
+            collections_to_attempt.append(collection_name)
 
     collection_results: list[CollectionVectorDeletionResult] = []
     for collection_name in collections_to_attempt:

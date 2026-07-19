@@ -140,8 +140,8 @@ make verify                    # test + lint + typecheck + compose — run befor
   `delete_current_document_vectors()` (deliberately partial, active-collection-only). Vectors are
   always removed before storage; a partial vector failure blocks storage deletion in that attempt.
 - No operation's partial success is ever exposed as full success — `VectorDeletionResult`/
-  `ReindexResult`/`DeletionRequestResult` are typed results the caller must inspect, never a bare
-  bool swallowing a partial-failure case.
+  `ReindexBuildResult`/`ReindexActivationResult`/`DeletionRequestResult` are typed results the
+  caller must inspect, never a bare bool swallowing a partial-failure case.
 - Qdrant is rebuildable: never treat a Qdrant write as authoritative, never make the
   Qdrant/Postgres boundary look atomic — a Qdrant write can succeed while the Postgres commit
   fails, and this is documented, not glossed over.

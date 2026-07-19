@@ -29,6 +29,16 @@ insert, and falls back to catching the index's `IntegrityError` (re-reading and 
 now-active job) for the residual race the lock alone cannot close — identical strategy to
 `retry_ingestion()`.
 
+## Active re-index blocks deletion scheduling (Phase 2.8.6)
+
+An active (`PENDING`/`PROCESSING`) `ReindexJob` for the document rejects deletion scheduling with
+`REINDEX_ACTIVE`, symmetric with the existing `INGESTION_ACTIVE` check — deletion must never race
+an in-flight re-index build. Checked via
+`app.services.indexing.reindex_scheduling_service.get_active_reindex_job()`, never a locally
+duplicated query, since (unlike the ingestion/deletion cross-check within this same package) there
+is no import-cycle risk in this direction: `app/services/indexing/*` never imports back from
+`app/services/documents/*`.
+
 ## Retry is append-only, not resumable-in-place
 
 A `PARTIALLY_FAILED` job's `vector_cleanup_completed`/`storage_cleanup_completed` flags describe
@@ -53,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.services.indexing.reindex_scheduling_service import get_active_reindex_job
 
 _ACTIVE_STATUSES = (DocumentDeletionStatus.PENDING, DocumentDeletionStatus.PROCESSING)
 
@@ -96,6 +107,7 @@ class DeletionRequestOutcome(StrEnum):
 
     DOCUMENT_NOT_FOUND = "document_not_found"
     INGESTION_ACTIVE = "ingestion_active"
+    REINDEX_ACTIVE = "reindex_active"
     CREATED = "created"
     ALREADY_ACTIVE = "already_active"
     ALREADY_DELETED = "already_deleted"
@@ -189,8 +201,9 @@ async def request_document_deletion(session: AsyncSession, document_id: str) -> 
       job is returned, no duplicate is created.
     - latest deletion job PARTIALLY_FAILED, or no deletion job yet -> if the latest IngestionJob
       is PENDING/PROCESSING, INGESTION_ACTIVE (route maps to 409) — deletion must never race an
-      in-flight ingestion. Otherwise CREATED: a new PENDING DocumentDeletionJob is inserted (route
-      maps to 202).
+      in-flight ingestion. If an active (PENDING/PROCESSING) ReindexJob exists (Phase 2.8.6),
+      REINDEX_ACTIVE (route maps to 409) — deletion must never race an in-flight re-index build
+      either. Otherwise CREATED: a new PENDING DocumentDeletionJob is inserted (route maps to 202).
 
     Takes a blocking `SELECT ... FOR UPDATE` on the document's existing deletion-job rows first,
     so concurrent delete requests for the same document serialize instead of racing; a residual
@@ -220,6 +233,10 @@ async def request_document_deletion(session: AsyncSession, document_id: str) -> 
     active_ingestion = await _latest_active_ingestion_job(session, document_id)
     if active_ingestion is not None:
         return DeletionRequestResult(outcome=DeletionRequestOutcome.INGESTION_ACTIVE, job=None)
+
+    active_reindex = await get_active_reindex_job(session, document_id)
+    if active_reindex is not None:
+        return DeletionRequestResult(outcome=DeletionRequestOutcome.REINDEX_ACTIVE, job=None)
 
     new_job = DocumentDeletionJob(
         id=str(uuid.uuid4()), document_id=document_id, status=DocumentDeletionStatus.PENDING

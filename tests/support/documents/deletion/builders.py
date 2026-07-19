@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.models.reindex_job import ReindexJob, ReindexJobStatus
 
 NOW = datetime(2026, 7, 13, 12, 0, 0, tzinfo=UTC)
 
@@ -56,6 +57,27 @@ def build_deletion_job(
         status=status,
         vector_cleanup_completed=False,
         storage_cleanup_completed=False,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+
+def build_reindex_job(
+    document_id: str,
+    status: ReindexJobStatus,
+    *,
+    target_collection_name: str = "documents__ollama__target-model__ev1__cv1__d3",
+    created_at: datetime | None = None,
+) -> ReindexJob:
+    """Build a ReindexJob for `document_id` at the given status."""
+    created_at = created_at or (NOW - timedelta(minutes=30))
+    return ReindexJob(
+        id=str(uuid.uuid4()),
+        document_id=document_id,
+        target_collection_name=target_collection_name,
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=status,
         created_at=created_at,
         updated_at=created_at,
     )
