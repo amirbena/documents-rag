@@ -209,8 +209,13 @@ async def test_existing_pending_reindex_returns_already_active() -> None:
     target = build_embedding_config()
     document = _indexed_document("documents__ollama__old__ev0__cv0__d768")
     existing = ReindexJob(
-        id=str(uuid.uuid4()), document_id=document.id, target_collection_name=target.collection_name,
-        target_chunk_size=500, target_chunk_overlap=50, status=ReindexJobStatus.PENDING,
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        source_collection_name="documents__ollama__old__ev0__cv0__d768",
+        target_collection_name=target.collection_name,
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=ReindexJobStatus.PENDING,
     )
     session.reindex_jobs[existing.id] = existing
 
@@ -229,8 +234,13 @@ async def test_existing_processing_reindex_returns_already_active() -> None:
     target = build_embedding_config()
     document = _indexed_document("documents__ollama__old__ev0__cv0__d768")
     existing = ReindexJob(
-        id=str(uuid.uuid4()), document_id=document.id, target_collection_name=target.collection_name,
-        target_chunk_size=500, target_chunk_overlap=50, status=ReindexJobStatus.PROCESSING,
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        source_collection_name="documents__ollama__old__ev0__cv0__d768",
+        target_collection_name=target.collection_name,
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=ReindexJobStatus.PROCESSING,
     )
     session.reindex_jobs[existing.id] = existing
 
@@ -402,8 +412,13 @@ async def test_failed_historical_jobs_do_not_block_a_new_attempt() -> None:
     target = build_embedding_config()
     document = _indexed_document("documents__ollama__old__ev0__cv0__d768")
     session.reindex_jobs[str(uuid.uuid4())] = ReindexJob(
-        id=str(uuid.uuid4()), document_id=document.id, target_collection_name="some-other-collection",
-        target_chunk_size=500, target_chunk_overlap=50, status=ReindexJobStatus.FAILED,
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        source_collection_name="documents__ollama__old__ev0__cv0__d768",
+        target_collection_name="some-other-collection",
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=ReindexJobStatus.FAILED,
     )
 
     result = await schedule_reindex(
@@ -418,8 +433,13 @@ async def test_completed_historical_jobs_do_not_block_a_new_attempt() -> None:
     target = build_embedding_config()
     document = _indexed_document("documents__ollama__old__ev0__cv0__d768")
     session.reindex_jobs[str(uuid.uuid4())] = ReindexJob(
-        id=str(uuid.uuid4()), document_id=document.id, target_collection_name="some-other-collection",
-        target_chunk_size=500, target_chunk_overlap=50, status=ReindexJobStatus.COMPLETED,
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        source_collection_name="documents__ollama__old__ev0__cv0__d768",
+        target_collection_name="some-other-collection",
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=ReindexJobStatus.COMPLETED,
     )
 
     result = await schedule_reindex(
@@ -473,8 +493,13 @@ async def test_active_job_constraint_violation_reloads_the_winner_as_already_act
     target = build_embedding_config()
     document = _indexed_document("documents__ollama__old__ev0__cv0__d768")
     winner = ReindexJob(
-        id=str(uuid.uuid4()), document_id=document.id, target_collection_name=target.collection_name,
-        target_chunk_size=500, target_chunk_overlap=50, status=ReindexJobStatus.PENDING,
+        id=str(uuid.uuid4()),
+        document_id=document.id,
+        source_collection_name="documents__ollama__old__ev0__cv0__d768",
+        target_collection_name=target.collection_name,
+        target_chunk_size=500,
+        target_chunk_overlap=50,
+        status=ReindexJobStatus.PENDING,
     )
     session.pretend_collection_already_tracked = True
     session.force_next_commit_integrity_error = _ONE_ACTIVE_REINDEX_JOB_CONSTRAINT

@@ -1,4 +1,4 @@
-"""ORM model for one re-index build attempt for a document (Phase 2.8.6, subtask 2).
+"""ORM model for one re-index build attempt for a document (Phase 2.8.6, subtasks 2 and 5).
 
 One row per build attempt, mirroring `IngestionJob`/`DocumentDeletionJob`'s append-only lifecycle
 style: a `FAILED` row is never reset or reused — retrying always creates a brand-new row for the
@@ -7,13 +7,24 @@ time, enforced by the partial unique index `ix_reindex_jobs_one_active_per_docum
 (migration `a8685da857f3`), not application logic alone — see
 `app/services/indexing/reindex_scheduling_service.py`.
 
-`target_collection_name`/`target_chunk_size`/`target_chunk_overlap` are a fully pinned,
-reproducible build snapshot captured once at scheduling time — never re-derived from whatever the
-live process's `Settings` say when a worker later claims this job (see
-`app.services.indexing.reindex_service.build_settings_for_target`). `target_collection_name` is a
-foreign key into `IndexCollection`, which already durably holds the target's full embedding
-provider/model/dimension/embedding_version/chunking_version identity — so this row never needs to
-duplicate those fields itself.
+`source_collection_name`/`target_collection_name`/`target_chunk_size`/`target_chunk_overlap` are a
+fully pinned, reproducible build snapshot captured once at scheduling time — never re-derived from
+whatever the live process's `Settings` say when a worker later claims this job (see
+`app.services.indexing.reindex_service.build_settings_for_target`). Both `*_collection_name`
+columns are foreign keys into `IndexCollection`, which already durably holds each collection's full
+embedding provider/model/dimension/embedding_version/chunking_version identity — so this row never
+needs to duplicate those fields itself. `source_collection_name` is what
+`app.services.indexing.reindex_activation.activate_reindexed_document()` (subtask 5) compares
+against the document's *current* `collection_name` at activation time: if the document has since
+moved to a third collection (e.g. a different `ReindexJob` for the same document activated first),
+this job's build is stale relative to that new reality and must never overwrite it — see that
+module's docstring for the full staleness scenario.
+
+`activated_at` is the durable marker that cutover actually happened — deliberately distinct from
+`completed_at` (build success) and `status == COMPLETED` (which never changes meaning once set):
+a job can be `COMPLETED` with `activated_at IS NULL` for an arbitrarily long time (build succeeded,
+not yet activated), and remains `COMPLETED` after activation too — `activated_at` alone
+distinguishes "built" from "actually serving."
 
 `error_message` is an internal value only, retained for operator/log inspection — never yet
 exposed through any public API (no such API exists as of this subtask).
@@ -46,6 +57,9 @@ class ReindexJob(Base):
     document_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("documents.id"), nullable=False, index=True
     )
+    source_collection_name: Mapped[str] = mapped_column(
+        String(255), ForeignKey("index_collections.collection_name"), nullable=False
+    )
     target_collection_name: Mapped[str] = mapped_column(
         String(255), ForeignKey("index_collections.collection_name"), nullable=False
     )
@@ -68,3 +82,4 @@ class ReindexJob(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

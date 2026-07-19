@@ -1248,9 +1248,167 @@ can be reloaded.
 **Active re-index blocks document deletion.** `deletion_service.request_document_deletion()`
 rejects with `REINDEX_ACTIVE` (`409`) while an active `ReindexJob` exists for the document,
 symmetric with its existing `INGESTION_ACTIVE` check — deletion must never race an in-flight
-re-index build. Full-deletion tracking of a completed-but-not-yet-activated target build (so
+re-index build. Full-deletion tracking of a completed-but-not-yet-activated target build — so
 `delete_all_tracked_document_vectors()` can prove and clean both the serving and target collections
-for a document deleted mid-build) is explicitly deferred to a later subtask, not implemented here.
+for a document deleted mid-build — is implemented too: it also resolves every distinct
+`target_collection_name` from a `COMPLETED` `ReindexJob` for the document (via
+`get_completed_reindex_target_collections()`), never `PENDING`/`PROCESSING`/`FAILED` ones. See
+"Two separate vector-deletion operations, deliberately not one" above.
+
+### Re-index worker (`app/services/indexing/reindex_worker.py`)
+
+**Build-only — the worker never activates anything.** `ReindexWorker.process_next_job(session,
+settings)` claims one `PENDING` `ReindexJob` (`SELECT ... FOR UPDATE SKIP LOCKED`, mirroring
+`IngestionWorker`/`DocumentDeletionWorker` exactly, ordered `created_at ASC, id ASC`), commits the
+`PENDING -> PROCESSING` transition before any external I/O, reconstructs the job's pinned target
+`EmbeddingIndexConfig` from its `IndexCollection` foreign key plus its own persisted
+`target_chunk_size`/`target_chunk_overlap`, and delegates entirely to
+`reindex_service.build_reindex_target()` — the worker never duplicates
+extraction/chunking/embedding/validation/collection/upsert logic itself. `ReindexJob.status ==
+COMPLETED` means only **"the pinned target build succeeded"** — never "the target is active or
+serving." `Document.collection_name`/`embedding_*`/`chunking_version`/`indexed_at` are never
+touched by this worker, no `VectorCleanupJob` is ever created by it, and no vector is ever deleted
+from any collection by it. Activation (`reindex_service.activate_reindexed_document()`, added in
+subtask 1) remains completely unwired into any runtime code as of this subtask.
+
+`IndexCollection` does not itself persist the `collection_prefix` used to derive its
+`collection_name` (only the fully joined name is a column) — the worker sources it from its own
+base `Settings.qdrant_collection_name` (a platform-wide constant that should never legitimately
+differ from what was used at scheduling time) and then verifies the reconstructed config's
+`collection_name` matches the job's pinned `target_collection_name` exactly before building,
+failing the job cleanly rather than silently building into the wrong collection if it does not.
+
+**Defense in depth against deletion races.** `schedule_reindex()` already refuses to create a new
+`ReindexJob` while a document's deletion is active/incomplete/completed, but the worker re-checks
+the same condition immediately before building anyway, against the residual window between
+scheduling and a worker actually claiming the job. A blocked build is recorded as
+`ReindexJob.status = FAILED` (the existing status vocabulary — no new database status is
+introduced for this) with a stable internal error message; the worker's own return value
+additionally distinguishes this case (`ReindexWorkerOutcome.SKIPPED_DELETED`) from a genuine build
+exception (`FAILED`) for the caller's benefit, without any corresponding DB-level distinction.
+
+**Transaction boundaries.** Claiming is its own committed transaction before any external I/O; no
+row lock is held across storage reads, extraction, chunking, embedding, or the Qdrant upsert.
+Resolving the terminal status is a second, separate commit. The failure path always rolls back
+first, then reloads the job strictly by its captured scalar `id` — never by re-accessing the
+original (possibly now-expired) ORM object's attributes, which is exactly the `MissingGreenlet`
+defect found and fixed in subtask 2's PostgreSQL verification.
+
+**No stale-`PROCESSING` recovery yet.** If a worker process crashes between claiming a job and
+marking it terminal, that `ReindexJob` row remains `PROCESSING` indefinitely in this subtask —
+there is no automatic reset back to `PENDING`. This mirrors `IngestionJob`'s own
+`recover_stale_ingestion_jobs()` precedent (script-only, never HTTP-triggered, never run by `make
+verify`/CI) — a future task would extend that same convention to `ReindexJob`, not invent a new
+mechanism; this subtask does not register or extend it.
+
+### Re-index activation (`app/services/indexing/reindex_activation.py`)
+
+**Build completion and activation are separate, independently-durable states.** `ReindexJob.status
+== COMPLETED` (set by the worker above) means only "the pinned target build succeeded" — it says
+nothing about whether the document is actually being served from that target. Activation is the
+explicit, separate operation that performs the cutover: `activate_reindexed_document(session,
+reindex_job_id) -> ReindexActivationResult` locks the `ReindexJob` and its `Document`
+(`SELECT ... FOR UPDATE`, not `SKIP LOCKED` — a caller intentionally targeting one specific job
+should wait for a concurrent activator rather than silently skip), re-validates every precondition
+against current state (job exists / is `COMPLETED` / is not already activated; document exists and
+its deletion lifecycle isn't active/incomplete/completed; the document's *current*
+`collection_name` still equals the job's pinned `source_collection_name`; the target
+`IndexCollection` row still exists), and — in that same transaction — atomically switches
+`Document.collection_name`/`embedding_provider`/`embedding_model`/`embedding_dimension`/
+`embedding_version`/`chunking_version`/`indexed_at` to the target's own persisted `IndexCollection`
+columns, creates one `VectorCleanupJob` for the vacated source collection, and sets
+`ReindexJob.activated_at` (added by this subtask, alongside `ReindexJob.source_collection_name` —
+the document's serving collection *as captured by `schedule_reindex()` at scheduling time*, used
+for the staleness check above). The document cutover and the cleanup-job creation share one commit
+— activation never durably exposes a document already pointing at the target with no cleanup job
+yet recorded for the source, or vice versa.
+
+**Never rebuilds, never touches Qdrant, never consults live Settings.** Unlike the worker, this
+module reconstructs the target's embedding/chunking identity purely from the target
+`IndexCollection` row's own columns — never from a reconstructed `EmbeddingIndexConfig` (which
+would require a `collection_prefix` that isn't itself a persisted column) and never from live
+`Settings`, so a stale `QDRANT_COLLECTION_NAME` on the activating process can never corrupt a
+cutover. It never calls `build_reindex_target()`, never issues a Qdrant write or delete, and never
+retires or otherwise mutates the target `IndexCollection`'s own status.
+
+**Old vectors remain present after activation; cleanup execution is asynchronous and not part of
+this subtask.** The `VectorCleanupJob` row created here is picked up by the existing
+`cleanup_job_service.retry_cleanup_job()` machinery on its own schedule — activation only records
+the obligation, it never executes it inline. A document therefore has live, searchable vectors in
+*both* its old and new collections for an indeterminate window after activation, by design.
+
+**Idempotent via row locking, not a new unique constraint.** Two concurrent activation attempts
+against the *same* `ReindexJob` id serialize on that row's `FOR UPDATE` lock; the second caller
+proceeds only after the first commits, then observes `activated_at` already set and returns
+`ALREADY_ACTIVATED` with no further mutation and no duplicate `VectorCleanupJob`. This differs from
+`ix_reindex_jobs_one_active_per_document` (a multi-row insert race) because activation contention
+is always over one already-existing row.
+
+**Out of scope for this subtask (all remain future work):** no batch/campaign orchestration across
+multiple documents or jobs; no collection retirement; no automatic write-freeze or process-restart
+coordination around a cutover (that remains an external operational concern); no automated
+end-to-end migration workflow — build, schedule, and activate remain three separately-invoked
+operations, not one automated pipeline. A single-document HTTP API for this lifecycle was added in
+subtask 6 — see "Single-document re-index API" below.
+
+### Single-document re-index API (`app/api/v1/routes/reindex.py`, Phase 2.8.6, subtask 6)
+
+**A thin HTTP boundary over the lifecycle above — inspect, schedule, activate, nothing more.**
+Three endpoints, all under `/api/v1/documents/{document_id}/reindex`:
+
+- `GET .../reindex` — read-only inspection. Delegates entirely to
+  `app.services.indexing.reindex_inspection_service.inspect_document_reindex_state()`, which
+  derives `is_stale` from the existing `collection_registry.is_document_stale()` primitive (never
+  a new comparison), reports the document's `active_index` (read straight off `Document`'s own
+  persisted columns) alongside the platform's current `desired_index` (from
+  `get_active_embedding_config()` — the one legitimate live-`Settings` read anywhere in this
+  service), the document's `latest_job` (if any, unconditionally — even one that targeted a
+  now-superseded configuration, purely for operator visibility), and a derived
+  `ReindexLifecycleState` (`not_indexed`/`up_to_date`/`stale`/`reindex_pending`/
+  `reindex_processing`/`target_built`/`activated`/`failed`/`deletion_blocked` — purely derived,
+  never a new persisted `ReindexJob` status; see CLAUDE.md's High-Risk Invariants). A historical job
+  only drives this derived state when its `target_collection_name` still matches the *current*
+  desired collection — an old, already-activated job for an abandoned configuration can never keep
+  reporting `activated` forever once the desired configuration has moved on again. 404 only when
+  the document itself doesn't exist.
+- `POST .../reindex` — schedules one append-only attempt. Delegates entirely to the existing
+  `reindex_scheduling_service.schedule_reindex()`; the route only loads the `Document` (via a
+  service-owned `get_document()` lookup, never a raw `session.get()` in the route itself — see
+  CLAUDE.md's Route Layer Style) and maps `schedule_reindex()`'s outcome enum to a status code via a
+  lookup table, exactly like `_RETRY_OUTCOME_ERRORS` in `documents.py`. 202 (`created=true`) for a
+  newly-inserted `PENDING` job; 200 (`created=false`) for an already-active job returned unchanged;
+  404 if the document doesn't exist; 409 for every other blocking outcome
+  (`INELIGIBLE_NEVER_INDEXED`/`ALREADY_CURRENT`/`INGESTION_ACTIVE`/`DELETION_ACTIVE`/
+  `DELETION_INCOMPLETE`/`DOCUMENT_DELETED`). Never builds inline — the `PENDING` row is picked up by
+  the existing out-of-band `ReindexWorker`, run separately (a script/process, not this request).
+- `POST .../reindex/activate` — activates one completed attempt. Delegates entirely to
+  `reindex_activation.activate_reindexed_document()`. Accepts an optional `?job_id=` query
+  parameter; when omitted, resolves to the document's latest attempt. When `job_id` *is* supplied,
+  the route first confirms that job actually belongs to `document_id` in the URL (a plain
+  resource-ownership check, not a re-derivation of activation's own precondition chain) — without
+  it, a caller could pass a `job_id` belonging to a different document and silently activate that
+  document instead of the one named in the path. 200 for both a fresh activation and an idempotent
+  already-activated call (`already_activated` in the response body distinguishes the two); 404 if
+  no matching job can be found; 409 for `NOT_READY`/`SOURCE_CHANGED`/`BLOCKED_BY_DELETION`. Never
+  executes the `VectorCleanupJob` activation creates — that remains a separate, out-of-band
+  operation, exactly as in the service layer itself.
+
+**`can_schedule`/`can_activate` on the inspection response are best-effort hints, not guarantees.**
+Reproducing every precondition `schedule_reindex()`/`activate_reindexed_document()` actually
+enforce inside the read path (active-ingestion checks, a row-locked re-validation of source
+staleness) would duplicate business logic this subtask's spec explicitly forbids. Both flags do
+account for the document's blocking deletion status (that lookup is already required to derive
+`deletion_blocked` state, so reusing it is free), but the `POST` endpoints remain the sole authority
+on whether a given call actually succeeds — either can still return `409` for a condition the read
+path did not attempt to predict, most plausibly a concurrent change between the `GET` and the
+following `POST`.
+
+**Bounded batch eligibility listing was deferred, not built.** The original Phase 2.8.6 roadmap
+mentioned a bounded-eligibility read operation (`list_reindex_eligible_documents()`); this subtask
+has no current consumer for it (no frontend, no operational script), so per its own spec ("If no
+current consumer requires this operation, document it as deferred rather than creating unused API
+surface") it was not implemented — a future subtask should add it once a real consumer exists,
+reusing `is_document_stale()`/`get_active_reindex_job()` rather than a new comparison.
 
 ### Zero-chunk behavior
 
@@ -1282,6 +1440,42 @@ helper for other callers, but `activate_reindexed_document()` does not use it �
 created as part of activation must share activation's own single commit with the metadata switch,
 so `activate_reindexed_document()` constructs and `session.add()`s a `VectorCleanupJob` row
 directly instead.
+
+**Historical cleanup execution (`process_next_vector_cleanup_job()`, Phase 2.8.6, subtask 7).**
+`activate_reindexed_document()` creates the `VectorCleanupJob` for the vacated source collection,
+but never executes it — this is the minimal claim/execute wiring that was missing.
+`process_next_vector_cleanup_job(session, vector_store)` claims one eligible (`pending`/`failed`)
+row (`SELECT ... FOR UPDATE SKIP LOCKED`, oldest first — mirrors `reindex_worker.py`'s claim
+exactly), commits immediately to release the row lock before any Qdrant call, then delegates the
+actual delete-and-mark-terminal work entirely to the existing `retry_cleanup_job()` — no new
+cleanup state machine, no `PROCESSING` status (`VectorCleanupJob` never gained one; a claimed row's
+transaction simply commits with no status mutation, since there is no intermediate status to set).
+Processes at most one job per call — the *caller* (a script or scheduled runner) is responsible for
+looping, exactly like `ReindexWorker`/`IngestionWorker`/`DocumentDeletionWorker`. Cleanup execution
+remains asynchronous and internal — no public HTTP endpoint triggers it, and the existing re-index
+inspection/schedule/activate API (Phase 2.8.6, subtask 6) does not expose cleanup state.
+
+**Active-serving-collection safety guard.** `retry_cleanup_job()` now refuses to delete when
+`job.collection_name` equals the document's *current* `collection_name` exactly — protection
+against a stale or invalid cleanup record accidentally deleting vectors a document is still
+actively served from. A missing document (already fully deleted) never blocks cleanup, only an
+exact match against a still-existing document's active collection does — "prefer safe, idempotent
+handling over recreating lifecycle state." A blocked attempt is recorded using the *existing*
+`failed` status and a fixed internal message, never a new persisted status invented solely to
+distinguish this case. This guard, plus a defensive bounded/truncated `last_error` and a
+commit-failure rollback (mirroring `reindex_activation.py`'s exact convention — capture scalars,
+roll back, expire, re-raise, never touch an expired ORM attribute afterward), are the only changes
+made to `retry_cleanup_job()` itself.
+
+**Historical vectors remain present until cleanup succeeds, and cleanup never touches the target
+collection or retires anything.** After activation, a document's old vectors in the vacated source
+collection stay live and searchable for an indeterminate window — cleanup is asynchronous, not
+part of activation. Cleanup deletes only this one document's vectors from the one collection its
+`VectorCleanupJob` names; it never deletes the whole collection, never clears it, and never invokes
+full document deletion (`delete_all_tracked_document_vectors()`) — those remain entirely separate
+operations reserved for lifecycle-level document deletion. Collection-wide retirement
+(`collection_registry.retire_collection()`) is unrelated to and untouched by this cleanup path.
+Stale-`PROCESSING` recovery does not apply here (there is no `PROCESSING` status to recover from).
 
 **Two separate vector-deletion operations, deliberately not one.**
 `delete_current_document_vectors(document, vector_store)` targets only the document's

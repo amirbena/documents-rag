@@ -113,6 +113,29 @@ def is_active_reindex_job_violation(exc: IntegrityError) -> bool:
     return _diagnostic_constraint_name(exc) == _ONE_ACTIVE_REINDEX_JOB_CONSTRAINT_NAME
 
 
+async def get_document(session: AsyncSession, document_id: str) -> Document | None:
+    """Return the Document with `document_id`, or None if it does not exist.
+
+    A trivial by-primary-key lookup, duplicated here (rather than imported from
+    `app.services.documents.query_service.get_document`) purely so callers in `app/api/v1/routes/`
+    that need a `Document` object for `schedule_reindex()` never touch `session.get()`/ORM query
+    logic directly — see CLAUDE.md's "Route Layer Style" — without this module reaching into
+    `app/services/documents/*` (see module docstring's dependency-cycle rationale).
+    """
+    return await session.get(Document, document_id)
+
+
+async def get_reindex_job(session: AsyncSession, job_id: str) -> ReindexJob | None:
+    """Return the ReindexJob with `job_id`, or None if it does not exist.
+
+    Used by the re-index activation route to confirm a caller-supplied `job_id` actually belongs
+    to the document named in the URL, before ever calling `reindex_activation
+    .activate_reindexed_document()` — a basic resource-ownership check, not a duplication of
+    activation's own precondition validation.
+    """
+    return await session.get(ReindexJob, job_id)
+
+
 async def get_latest_reindex_job(session: AsyncSession, document_id: str) -> ReindexJob | None:
     """Return `document_id`'s most recent ReindexJob (created_at DESC, id DESC), or None."""
     stmt = (
@@ -234,11 +257,16 @@ async def schedule_reindex(
     # Captured once, up front: a rollback later in this function (the race-recovery path) expires
     # every object in the session, including `document` — any attribute access on it afterward
     # would trigger an unsafe synchronous lazy-load under an AsyncSession. Every subsequent lookup
-    # in this function uses this plain string, never `document.id` again.
+    # in this function uses these plain values, never `document.*` again. `source_collection_name`
+    # is the document's serving collection *at scheduling time* — pinned onto the job so
+    # `reindex_activation.activate_reindexed_document()` (subtask 5) can later detect whether the
+    # document has since moved to a third collection before ever overwriting it.
     document_id = document.id
 
     if document.collection_name is None:
         return _result(ReindexSchedulingOutcome.INELIGIBLE_NEVER_INDEXED, document, target_config)
+
+    source_collection_name = document.collection_name
 
     if document.collection_name == target_config.collection_name:
         return _result(ReindexSchedulingOutcome.ALREADY_CURRENT, document, target_config)
@@ -265,6 +293,7 @@ async def schedule_reindex(
     job = ReindexJob(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name=source_collection_name,
         target_collection_name=target_config.collection_name,
         target_chunk_size=target_chunk_size,
         target_chunk_overlap=target_chunk_overlap,
@@ -292,7 +321,9 @@ __all__ = [
     "ReindexSchedulingResult",
     "get_active_reindex_job",
     "get_completed_reindex_target_collections",
+    "get_document",
     "get_latest_reindex_job",
+    "get_reindex_job",
     "is_active_reindex_job_violation",
     "schedule_reindex",
 ]

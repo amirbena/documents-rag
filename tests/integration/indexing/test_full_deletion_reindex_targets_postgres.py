@@ -106,9 +106,13 @@ async def _seed_document(session: AsyncSession, **overrides: object) -> Document
 
 
 def _reindex_job(document_id: str, status: ReindexJobStatus, target_collection_name: str) -> ReindexJob:
+    # source_collection_name only needs to reference a real, already-seeded IndexCollection row
+    # for this file's tests (none of them exercise activation's source-staleness check) — reusing
+    # the target itself is always valid here, since every call site seeds it before calling this.
     return ReindexJob(
         id=str(uuid.uuid4()),
         document_id=document_id,
+        source_collection_name=target_collection_name,
         target_collection_name=target_collection_name,
         target_chunk_size=500,
         target_chunk_overlap=50,
