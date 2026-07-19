@@ -423,6 +423,57 @@ document's `GET .../download` returns `410 Gone` (the row still exists; only its
 removed), and `POST .../ingestion/retry` on it returns `409` — a document is never implicitly
 resurrected once deletion has begun.
 
+### Re-index scheduling and activation
+
+Manual, operator-triggered re-indexing of an already-ingested document under the platform's
+current active embedding/chunking configuration — see "Single-document re-index API" in
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full precondition chains, locking behavior, and
+rollback guarantees.
+
+```bash
+# Inspect staleness + the latest attempt (404 if the document doesn't exist).
+curl "http://localhost:8000/api/v1/documents/<document_id>/reindex"
+
+# Schedule a re-index — 202 if newly scheduled, 200 if an already-active attempt exists, 404/409
+# for every other blocking condition. Never builds inline (the existing ReindexWorker does, out of
+# band).
+curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex"
+
+# Activate a completed build — defaults to the document's latest attempt; accepts an optional
+# ?job_id= to target a specific one:
+curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex/activate"
+```
+
+`POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — the existing out-of-band
+`ReindexWorker` claims and builds it separately, never inline in this request. A successful build
+writes the target's vectors into a new collection but **never switches which collection the
+document serves from** — the running process keeps serving the document's current collection
+untouched, for as long as the operator wants, until an explicit activation call.
+
+`POST .../reindex/activate` performs one atomic, `SELECT ... FOR UPDATE`-locked transaction that
+switches the document's serving collection/embedding/chunking metadata, sets `activated_at`, and
+persists a `VectorCleanupJob` for the vacated collection — in the same commit. A failure anywhere
+in that transaction rolls back entirely; the document is never left pointing at a new collection
+unless `activated_at` was actually persisted. Calling activation again on an already-activated job
+is idempotent — `200` with `already_activated: true` in the response, no second switch, no second
+`activated_at`, no duplicate cleanup job. Activation never executes the `VectorCleanupJob` it
+creates inline — that remains a separate, out-of-band operation. `process_next_vector_cleanup_job()`
+claims one pending/failed cleanup job at a time (oldest first), refuses to delete a collection that
+is still the document's *current* active collection (a defensive safety guard), and marks the job
+`COMPLETED`/`FAILED` on completion; processing more than one job per call, and looping, is left to
+whatever caller invokes it — there is no dedicated Makefile target or script for this yet in this
+codebase (unlike full document deletion's `make process-pending-document-deletions`). The vacated
+collection's vectors remain in place — readable, unused — until that cleanup step actually runs.
+
+**Explicitly not included in this API surface:**
+- no automatic activation — a build completing never activates itself
+- no job-id-scoped activation endpoint yet (`?job_id=` on the document-scoped route above is the
+  only way to target a specific attempt)
+- no reconciliation/audit API of any kind
+- no scheduler or cron loop — the worker and cleanup processor are both invoked out-of-band,
+  manually or via an external scheduler you control
+- no automatic repair of a stale, failed, or partially-cleaned-up state
+
 ### Ingestion worker
 
 `IngestionWorker` (`app/services/ingestion/worker.py`) is an internal service — no public API —
