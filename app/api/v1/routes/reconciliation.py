@@ -1,10 +1,11 @@
-"""Read-only bounded batch document lifecycle audit endpoint (Phase 2.8.7, subtask 3).
+"""Read-only reconciliation reporting endpoints: bounded batch document audit (Phase 2.8.7,
+subtask 3), single-document audit, and collection consistency report (both subtask 5).
 
-Thin HTTP boundary over the already-implemented `audit_document_lifecycle_batch()`
-(`app/services/reconciliation/document_audit_batch_service.py`) — this route never audits a
-document itself, never mutates `Document`/job rows, and never recalculates the per-document
-classification or the aggregate summary counts the service already computed. Per CLAUDE.md's
-"Route Layer Style" (same convention as `app/api/v1/routes/documents.py`/`reindex.py`), it only
+Thin HTTP boundary over already-implemented services — `audit_document_lifecycle_batch()`,
+`audit_document_lifecycle()`, and `build_collection_reconciliation_report()`
+(`app/services/reconciliation/*`). No route here audits a document/collection itself, mutates any
+row, or recalculates a classification/count the service already computed. Per CLAUDE.md's "Route
+Layer Style" (same convention as `app/api/v1/routes/documents.py`/`reindex.py`), every route only
 parses/injects/calls-one-service/maps-the-result.
 """
 
@@ -16,10 +17,21 @@ from app.db.session import get_db_session
 from app.rag.providers.provider_factory import get_vector_store as _resolve_vector_store
 from app.rag.providers.vector_store import VectorStore
 from app.schemas.reconciliation import (
+    CollectionReportFindingResponse,
+    CollectionReportResponse,
     DocumentAuditFindingResponse,
     DocumentBatchAuditItemResponse,
     DocumentBatchAuditResponse,
     DocumentBatchAuditSummaryResponse,
+    DocumentDatabaseStateResponse,
+    DocumentFileStorageStateResponse,
+    DocumentLifecycleAuditResponse,
+    DocumentVectorStoreStateResponse,
+)
+from app.services.reconciliation.collection_reconciliation_report_service import (
+    CollectionReportFinding,
+    InvalidCollectionNameError,
+    build_collection_reconciliation_report,
 )
 from app.services.reconciliation.document_audit_batch_service import (
     DEFAULT_BATCH_LIMIT,
@@ -29,8 +41,13 @@ from app.services.reconciliation.document_audit_batch_service import (
     InvalidAuditBatchLimitError,
     InvalidAuditCursorError,
     audit_document_lifecycle_batch,
+    classify_document_audit,
 )
-from app.services.reconciliation.document_audit_service import DocumentLifecycleFinding
+from app.services.reconciliation.document_audit_service import (
+    DocumentLifecycleAuditResult,
+    DocumentLifecycleFinding,
+    audit_document_lifecycle,
+)
 from app.storage.contract import FileStorage
 from app.storage.factory import create_file_storage
 
@@ -71,6 +88,66 @@ def _item_response(summary: DocumentAuditSummary) -> DocumentBatchAuditItemRespo
         overall_status=summary.overall_status,
         classification=summary.classification,
         issues=[_finding_response(finding) for finding in summary.findings],
+    )
+
+
+def _database_response(result: DocumentLifecycleAuditResult) -> DocumentDatabaseStateResponse:
+    state = result.postgres_state
+    if state is None:
+        return DocumentDatabaseStateResponse(
+            document_exists=False,
+            collection_name=None,
+            document_created_at=None,
+            latest_ingestion_status=None,
+            latest_deletion_status=None,
+            latest_reindex_status=None,
+            latest_reindex_activated=False,
+            pending_cleanup_collections=[],
+        )
+    return DocumentDatabaseStateResponse(
+        document_exists=True,
+        collection_name=state.collection_name,
+        document_created_at=state.document_created_at,
+        latest_ingestion_status=state.latest_ingestion_status,
+        latest_deletion_status=state.latest_deletion_status,
+        latest_reindex_status=state.latest_reindex_status,
+        latest_reindex_activated=state.latest_reindex_activated,
+        pending_cleanup_collections=list(state.pending_cleanup_collections),
+    )
+
+
+def _file_storage_state_response(
+    result: DocumentLifecycleAuditResult,
+) -> DocumentFileStorageStateResponse | None:
+    state = result.storage_state
+    if state is None:
+        return None
+    return DocumentFileStorageStateResponse(inspected=state.inspected, source_file_exists=state.exists)
+
+
+def _vector_store_state_response(
+    result: DocumentLifecycleAuditResult,
+) -> DocumentVectorStoreStateResponse | None:
+    state = result.vector_state
+    if state is None:
+        return None
+    collection_name = result.postgres_state.collection_name if result.postgres_state is not None else None
+    return DocumentVectorStoreStateResponse(
+        inspected=state.inspected,
+        collection_name=collection_name,
+        collection_exists=state.collection_exists,
+        has_vectors=state.has_vectors,
+        vector_count=state.vector_count,
+    )
+
+
+def _collection_finding_response(finding: CollectionReportFinding) -> CollectionReportFindingResponse:
+    return CollectionReportFindingResponse(
+        code=finding.code,
+        severity=finding.severity,
+        summary=finding.summary,
+        expected_state=finding.expected_state,
+        actual_state=finding.actual_state,
     )
 
 
@@ -116,4 +193,81 @@ async def audit_documents_batch_route(
         ),
         limit=limit,
         next_cursor=result.next_cursor,
+    )
+
+
+@router.get(
+    "/reconciliation/documents/{document_id}/audit", response_model=DocumentLifecycleAuditResponse
+)
+async def audit_single_document_route(
+    document_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    file_storage: FileStorage = Depends(get_file_storage),
+    vector_store: VectorStore = Depends(get_vector_store),
+) -> DocumentLifecycleAuditResponse:
+    """Read-only lifecycle audit for exactly one document.
+
+    Delegates entirely to `audit_document_lifecycle()`, exactly once — never routed through the
+    batch auditor. Always 200, including when the document doesn't exist at all
+    (`classification=not_found`, `database.document_exists=false`) — the service already
+    represents that as a typed result, not an exception, so this route preserves that rather than
+    inventing a 404. `classification` is computed via the same shared `classify_document_audit()`
+    the batch endpoint uses internally — never recalculated ad hoc here. Any unexpected exception
+    (a Postgres/Object-Storage/Qdrant failure the service doesn't already turn into a finding)
+    propagates as a normal 500.
+    """
+    settings = get_settings()
+    result = await audit_document_lifecycle(db, document_id, settings, file_storage, vector_store)
+
+    return DocumentLifecycleAuditResponse(
+        document_id=result.document_id,
+        overall_status=result.overall_status,
+        classification=classify_document_audit(result.overall_status, result.findings),
+        issues=[_finding_response(finding) for finding in result.findings],
+        database=_database_response(result),
+        file_storage=_file_storage_state_response(result),
+        vector_store=_vector_store_state_response(result),
+    )
+
+
+@router.get(
+    "/reconciliation/collections/{collection_name}/report", response_model=CollectionReportResponse
+)
+async def collection_reconciliation_report_route(
+    collection_name: str,
+    db: AsyncSession = Depends(get_db_session),
+    vector_store: VectorStore = Depends(get_vector_store),
+) -> CollectionReportResponse:
+    """Read-only consistency report for exactly one collection.
+
+    Delegates entirely to `build_collection_reconciliation_report()`, exactly once. Always 200,
+    including when the collection doesn't exist at all (`classification=missing`, `exists=false`,
+    `actual_vector_count=0`) — a diagnostic snapshot, never a 404. 400 for a malformed
+    `collection_name`. Any unexpected exception (an unreachable Qdrant, a database failure)
+    propagates as a normal 500 — this report never fabricates a count when its one Qdrant call
+    fails, see the service module's own docstring for why.
+    """
+    settings = get_settings()
+    try:
+        report = await build_collection_reconciliation_report(db, collection_name, settings, vector_store)
+    except InvalidCollectionNameError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return CollectionReportResponse(
+        collection_name=report.collection_name,
+        classification=report.classification,
+        exists=report.exists,
+        is_active=report.is_active,
+        index_collection_status=report.index_collection_status,
+        embedding_provider=report.embedding_provider,
+        embedding_model=report.embedding_model,
+        embedding_dimension=report.embedding_dimension,
+        embedding_version=report.embedding_version,
+        chunking_version=report.chunking_version,
+        document_count=report.document_count,
+        expected_vector_count=report.expected_vector_count,
+        actual_vector_count=report.actual_vector_count,
+        difference=report.difference,
+        issues=[_collection_finding_response(finding) for finding in report.findings],
+        generated_at=report.generated_at,
     )

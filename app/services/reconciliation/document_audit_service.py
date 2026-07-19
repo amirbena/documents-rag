@@ -135,9 +135,14 @@ class DocumentLifecycleFinding:
 
 @dataclass(frozen=True)
 class PostgresLifecycleState:
-    """A bounded snapshot of the PostgreSQL-side lifecycle state this audit inspected."""
+    """A bounded snapshot of the PostgreSQL-side lifecycle state this audit inspected.
+
+    `document_created_at` is read straight off the already-loaded `Document` row — added for the
+    single-document audit API (Phase 2.8.7, subtask 5) so a caller never needs a second query.
+    """
 
     collection_name: str | None
+    document_created_at: datetime
     latest_ingestion_status: IngestionStatus | None
     latest_deletion_status: DocumentDeletionStatus | None
     latest_reindex_status: ReindexJobStatus | None
@@ -155,11 +160,17 @@ class StorageLifecycleState:
 
 @dataclass(frozen=True)
 class VectorLifecycleState:
-    """A bounded snapshot of what this audit observed in Qdrant."""
+    """A bounded snapshot of what this audit observed in Qdrant.
+
+    `vector_count` is populated only alongside `has_vectors` (inspection succeeded and the
+    collection exists) — added for the single-document audit API (Phase 2.8.7, subtask 5) so a
+    caller sees the actual count already computed internally, not just a boolean.
+    """
 
     inspected: bool
     collection_exists: bool | None  # None when inspection was unavailable
     has_vectors: bool | None  # None when inspection was unavailable or the collection is missing
+    vector_count: int | None = None  # None whenever has_vectors is None
 
 
 @dataclass(frozen=True)
@@ -477,7 +488,10 @@ async def audit_document_lifecycle(
                 else:
                     has_vectors = vector_count > 0
                     vector_state = VectorLifecycleState(
-                        inspected=True, collection_exists=True, has_vectors=has_vectors
+                        inspected=True,
+                        collection_exists=True,
+                        has_vectors=has_vectors,
+                        vector_count=vector_count,
                     )
                     if not has_vectors:
                         findings.append(
@@ -495,6 +509,7 @@ async def audit_document_lifecycle(
 
     postgres_state = PostgresLifecycleState(
         collection_name=document.collection_name,
+        document_created_at=document.created_at,
         latest_ingestion_status=latest_ingestion.status if latest_ingestion is not None else None,
         latest_deletion_status=latest_deletion.status if latest_deletion is not None else None,
         latest_reindex_status=latest_reindex.status if latest_reindex is not None else None,

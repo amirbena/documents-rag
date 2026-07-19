@@ -7,8 +7,9 @@ continuation cursor. It reuses the single-document auditor's result contract unc
 (`DocumentLifecycleAuditResult`/`DocumentLifecycleFinding`/`DocumentLifecycleFindingCode`/
 `AuditOverallStatus`/`FindingSeverity`) and introduces no new finding codes. The one addition on
 top of that contract is `DocumentAuditClassification` — the same five triage buckets the aggregate
-counts already used internally, now also stamped onto each `DocumentAuditSummary` via `_classify()`
-so a consumer (Phase 2.8.7 subtask 3's read-only API included) never needs to re-derive it.
+counts already used internally, now also stamped onto each `DocumentAuditSummary` via
+`classify_document_audit()` so a consumer (the read-only reconciliation API included) never needs
+to re-derive it.
 
 ## Why sequential, not concurrent
 
@@ -81,7 +82,7 @@ class InvalidAuditCursorError(ValueError):
 
 class DocumentAuditClassification(StrEnum):
     """The same five triage buckets used for this batch result's aggregate counts, exposed per
-    document too — see `_classify()`, the single place both are derived from."""
+    document too — see `classify_document_audit()`, the single place both are derived from."""
 
     NOT_FOUND = "not_found"
     INCONSISTENT = "inconsistent"
@@ -103,7 +104,7 @@ class DocumentAuditSummary:
     """One document's audit outcome, bounded to what batch triage needs — reuses findings as-is.
 
     `classification` is the exact same bucket this document was counted into in the batch result's
-    aggregate counts (see `_classify()`) — a consumer never needs to re-derive it from
+    aggregate counts (see `classify_document_audit()`) — a consumer never needs to re-derive it from
     `overall_status`/`findings` itself.
     """
 
@@ -209,11 +210,14 @@ async def _select_document_page(
     return list(result.scalars().all())
 
 
-def _classify(
+def classify_document_audit(
     overall_status: AuditOverallStatus, findings: tuple[DocumentLifecycleFinding, ...]
 ) -> DocumentAuditClassification:
     """Single source of truth for both `DocumentAuditSummary.classification` and the aggregate
-    bucket counts below — never re-derive this rule anywhere else (including the API layer)."""
+    bucket counts below — never re-derive this rule anywhere else. Public (not module-private)
+    specifically so the single-document audit API (Phase 2.8.7, subtask 5) can classify one
+    `DocumentLifecycleAuditResult` the exact same way, without routing through the batch auditor
+    or reimplementing the bucket rule in the router."""
     if overall_status == AuditOverallStatus.NOT_FOUND:
         return DocumentAuditClassification.NOT_FOUND
     if overall_status == AuditOverallStatus.INCONSISTENT:
@@ -289,7 +293,7 @@ async def audit_document_lifecycle_batch(
             original_filename=document.original_filename,
             created_at=document.created_at,
             overall_status=audit.overall_status,
-            classification=_classify(audit.overall_status, audit.findings),
+            classification=classify_document_audit(audit.overall_status, audit.findings),
             findings=audit.findings,
         )
         summaries.append(summary)
@@ -323,6 +327,7 @@ __all__ = [
     "InvalidAuditBatchLimitError",
     "InvalidAuditCursorError",
     "audit_document_lifecycle_batch",
+    "classify_document_audit",
     "decode_audit_cursor",
     "encode_audit_cursor",
 ]

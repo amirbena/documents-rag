@@ -229,3 +229,67 @@ async def test_search_similar_unreachable_raises_error() -> None:
 
     with pytest.raises(QdrantVectorStoreError):
         await store.search_similar("docs", query_vector=[0.1], limit=5)
+
+
+async def test_count_collection_vectors_returns_none_when_collection_missing() -> None:
+    """A 404 on the collection-info GET should short-circuit to None, no count call made."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(404, json={"status": "not found"})
+
+    store = _store(httpx.MockTransport(handler))
+
+    result = await store.count_collection_vectors("docs")
+
+    assert result is None
+    assert calls == ["/collections/docs"]  # never reaches /points/count
+
+
+async def test_count_collection_vectors_returns_total_point_count() -> None:
+    """A present collection should return the unfiltered points/count result."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/collections/docs":
+            return httpx.Response(
+                200, json={"result": {"config": {"params": {"vectors": {"size": 768}}}}}
+            )
+        assert request.url.path == "/collections/docs/points/count"
+        body = json.loads(request.content)
+        assert "filter" not in body  # unfiltered — total count, not per-document
+        return httpx.Response(200, json={"result": {"count": 42}})
+
+    store = _store(httpx.MockTransport(handler))
+
+    result = await store.count_collection_vectors("docs")
+
+    assert result == 42
+
+
+async def test_count_collection_vectors_malformed_response_raises_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/collections/docs":
+            return httpx.Response(
+                200, json={"result": {"config": {"params": {"vectors": {"size": 768}}}}}
+            )
+        return httpx.Response(200, json={"result": {}})
+
+    store = _store(httpx.MockTransport(handler))
+
+    with pytest.raises(QdrantVectorStoreError):
+        await store.count_collection_vectors("docs")
+
+
+async def test_count_collection_vectors_unreachable_raises_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/collections/docs":
+            return httpx.Response(
+                200, json={"result": {"config": {"params": {"vectors": {"size": 768}}}}}
+            )
+        raise httpx.ConnectError("connection refused", request=request)
+
+    store = _store(httpx.MockTransport(handler))
+
+    with pytest.raises(QdrantVectorStoreError):
+        await store.count_collection_vectors("docs")

@@ -74,3 +74,13 @@ class VectorStore(ABC):
         any payload or performing a similarity search.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def count_collection_vectors(self, collection_name: str) -> int | None:
+        """Return the total number of points in a collection, or None if it doesn't exist.
+
+        A read-only, collection-scoped (not document-scoped) count — added for the collection
+        reconciliation report (Phase 2.8.7, subtask 5), which needs "how many vectors are
+        physically present in this collection" without enumerating any point/payload.
+        """
+        raise NotImplementedError

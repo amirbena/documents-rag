@@ -1710,10 +1710,13 @@ payload retrieval, never a full-collection scroll).
 **Deferred, not silently ignored.** `STALE_REINDEX_JOB` is not implemented: no approved stale
 threshold exists yet for `ReindexJob` (only `Settings.ingestion_stale_after_seconds` exists, and
 only for `IngestionJob`) — inventing one here would be exactly the kind of un-asked-for scope this
-subtask must avoid. Orphan object/vector discovery, storage-bucket/Qdrant-collection scanning, a
-reconciliation worker/scheduler, and a public API (a future `GET
-/api/v1/documents/{document_id}/audit` may expose this once the result contract stabilizes) are all
-explicitly out of scope for this subtask — no repair exists yet at all.
+subtask must avoid. Orphan object/vector discovery, storage-bucket/Qdrant-collection scanning, and
+a reconciliation worker/scheduler are explicitly out of scope for this subtask — no repair exists
+yet at all. A public API (`GET /api/v1/reconciliation/documents/{document_id}/audit`) was added in
+Phase 2.8.7 subtask 5 — see "Single-document lifecycle audit API" below; two small additive fields
+(`PostgresLifecycleState.document_created_at`, `VectorLifecycleState.vector_count`) were added to
+this module at that point so the API wouldn't need a second query for information the audit had
+already loaded — see that section for why.
 
 ## Reconciliation: bounded batch lifecycle audit (`app/services/reconciliation/`, Phase 2.8.7, subtask 2)
 
@@ -1759,12 +1762,13 @@ Storage/Qdrant inspection failures are already handled by the single-document au
 exception raised while auditing a document is never folded into a finding — it propagates, since an
 unexpected exception is not proof that the audited document is inconsistent.
 
-**Deferred, not silently ignored.** No public/admin endpoint, CLI, scheduler, background worker, or
-dashboard is added — this subtask produces an internal service and typed result contract only, for
-a future consumer to build on once the result shape is reviewed. No audit run is persisted; no
-repair, retry, or orphan discovery is implemented. Object Storage bucket scanning and Qdrant
-collection-wide scanning remain out of scope, exactly as in subtask 1 — only documents already
-selected from PostgreSQL are ever inspected.
+**Deferred, not silently ignored.** No CLI, scheduler, background worker, or dashboard is added.
+No audit run is persisted; no repair, retry, or orphan discovery is implemented. Object Storage
+bucket scanning and Qdrant collection-wide scanning remain out of scope, exactly as in subtask 1
+— only documents already selected from PostgreSQL are ever inspected. A public API (`GET
+/api/v1/reconciliation/documents/audit`, subtask 3) and a per-document `classification` field
+(`classify_document_audit()`, subtask 5's shared classifier — see below) were both added on top of
+this subtask's result contract without changing its pagination/cursor behavior.
 
 ## Reconciliation: batch lifecycle audit API (`app/api/v1/routes/reconciliation.py`, Phase 2.8.7, subtask 3)
 
@@ -1782,11 +1786,13 @@ subtask, `DocumentAuditSummary` carried only `overall_status`/`findings` — eno
 service's own aggregate counts, but not enough for a per-document API field without recomputing
 the same bucket logic in the router (exactly the duplication CLAUDE.md's route-layer rule
 forbids). `document_audit_batch_service.py` now derives both the per-document `classification`
-field and the aggregate `*_count` fields from one shared `_classify()` function, so the two can
-never drift, and also stamps `created_at` onto `DocumentAuditSummary` (trivial — it was already
-fetched in the page query) since the API item needs it. Both are additive: existing unit/
-integration tests for the batch service needed no changes, and `audit_document_lifecycle_batch()`'s
-signature, cursor format, and pagination behavior are all unchanged.
+field and the aggregate `*_count` fields from one shared `classify_document_audit()` function
+(public — not module-private — specifically so the single-document audit API added in subtask 5
+can reuse it too; see below), so the two can never drift, and also stamps `created_at` onto
+`DocumentAuditSummary` (trivial — it was already fetched in the page query) since the API item
+needs it. Both are additive: existing unit/integration tests for the batch service needed no
+changes, and `audit_document_lifecycle_batch()`'s signature, cursor format, and pagination
+behavior are all unchanged.
 
 **Validation and error mapping.** `limit` is validated twice, deliberately: FastAPI's
 `Query(ge=MIN_BATCH_LIMIT, le=MAX_BATCH_LIMIT)` rejects most out-of-range values with a `422`
@@ -1804,6 +1810,94 @@ normal `500` — never silently downgraded to a partial 200.
 no repair, activation, cleanup, or scheduling endpoint exists. Pagination is exclusively the
 service's existing opaque keyset cursor — this subtask adds no new pagination mechanism, and no
 offset-based alternative.
+
+## Reconciliation: single-document audit API and collection report API (Phase 2.8.7, subtask 5)
+
+This subtask completes the reconciliation reporting surface: one document (new), a bounded page
+of documents (already existed, subtask 3), and one collection (new) — all under
+`app/api/v1/routes/reconciliation.py`, all read-only, all sharing the same `get_file_storage()`/
+`get_vector_store()` dependency wrappers already defined in that module.
+
+### Single-document audit API
+
+**`GET /api/v1/reconciliation/documents/{document_id}/audit`** delegates to
+`audit_document_lifecycle()` exactly once — never routed through the batch auditor. Its
+`classification` field is computed via the exact same `classify_document_audit()` the batch
+endpoint already uses internally (see subtask 3 above), so a single-document result and a
+batch-page result are guaranteed to classify identically for the same underlying findings — no
+second classification rule exists anywhere. A missing document is `200` with
+`classification: "not_found"` and `database.document_exists: false`, never `404` — the service
+already represents a missing document as a typed `AuditOverallStatus.NOT_FOUND` result, not an
+exception, and the route preserves that rather than inventing an HTTP-layer semantic the service
+doesn't have.
+
+**Two small, additive fields were added to `document_audit_service.py` for this subtask** —
+`PostgresLifecycleState.document_created_at` (the already-loaded `Document.created_at`, no new
+query) and `VectorLifecycleState.vector_count` (the count `audit_document_lifecycle()` already
+computes internally via `count_document_vectors()`, previously discarded down to a `has_vectors`
+boolean). Both are additive with safe defaults (`vector_count` defaults to `None`); no existing
+call site, test, or the batch service's own reuse of these types needed any change.
+
+### Collection reconciliation report API
+
+**`GET /api/v1/reconciliation/collections/{collection_name}/report`** delegates to a new service,
+`build_collection_reconciliation_report()`
+(`app/services/reconciliation/collection_reconciliation_report_service.py`) — no such
+report-composition capability existed anywhere before this subtask, so a thin new service was
+added rather than duplicating count logic in the router (per this subtask's own instruction).
+
+**`expected_vector_count` is a document-count-based proxy, not a tracked chunk count.** No column
+anywhere in this schema durably persists "how many chunks/vectors document X produced" —
+chunking's *result* is written straight to Qdrant, never counted back into Postgres. The service
+therefore computes `expected_vector_count` as the number of `Document` rows currently claiming
+`collection_name` (a bounded `SELECT count(*) ... WHERE collection_name = :name` aggregate) — a
+real, honest, cheap number, but not a claim that every document produces exactly one vector. A
+document can legitimately produce zero chunks (see "Zero-chunk behavior") or many, so
+`actual_vector_count` routinely exceeds `expected_vector_count` in a perfectly healthy collection
+— that surplus is never flagged. Only a **deficit**
+(`actual_vector_count < expected_vector_count`) is treated as `inconsistent`, mirroring exactly
+the same coarse "has at least one vector" philosophy the single-document auditor already applies
+(`ACTIVE_VECTORS_MISSING`).
+
+**Two independent "active" signals, both exposed.** `is_active` compares `collection_name` against
+the platform's single currently-*desired* collection (`get_active_embedding_config(settings).
+collection_name` — the same comparison `is_document_stale()`/`schedule_reindex()` already use
+everywhere else). `index_collection_status` is the separate `IndexCollection.status`
+(`active`/`retired`) bookkeeping flag, which is never automatically exclusive across rows. A
+collection can be internally consistent (`classification: "healthy"`) while `is_active: false` —
+inactive is not the same fact as unhealthy.
+
+**Classification is a closed four-value set** (`CollectionReportClassification`): `healthy`
+(exists, no deficit), `inconsistent` (exists, deficit), `missing` (no such Qdrant collection —
+`200`, never `404`, matching the single-document/batch endpoints' own missing-resource
+convention), and `unmanaged` (the collection physically exists in Qdrant but has no persisted
+`IndexCollection` row at all — never silently reported as `healthy`, since untracked platform
+state is itself worth an operator's attention even when no document claims it).
+
+**A new `VectorStore.count_collection_vectors(collection_name) -> int | None` method** was added
+(`app/rag/providers/vector_store.py` + `QdrantVectorStore`) — no existing method counted total
+points in a collection irrespective of document; only `count_document_vectors()` (per-document,
+filtered) and `get_collection_vector_size()` (configured dimension, not a point count) existed.
+The new method mirrors `count_document_vectors()`'s exact request/error-handling shape, only
+omitting the document-id filter — an unfiltered `POST /collections/{name}/points/count`. It
+returns `None` for a missing collection (never raises for that case) and propagates
+`QdrantVectorStoreError` for every other failure, exactly like its sibling methods.
+
+**Unexpected dependency failures are never downgraded to a fabricated report — deliberately
+different from the single-document auditor.** The single-document auditor turns a Qdrant failure
+into a `WARNING` finding, because a document-level audit still has other useful signals to report
+even when Qdrant is unreachable. A collection report has no such fallback signal for its one
+Qdrant call — so `QdrantVectorStoreError` (and any other unexpected exception) is left to
+propagate all the way to a normal `500`, per this subtask's explicit instruction; `collection_name`
+validation (`InvalidCollectionNameError`, checked against the exact charset
+`app.rag.embedding_config._sanitize()` ever produces) is the only case mapped to a client error
+(`400`), and it is checked before any query runs.
+
+**Deferred, not silently ignored.** No repair, no automatic remediation, no vector deletion, no
+document mutation, no scheduler, no CLI, no persisted report history, no orphan-vector-ID or
+orphan-document listing, no cross-collection batch reporting, and no collection deletion/rollback
+endpoint — this subtask is a diagnostic snapshot only, exactly like its two sibling reconciliation
+endpoints.
 
 ## Streaming chat endpoint
 

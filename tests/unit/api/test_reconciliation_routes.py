@@ -360,10 +360,17 @@ def test_exactly_one_call_to_the_batch_service(monkeypatch: pytest.MonkeyPatch) 
     assert len(calls) == 1
 
 
-def test_router_never_imports_the_single_document_auditor() -> None:
-    """The router must delegate to the batch service only — never call audit_document_lifecycle
-    directly, which would mean re-auditing outside the service's own sequential batch loop."""
-    assert not hasattr(reconciliation_route_module, "audit_document_lifecycle")
+def test_batch_route_never_calls_the_single_document_auditor_directly() -> None:
+    """The batch route must delegate to audit_document_lifecycle_batch() only — never call
+    audit_document_lifecycle() itself, which would mean re-auditing outside the service's own
+    sequential batch loop. (The module now also exposes a single-document audit route — Phase
+    2.8.7, subtask 5 — which legitimately imports and calls audit_document_lifecycle() directly;
+    this test scopes the assertion to the batch route's own source only.)"""
+    import inspect
+
+    source = inspect.getsource(reconciliation_route_module.audit_documents_batch_route)
+    assert "audit_document_lifecycle(" not in source
+    assert "audit_document_lifecycle_batch(" in source
 
 
 def test_router_does_not_recalculate_classification_or_summary_counts() -> None:

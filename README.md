@@ -344,8 +344,8 @@ Five read-only endpoints let you inspect a document's lifecycle and download its
 content — see "Document read APIs and original download (Phase 2.8.2)" in
 [ARCHITECTURE.md](ARCHITECTURE.md) for full contract details, the lifecycle-status derivation
 table, and the 404/409/503 mapping rationale. None of them mutate anything (delete/re-index are
-separate, mutating endpoints, see below; the read-only batch reconciliation endpoint is documented
-further down).
+separate, mutating endpoints, see below; the read-only reconciliation reporting endpoints are
+documented further down).
 
 ```bash
 # List (paginated, newest first)
@@ -872,29 +872,62 @@ full answer: each `OrchestratorToken` is written to the response as soon as the 
 so `curl -N` (no-buffer mode, shown above) prints tokens as they arrive rather than all at once at
 the end. This event shape is identical regardless of which `RagEngine` produced it.
 
-### Batch document lifecycle audit (read-only)
+### Reconciliation reporting APIs (read-only)
 
-`GET /api/v1/reconciliation/documents/audit` (`app/api/v1/routes/reconciliation.py`) is a
-read-only diagnostic endpoint over the existing bounded batch auditor — see "Reconciliation:
-bounded batch lifecycle audit" in [ARCHITECTURE.md](ARCHITECTURE.md) for the full contract. It
-never mutates anything; there is no repair, scheduler, CLI, or persisted audit history yet.
+Three read-only diagnostic endpoints (`app/api/v1/routes/reconciliation.py`) over the
+reconciliation service layer — one document, a bounded page of documents, and one collection.
+None of them mutate anything: no repair, no scheduler, no CLI, no persisted audit/report history,
+no automatic activation, no cleanup execution, no orphan-ID discovery. See "Reconciliation:
+bounded batch lifecycle audit" / "Single-document lifecycle audit API" / "Collection
+reconciliation report API" in [ARCHITECTURE.md](ARCHITECTURE.md) for full contracts.
 
 ```bash
+# One document, by id — always 200, even for a document that doesn't exist (see below).
+curl "http://localhost:8000/api/v1/reconciliation/documents/<document_id>/audit"
+
+# A bounded, oldest-first page of documents (opaque cursor pagination).
 curl "http://localhost:8000/api/v1/reconciliation/documents/audit?limit=20"
+
+# One collection's consistency report, by name — always 200, even for a collection that
+# doesn't exist (see below).
+curl "http://localhost:8000/api/v1/reconciliation/collections/<collection_name>/report"
 ```
 
-Query parameters: `limit` (optional, 1-50, default 20 — out-of-range values are rejected with
-`422`) and `cursor` (optional, opaque — pass back the previous page's `next_cursor` verbatim to
-continue; a malformed cursor is rejected with `400`). Response:
+**Single-document audit** delegates to `audit_document_lifecycle()` exactly once and is always
+`200` — a missing document is represented as `classification: "not_found"` with
+`database.document_exists: false`, never a `404` (the service already returns this as a typed
+result, not an exception, and the route preserves that). Response:
+
+```json
+{
+  "document_id": "...",
+  "overall_status": "consistent",
+  "classification": "warning",
+  "issues": [{"code": "...", "severity": "warning", "summary": "...", "...": "..."}],
+  "database": {
+    "document_exists": true, "collection_name": "documents-v2",
+    "document_created_at": "2026-01-01T00:00:00Z", "latest_ingestion_status": "completed",
+    "latest_deletion_status": null, "latest_reindex_status": null,
+    "latest_reindex_activated": false, "pending_cleanup_collections": []
+  },
+  "file_storage": {"inspected": true, "source_file_exists": true},
+  "vector_store": {
+    "inspected": true, "collection_name": "documents-v2",
+    "collection_exists": true, "has_vectors": true, "vector_count": 3
+  }
+}
+```
+
+**Batch document audit** pages through documents oldest-first via an opaque keyset cursor.
+`limit` (optional, 1-50, default 20; out-of-range is a `422`) and `cursor` (optional, opaque — pass
+back the previous page's `next_cursor` verbatim; a malformed cursor is a `400`). Response:
 
 ```json
 {
   "items": [
     {
-      "document_id": "...",
-      "original_filename": "report.pdf",
-      "created_at": "2026-01-01T00:00:00+00:00",
-      "overall_status": "consistent",
+      "document_id": "...", "original_filename": "report.pdf",
+      "created_at": "2026-01-01T00:00:00+00:00", "overall_status": "consistent",
       "classification": "warning",
       "issues": [{"code": "...", "severity": "warning", "summary": "...", "...": "..."}]
     }
@@ -909,8 +942,38 @@ continue; a malformed cursor is rejected with `400`). Response:
 }
 ```
 
-Documents are always returned oldest-first (deterministic keyset pagination); an empty repository
-returns `200` with empty `items`/zeroed `summary`/`next_cursor: null`, never `404`.
+Documents are always returned oldest-first (deterministic keyset pagination), audited
+sequentially (one shared `AsyncSession`, never concurrently); an empty repository returns `200`
+with empty `items`/zeroed `summary`/`next_cursor: null`, never `404`.
+
+**Collection report** delegates to `build_collection_reconciliation_report()` exactly once and is
+always `200` — a missing collection is `classification: "missing"`, `exists: false`,
+`actual_vector_count: 0`, never a `404`; `collection_name` is validated (`400` if malformed) but
+otherwise never transformed. `is_active` compares against the platform's single currently-desired
+collection (`get_active_embedding_config()`), independent of `index_collection_status`
+(`IndexCollection.status`'s own `active`/`retired` bookkeeping flag) — an inactive collection can
+still be perfectly consistent. `expected_vector_count` is a **document-count-based proxy**, not a
+tracked chunk count (this schema never persists one) — only a *deficit*
+(`actual_vector_count < expected_vector_count`) is ever flagged `inconsistent`; a surplus (the
+normal case for multi-chunk documents) is not. Response:
+
+```json
+{
+  "collection_name": "documents-v2",
+  "classification": "healthy",
+  "exists": true,
+  "is_active": true,
+  "index_collection_status": "active",
+  "embedding_provider": "ollama", "embedding_model": "bge-m3",
+  "embedding_dimension": 1024, "embedding_version": "v1", "chunking_version": "v1",
+  "document_count": 1540,
+  "expected_vector_count": 1540,
+  "actual_vector_count": 1540,
+  "difference": 0,
+  "issues": [],
+  "generated_at": "2026-07-19T10:00:00Z"
+}
+```
 
 ## Verification
 
