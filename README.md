@@ -402,7 +402,8 @@ external resources (Qdrant vectors, the stored object) are removed.
 
 ```bash
 # Schedule deletion — 202 if newly scheduled or already active, 200 if already fully deleted,
-# 404 if the document is missing, 409 if it has an active ingestion job.
+# 404 if the document is missing, 409 if it has an active ingestion job or an active re-index job
+# (deletion never races an in-flight ingestion or an in-flight re-index build).
 curl -X DELETE "http://localhost:8000/api/v1/documents/<document_id>"
 
 # Inspect the latest deletion attempt (404 if none was ever requested).
@@ -448,13 +449,21 @@ curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex/activ
 # Activate a completed build — job-scoped: targets one explicit re-index job directly by id, so
 # the caller doesn't need to already know the owning document:
 curl -X POST "http://localhost:8000/api/v1/reindex/jobs/<job_id>/activate"
+
+# Build one pending re-index job against the configured database/Qdrant/storage (manual/optional —
+# never run by make verify/CI, mirrors make process-pending-document-deletions; processes at most
+# one job per invocation, invoke repeatedly to make further progress):
+make process-pending-reindex-jobs
 ```
 
-`POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — the existing out-of-band
-`ReindexWorker` claims and builds it separately, never inline in this request. A successful build
-writes the target's vectors into a new collection but **never switches which collection the
-document serves from** — the running process keeps serving the document's current collection
-untouched, for as long as the operator wants, until an explicit activation call.
+`POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — it never builds inline. Building
+is a separate, explicit, bounded operational step: `make process-pending-reindex-jobs`
+(`scripts/process_pending_reindex_jobs.py`) claims and builds **at most one** pending job per
+invocation via the existing `ReindexWorker`, then exits — an operator or external scheduler invokes
+it repeatedly to make further progress; the script itself never loops, polls, or schedules itself. A
+successful build writes the target's vectors into a new collection but **never switches which
+collection the document serves from** — the running process keeps serving the document's current
+collection untouched, for as long as the operator wants, until an explicit activation call.
 
 Both activation endpoints delegate to the exact same `activate_reindexed_document()` service call
 — one atomic, `SELECT ... FOR UPDATE`-locked transaction that switches the document's serving
@@ -466,13 +475,22 @@ with `already_activated: true` in the response, no second switch, no second `act
 duplicate cleanup job; 404 if the job/document can't be found; 409 if the job isn't `COMPLETED`,
 its source collection changed since scheduling, or the document has a blocking deletion in
 progress. Activation never executes the `VectorCleanupJob` it creates inline — that remains a
-separate, out-of-band operation. `process_next_vector_cleanup_job()` claims one pending/failed
-cleanup job at a time (oldest first), refuses to delete a collection that is still the document's
-*current* active collection (a defensive safety guard), and marks the job `COMPLETED`/`FAILED` on
-completion; processing more than one job per call, and looping, is left to whatever caller invokes
-it — there is no dedicated Makefile target or script for this yet in this codebase (unlike full
-document deletion's `make process-pending-document-deletions`). The vacated collection's vectors
-remain in place — readable, unused — until that cleanup step actually runs.
+separate, out-of-band operation:
+
+```bash
+# Clean up one pending/retry-eligible vector-cleanup job against the configured Qdrant instance
+# (manual/optional — never run by make verify/CI; processes at most one job per invocation,
+# invoke repeatedly to make further progress; automatically covers retrying a previously-FAILED
+# job too, since the underlying claim query already selects PENDING and FAILED rows):
+make process-pending-vector-cleanups
+```
+
+`make process-pending-vector-cleanups` (`scripts/process_pending_vector_cleanups.py`) claims one
+pending/failed cleanup job at a time (oldest first) via the existing
+`process_next_vector_cleanup_job()`, refuses to delete a collection that is still the document's
+*current* active collection (a defensive safety guard, always preserved), and marks the job
+`COMPLETED`/`FAILED` on completion — never hiding a partial/failed outcome as success. The vacated
+collection's vectors remain in place — readable, unused — until that cleanup step actually runs.
 
 **Document-scoped vs. job-scoped activation:** the document-scoped route resolves which
 `ReindexJob` to activate *through the document* (its latest attempt, or an explicit `?job_id=`

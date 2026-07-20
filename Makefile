@@ -192,3 +192,9 @@ recover-stale-ingestion-jobs:
 
 process-pending-document-deletions:
 	python scripts/process_pending_document_deletions.py
+
+process-pending-reindex-jobs:
+	python scripts/process_pending_reindex_jobs.py
+
+process-pending-vector-cleanups:
+	python scripts/process_pending_vector_cleanups.py

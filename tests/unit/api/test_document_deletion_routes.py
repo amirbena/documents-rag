@@ -15,6 +15,7 @@ from app.main import app
 from app.models.document import Document
 from app.models.document_deletion_job import DocumentDeletionJob, DocumentDeletionStatus
 from app.models.ingestion_job import IngestionJob, IngestionStatus
+from app.models.reindex_job import ReindexJob, ReindexJobStatus
 from tests.support.documents.deletion.fake_session import FakeDocumentDeletionSession
 
 client = TestClient(app)
@@ -111,6 +112,78 @@ def test_delete_active_ingestion_returns_409() -> None:
     response = _delete(document.id)
 
     assert response.status_code == 409
+
+
+def _reindex_job(document_id: str, status: ReindexJobStatus, **overrides: object) -> ReindexJob:
+    now = datetime.now(UTC)
+    fields: dict[str, object] = {
+        "id": str(uuid.uuid4()),
+        "document_id": document_id,
+        "source_collection_name": "documents__ollama__old__ev0__cv0__d768",
+        "target_collection_name": "documents__ollama__new__ev1__cv1__d768",
+        "target_chunk_size": 500,
+        "target_chunk_overlap": 50,
+        "status": status,
+        "created_at": now,
+        "updated_at": now,
+    }
+    fields.update(overrides)
+    return ReindexJob(**fields)  # type: ignore[arg-type]
+
+
+def test_delete_active_reindex_returns_409_not_500() -> None:
+    """REINDEX_ACTIVE must map to a documented 409, never fall through to the `job is not None`
+    assertion (which previously raised AssertionError -> uncaught -> HTTP 500)."""
+    session = _override_session()
+    document = _document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = _reindex_job(document.id, ReindexJobStatus.PENDING)
+
+    response = _delete(document.id)
+
+    assert response.status_code == 409
+    body = response.json()
+    assert "detail" in body
+    assert isinstance(body["detail"], str)
+    # sanitized/stable: no raw exception text, no internal collection-name leakage
+    assert "AssertionError" not in body["detail"]
+    assert "Traceback" not in body["detail"]
+
+
+def test_delete_active_reindex_processing_also_returns_409() -> None:
+    session = _override_session()
+    document = _document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = _reindex_job(document.id, ReindexJobStatus.PROCESSING)
+
+    response = _delete(document.id)
+
+    assert response.status_code == 409
+
+
+def test_delete_active_reindex_creates_no_deletion_job() -> None:
+    session = _override_session()
+    document = _document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = _reindex_job(document.id, ReindexJobStatus.PENDING)
+
+    _delete(document.id)
+
+    assert session.deletion_jobs == {}
+    assert session.commit_count == 0
+
+
+def test_delete_completed_reindex_does_not_block_deletion() -> None:
+    """A COMPLETED (no longer active) ReindexJob must not block deletion scheduling."""
+    session = _override_session()
+    document = _document()
+    session.documents[document.id] = document
+    session.reindex_jobs[str(uuid.uuid4())] = _reindex_job(document.id, ReindexJobStatus.COMPLETED)
+
+    response = _delete(document.id)
+
+    assert response.status_code == 202
+    assert response.json()["created"] is True
 
 
 def test_delete_existing_pending_job_returns_202_created_false() -> None:

@@ -9,8 +9,9 @@ persisted `target_chunk_size`/`target_chunk_overlap`, and delegates to
 `embedding_*`/`chunking_version`/`indexed_at` are never touched, no `VectorCleanupJob` is created,
 and no vector is ever deleted from any collection. `ReindexJob.status == COMPLETED` means only
 "the pinned target build succeeded" — never "the target is active or serving." Activation is a
-separate, later operation (`reindex_service.activate_reindexed_document()`), not performed here and
-not wired into anything yet.
+separate, later operation (`reindex_service.activate_reindexed_document()`), not performed here.
+`ReindexWorker.process_next_job()` is invoked out-of-band by `scripts/process_pending_reindex_jobs.py`
+(`make process-pending-reindex-jobs`), never inline from any route or from this module itself.
 
 ## Defense in depth against deletion races
 
