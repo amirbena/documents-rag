@@ -1410,6 +1410,41 @@ current consumer requires this operation, document it as deferred rather than cr
 surface") it was not implemented — a future subtask should add it once a real consumer exists,
 reusing `is_document_stale()`/`get_active_reindex_job()` rather than a new comparison.
 
+### Job-id-scoped operator activation endpoint (`app/api/v1/routes/reindex.py`, Phase 2.8.7, subtask 4)
+
+**`POST /api/v1/reindex/jobs/{job_id}/activate`** is a second, explicit-operator-only activation
+endpoint alongside the document-scoped one above — same underlying service call
+(`activate_reindexed_document()`), same `_ACTIVATION_OUTCOME_ERRORS` outcome-to-status mapping,
+no duplicated eligibility logic, no automatic/implicit activation through any read endpoint. It
+exists because `activate_reindexed_document(session, job_id)` already resolves everything it needs
+(document, source/target collection names) from `job_id` alone — an operator who already has a
+job id (e.g. from `POST .../reindex`'s response, or from `GET .../reindex`'s `latest_attempt`)
+should not need to also know or re-supply the owning `document_id` just to activate it.
+
+**Response is richer than the document-scoped sibling's**, because this is meant as the primary
+operator-facing activation surface: `ReindexJobActivationResponse` adds
+`previous_collection_name`/`active_collection_name` (read directly off the activated `ReindexJob`
+row's own `source_collection_name`/`target_collection_name` — never recomputed). It does not
+expose a cleanup-job identifier — `ReindexActivationResult` gains no new field for this endpoint;
+`activate_reindexed_document()` and its existing result type are reused entirely unchanged, so
+this endpoint requires no service modification at all.
+
+**Idempotency, atomicity, and rollback are unchanged — inherited entirely from the service.** A
+repeated call against an already-activated job returns 200 with `already_activated=true`; it
+performs no second collection switch, writes no second `activated_at`, and creates no duplicate
+cleanup work — the same `SELECT ... FOR UPDATE` row-locking described under "Re-index activation"
+above already makes concurrent/repeated activation of the same job safe, and this endpoint adds no
+locking of its own. A failure during activation (commit failure, or any other exception
+`activate_reindexed_document()` raises) propagates as a normal `500` — the route never catches it,
+fabricates a response, or leaves the document pointing at a collection the job was never actually
+marked `activated_at` for.
+
+**Excluded, deliberately:** no automatic activation after a build completes, no scheduled/periodic
+activation, no approval workflow, no activation-history table, no rollback endpoint, no
+caller-supplied collection-name override (the target is always the job's own pinned
+`target_collection_name`), no cleanup-execution endpoint, and no reconciliation/batch-audit
+behavior of any kind — this is a manual, explicit, operator-triggered action only.
+
 ### Zero-chunk behavior
 
 A document whose extracted text produces zero chunks (e.g. genuinely empty content) is still a
