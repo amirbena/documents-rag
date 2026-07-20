@@ -64,3 +64,23 @@ class VectorStore(ABC):
     async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
         """Delete every point belonging to document_id from a collection, if the collection exists."""
         raise NotImplementedError
+
+    @abstractmethod
+    async def count_document_vectors(self, collection_name: str, document_id: str) -> int:
+        """Return how many points belong to document_id in a collection (0 if the collection is missing).
+
+        A read-only existence/count check — added for the document lifecycle audit (Phase 2.8.7),
+        which needs to know "does at least one vector exist for this document" without retrieving
+        any payload or performing a similarity search.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def count_collection_vectors(self, collection_name: str) -> int | None:
+        """Return the total number of points in a collection, or None if it doesn't exist.
+
+        A read-only, collection-scoped (not document-scoped) count — added for the collection
+        reconciliation report (Phase 2.8.7, subtask 5), which needs "how many vectors are
+        physically present in this collection" without enumerating any point/payload.
+        """
+        raise NotImplementedError

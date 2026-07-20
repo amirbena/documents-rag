@@ -167,6 +167,64 @@ class QdrantVectorStore(VectorStore):
                 f"Malformed collection-info response from Qdrant for {collection_name!r}"
             ) from exc
 
+    async def count_document_vectors(self, collection_name: str, document_id: str) -> int:
+        """Return how many points belong to document_id in a collection (0 if it doesn't exist)."""
+        exists = await self.get_collection_vector_size(collection_name)
+        if exists is None:
+            return 0
+
+        async with self._client() as client:
+            try:
+                response = await client.post(
+                    f"/collections/{collection_name}/points/count",
+                    json={
+                        "filter": {"must": [{"key": "document_id", "match": {"value": document_id}}]},
+                        "exact": True,
+                    },
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise QdrantVectorStoreError(
+                    f"Qdrant returned {exc.response.status_code} counting document {document_id!r} "
+                    f"in {collection_name!r}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise QdrantVectorStoreError(f"Qdrant unreachable counting vectors: {exc}") from exc
+
+        try:
+            return int(response.json()["result"]["count"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise QdrantVectorStoreError(
+                f"Malformed count response from Qdrant for {collection_name!r}"
+            ) from exc
+
+    async def count_collection_vectors(self, collection_name: str) -> int | None:
+        """Return the total number of points in a collection, or None if it doesn't exist."""
+        exists = await self.get_collection_vector_size(collection_name)
+        if exists is None:
+            return None
+
+        async with self._client() as client:
+            try:
+                response = await client.post(
+                    f"/collections/{collection_name}/points/count",
+                    json={"exact": True},
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise QdrantVectorStoreError(
+                    f"Qdrant returned {exc.response.status_code} counting points in {collection_name!r}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise QdrantVectorStoreError(f"Qdrant unreachable counting vectors: {exc}") from exc
+
+        try:
+            return int(response.json()["result"]["count"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise QdrantVectorStoreError(
+                f"Malformed count response from Qdrant for {collection_name!r}"
+            ) from exc
+
     async def delete_by_document_id(self, collection_name: str, document_id: str) -> None:
         """Delete every point belonging to document_id from a collection, if it exists."""
         exists = await self.get_collection_vector_size(collection_name)
