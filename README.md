@@ -449,13 +449,21 @@ curl -X POST "http://localhost:8000/api/v1/documents/<document_id>/reindex/activ
 # Activate a completed build — job-scoped: targets one explicit re-index job directly by id, so
 # the caller doesn't need to already know the owning document:
 curl -X POST "http://localhost:8000/api/v1/reindex/jobs/<job_id>/activate"
+
+# Build one pending re-index job against the configured database/Qdrant/storage (manual/optional —
+# never run by make verify/CI, mirrors make process-pending-document-deletions; processes at most
+# one job per invocation, invoke repeatedly to make further progress):
+make process-pending-reindex-jobs
 ```
 
-`POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — the existing out-of-band
-`ReindexWorker` claims and builds it separately, never inline in this request. A successful build
-writes the target's vectors into a new collection but **never switches which collection the
-document serves from** — the running process keeps serving the document's current collection
-untouched, for as long as the operator wants, until an explicit activation call.
+`POST .../reindex` only ever inserts a `PENDING` `ReindexJob` row — it never builds inline. Building
+is a separate, explicit, bounded operational step: `make process-pending-reindex-jobs`
+(`scripts/process_pending_reindex_jobs.py`) claims and builds **at most one** pending job per
+invocation via the existing `ReindexWorker`, then exits — an operator or external scheduler invokes
+it repeatedly to make further progress; the script itself never loops, polls, or schedules itself. A
+successful build writes the target's vectors into a new collection but **never switches which
+collection the document serves from** — the running process keeps serving the document's current
+collection untouched, for as long as the operator wants, until an explicit activation call.
 
 Both activation endpoints delegate to the exact same `activate_reindexed_document()` service call
 — one atomic, `SELECT ... FOR UPDATE`-locked transaction that switches the document's serving
