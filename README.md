@@ -475,13 +475,22 @@ with `already_activated: true` in the response, no second switch, no second `act
 duplicate cleanup job; 404 if the job/document can't be found; 409 if the job isn't `COMPLETED`,
 its source collection changed since scheduling, or the document has a blocking deletion in
 progress. Activation never executes the `VectorCleanupJob` it creates inline — that remains a
-separate, out-of-band operation. `process_next_vector_cleanup_job()` claims one pending/failed
-cleanup job at a time (oldest first), refuses to delete a collection that is still the document's
-*current* active collection (a defensive safety guard), and marks the job `COMPLETED`/`FAILED` on
-completion; processing more than one job per call, and looping, is left to whatever caller invokes
-it — there is no dedicated Makefile target or script for this yet in this codebase (unlike full
-document deletion's `make process-pending-document-deletions`). The vacated collection's vectors
-remain in place — readable, unused — until that cleanup step actually runs.
+separate, out-of-band operation:
+
+```bash
+# Clean up one pending/retry-eligible vector-cleanup job against the configured Qdrant instance
+# (manual/optional — never run by make verify/CI; processes at most one job per invocation,
+# invoke repeatedly to make further progress; automatically covers retrying a previously-FAILED
+# job too, since the underlying claim query already selects PENDING and FAILED rows):
+make process-pending-vector-cleanups
+```
+
+`make process-pending-vector-cleanups` (`scripts/process_pending_vector_cleanups.py`) claims one
+pending/failed cleanup job at a time (oldest first) via the existing
+`process_next_vector_cleanup_job()`, refuses to delete a collection that is still the document's
+*current* active collection (a defensive safety guard, always preserved), and marks the job
+`COMPLETED`/`FAILED` on completion — never hiding a partial/failed outcome as success. The vacated
+collection's vectors remain in place — readable, unused — until that cleanup step actually runs.
 
 **Document-scoped vs. job-scoped activation:** the document-scoped route resolves which
 `ReindexJob` to activate *through the document* (its latest attempt, or an explicit `?job_id=`
