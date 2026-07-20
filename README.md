@@ -402,7 +402,8 @@ external resources (Qdrant vectors, the stored object) are removed.
 
 ```bash
 # Schedule deletion — 202 if newly scheduled or already active, 200 if already fully deleted,
-# 404 if the document is missing, 409 if it has an active ingestion job.
+# 404 if the document is missing, 409 if it has an active ingestion job or an active re-index job
+# (deletion never races an in-flight ingestion or an in-flight re-index build).
 curl -X DELETE "http://localhost:8000/api/v1/documents/<document_id>"
 
 # Inspect the latest deletion attempt (404 if none was ever requested).

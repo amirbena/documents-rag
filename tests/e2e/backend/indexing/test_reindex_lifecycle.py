@@ -84,6 +84,36 @@ def process_pending_cleanup(
     return _process
 
 
+async def test_delete_returns_409_while_reindex_job_is_active(
+    app_client: httpx.AsyncClient,
+    process_pending_job,
+    fake_embedding_provider: FakeEmbeddingProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DELETE against a document with an active (PENDING) ReindexJob must return 409, not 500 —
+    regression test for the previously-uncaught `assert result.job is not None` path."""
+    monkeypatch.setattr(
+        reindex_service_module, "get_embedding_provider", lambda settings=None: fake_embedding_provider
+    )
+    document_id = await upload_and_ingest(app_client, process_pending_job)
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "embedding_version", f"v-e2e-{uuid.uuid4().hex[:8]}")
+
+    schedule_response = await app_client.post(f"/api/v1/documents/{document_id}/reindex")
+    assert schedule_response.status_code == 202
+    assert schedule_response.json()["status"] == "pending"
+
+    delete_response = await app_client.delete(f"/api/v1/documents/{document_id}")
+
+    assert delete_response.status_code == 409
+    assert "AssertionError" not in delete_response.text
+
+    # No deletion job was created — the document's lifecycle status is unaffected.
+    detail = await app_client.get(f"/api/v1/documents/{document_id}")
+    assert detail.json()["status"] != "deleted"
+
+
 async def test_reindex_lifecycle_inspect_schedule_build_activate_cleanup(
     app_client: httpx.AsyncClient,
     process_pending_job,

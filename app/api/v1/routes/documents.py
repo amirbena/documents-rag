@@ -320,6 +320,22 @@ async def download_document_route(
     )
 
 
+_DELETION_OUTCOME_ERRORS = {
+    DeletionRequestOutcome.DOCUMENT_NOT_FOUND: (
+        status.HTTP_404_NOT_FOUND,
+        "Document not found.",
+    ),
+    DeletionRequestOutcome.INGESTION_ACTIVE: (
+        status.HTTP_409_CONFLICT,
+        "Document has an active ingestion job; cannot delete until it resolves.",
+    ),
+    DeletionRequestOutcome.REINDEX_ACTIVE: (
+        status.HTTP_409_CONFLICT,
+        "Document has an active re-index job; cannot delete until it resolves.",
+    ),
+}
+
+
 @router.delete("/documents/{document_id}", response_model=DocumentDeletionResponse)
 async def delete_document_route(
     document_id: str, response: Response, db: AsyncSession = Depends(get_db_session)
@@ -330,19 +346,17 @@ async def delete_document_route(
     `created=False` when an already-active (PENDING/PROCESSING) job was returned instead; 200
     with `created=False` when the document was already fully deleted (idempotent); 404 if the
     document does not exist; 409 if the document's latest ingestion job is still PENDING/
-    PROCESSING (deletion never races an in-flight ingestion). Never performs the actual
-    cross-system cleanup inline — see `app.services.documents.deletion_service.
-    request_document_deletion` and `app.services.documents.deletion_worker.DocumentDeletionWorker`.
+    PROCESSING (deletion never races an in-flight ingestion), or if the document has an active
+    (PENDING/PROCESSING) re-index job (deletion never races an in-flight re-index build either —
+    see `DeletionRequestOutcome.REINDEX_ACTIVE`). Never performs the actual cross-system cleanup
+    inline — see `app.services.documents.deletion_service.request_document_deletion` and
+    `app.services.documents.deletion_worker.DocumentDeletionWorker`.
     """
     result = await request_document_deletion(db, document_id)
 
-    if result.outcome == DeletionRequestOutcome.DOCUMENT_NOT_FOUND:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
-    if result.outcome == DeletionRequestOutcome.INGESTION_ACTIVE:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Document has an active ingestion job; cannot delete until it resolves.",
-        )
+    if result.outcome in _DELETION_OUTCOME_ERRORS:
+        status_code, detail = _DELETION_OUTCOME_ERRORS[result.outcome]
+        raise HTTPException(status_code=status_code, detail=detail)
 
     assert result.job is not None
     created = result.outcome == DeletionRequestOutcome.CREATED
