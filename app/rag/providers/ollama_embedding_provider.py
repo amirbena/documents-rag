@@ -7,6 +7,7 @@ no ingestion, no Qdrant writes. This is the embedding half of the RAG pipeline i
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.correlation import correlation_headers
 from app.rag.providers.embedding_provider import EmbeddingProvider
 
 # Category (Phase 2.10, see app/core/errors.py): ProviderError.
@@ -49,6 +50,7 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
                 response = await client.post(
                     "/api/embeddings",
                     json={"model": self._settings.ollama_embedding_model, "prompt": text},
+                    headers=correlation_headers(),
                 )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:

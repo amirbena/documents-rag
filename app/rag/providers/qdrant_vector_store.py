@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.correlation import correlation_headers
 from app.rag.providers.vector_store import VectorPoint, VectorSearchResult, VectorStore
 
 # Category (Phase 2.10, see app/core/errors.py): ProviderError.
@@ -65,7 +66,10 @@ class QdrantVectorStore(VectorStore):
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=self._settings.qdrant_url, timeout=30.0, transport=self._transport
+            base_url=self._settings.qdrant_url,
+            timeout=30.0,
+            transport=self._transport,
+            headers=correlation_headers(),
         )
 
     async def create_collection_if_not_exists(self, collection_name: str, vector_size: int) -> None:

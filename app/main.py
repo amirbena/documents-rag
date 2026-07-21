@@ -8,11 +8,18 @@ from app.api.v1.routes import chat, documents, providers, reconciliation, reinde
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.exception_handlers import app_error_handler, unhandled_exception_handler
+from app.core.logging_config import configure_logging
+from app.core.middleware import correlation_id_middleware
 from app.core.version import SERVICE_NAME, SERVICE_VERSION
 
 settings = get_settings()
+configure_logging(settings)
 
 app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION)
+
+# Correlation ID first (outermost) — every subsequent middleware/handler/log line in this request
+# can read app.core.correlation.get_correlation_id(). See app/core/middleware.py.
+app.middleware("http")(correlation_id_middleware)
 
 # Fallback net only — every route's own outcome-table/try-except mapping is checked first by
 # FastAPI (more specific handlers, including the built-in HTTPException one, always win); these

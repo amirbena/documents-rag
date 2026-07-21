@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.correlation import correlation_headers
 from app.rag.providers.llm_provider import LLMProvider
 
 # Category (Phase 2.10, see app/core/errors.py): ProviderError.
@@ -58,6 +59,7 @@ class OllamaLLMProvider(LLMProvider):
                         "prompt": prompt,
                         "stream": True,
                     },
+                    headers=correlation_headers(),
                 ) as response:
                     try:
                         response.raise_for_status()
