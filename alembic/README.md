@@ -83,7 +83,9 @@ development-stage repository with no deployed or persistent database that requir
 upgrade path; the decision was to reset history rather than keep an ever-growing chain or write a
 migration bridge. If your local database is currently stamped at any of the 9 deleted revision
 IDs, `alembic upgrade head` will fail (`Can't locate revision identified by '<old-id>'`) — you
-must recreate it:
+must recreate it (see also
+[docs/development/](../docs/development/README.md#recreating-your-local-database-after-the-alembic-history-reset-phase-210)
+and [docs/troubleshooting/](../docs/troubleshooting/README.md#stale-local-alembic-history-pre-phase-210-database)):
 
 ```bash
 # Local venv, Postgres reachable directly:

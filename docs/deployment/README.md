@@ -65,13 +65,22 @@ See [alembic/README.md](../../alembic/README.md) for migration-authoring mechani
 
 ## Infrastructure dependencies
 
-| Dependency | Required for the app to start? | Required for readiness? |
+**The process itself starts regardless of any remote dependency's reachability (Phase 2.10)** —
+`app/core/lifespan.py` never probes PostgreSQL/Qdrant/Ollama/Redis/MinIO at startup; the only
+things that can prevent the process from starting are invalid configuration (fail-fast `Settings`
+validation, see [docs/configuration/](../configuration/README.md#fail-fast-validation-phase-210))
+and failure to initialize an application-owned resource (the shared SQLAlchemy engine object
+itself — never a live connection). `GET /health/ready` below is what actually gates whether an
+instance is fit to receive traffic, and it can report `503` at any point after the process has
+already started and is otherwise running fine.
+
+| Dependency | Required for the process to start? | Required for `/health/ready`? |
 |---|---|---|
-| PostgreSQL | Yes (migrations must be applied first) | Yes |
-| Qdrant | Yes | Yes |
-| Ollama (+ both configured models pulled) | Yes | Yes |
-| Redis | No — app starts without it | No — checked but not required |
-| MinIO | Only if `FILE_STORAGE_PROVIDER=minio` | Only if configured |
+| PostgreSQL | No (migrations must still be applied before upload/etc. work) | Yes |
+| Qdrant | No | Yes |
+| Ollama (+ both configured models pulled) | No | Yes |
+| Redis | No | No — checked but not required |
+| MinIO | No | Only if `FILE_STORAGE_PROVIDER=minio` |
 
 ## Readiness assumptions
 
@@ -95,6 +104,41 @@ generic message — never a raw exception, connection string, or credential.
 liveness/readiness probes, load balancer health checks, ArgoCD rollout gates, monitoring/alerting
 polling `/health/dependencies`.
 
+## Graceful shutdown and process termination
+
+On SIGTERM/process exit, FastAPI's ASGI lifespan runs `app/core/lifespan.py`'s shutdown path: it
+disposes the shared SQLAlchemy engine (closing pooled connections) via an `AsyncExitStack`, with
+deterministic `app_shutdown_begin`/`app_shutdown_complete` structured log lines around it. No
+provider client is closed here — every Ollama/Qdrant/MinIO client is already created and closed
+per operation, so there is nothing else process-lifetime-scoped to release. This governs the API
+process only.
+
+The standalone `scripts/process_pending_*.py` batch scripts are a **separate process model** with
+their own SIGINT/SIGTERM handling — see
+[docs/operations/](../operations/README.md#worker-signal-handling-phase-210) for stop-before-next-claim
+semantics, exit codes, and the force-kill limitation for an already-claimed deletion/re-index job.
+
+## CORS
+
+`CORSMiddleware` (`app/core/cors.py`, registered in `app/main.py`) is always installed; its effect
+is governed entirely by `CORS_ALLOW_ORIGINS` (empty by default — no cross-origin request is
+permitted until a frontend origin is named). Fixed policy, not configuration surface:
+
+| Aspect | Value |
+|---|---|
+| Allowed origins | `CORS_ALLOW_ORIGINS` (comma-separated); empty = none allowed |
+| Allowed methods | `GET`, `POST`, `DELETE` — exactly the verbs this API's routes use |
+| Allowed headers | Starlette's safelisted set (`Accept`, `Accept-Language`, `Content-Language`, `Content-Type`) — covers JSON and multipart bodies; no custom header is allow-listed |
+| Credentials | **Disabled** (`allow_credentials=False`) — this backend has no cookie/session/bearer-token authentication, so there is no credentialed-CORS use case to support |
+| Exposed response headers | `X-Correlation-ID` — so browser-based frontend JS can read it (otherwise browsers hide non-safelisted response headers from cross-origin scripts) |
+
+Registered before `correlation_id_middleware` in `app/main.py`, so correlation ID stays the
+outermost middleware layer — see
+[docs/architecture/](../architecture/README.md#process-lifecycle-phase-210). A wildcard
+`CORS_ALLOW_ORIGINS=*`, if ever set, is honored as a real wildcard (Starlette reflects it as a
+literal `Access-Control-Allow-Origin: *`) and stays spec-safe specifically because credentials are
+disabled — the CORS spec forbids combining a wildcard origin with credentialed requests.
+
 ## Current deployment limitations
 
 - **No production deployment target exists** — no Kubernetes manifests, Helm charts, or cloud
@@ -102,8 +146,15 @@ polling `/health/dependencies`.
 - **No deployed background-worker process** — every worker (ingestion, deletion, re-index,
   cleanup) is invoked by a script or test, never a long-running managed process. See
   [docs/operations/](../operations/README.md).
-- **No auth, rate limiting, or observability/logging pipeline.**
-- **Alembic migrations are a manual step** — not automated as part of container startup.
+- **No auth or rate limiting.** Structured JSON logging and correlation IDs exist (Phase 2.10 —
+  see [docs/operations/](../operations/README.md#structured-logging)), but no metrics/tracing
+  platform.
+- **Alembic migrations are a manual step** — not automated as part of container startup. See
+  [docs/development/](../development/README.md#recreating-your-local-database-after-the-alembic-history-reset-phase-210)
+  if your local database predates the Phase 2.10 baseline reset.
+- **No automated stale-`PROCESSING` recovery for deletion/re-index jobs**, and **no safe
+  mid-operation cancellation** of a worker's active work unit — see
+  [docs/operations/](../operations/README.md#current-limitations).
 - **No CI workflow exists in this repository** (`.github/workflows/` is absent) — verification is
   run manually / via the local pre-commit hook only.
 
