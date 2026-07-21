@@ -12,15 +12,22 @@ returned to a caller.
 
 import asyncio
 import io
-from collections.abc import Mapping
+import os
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
+from typing import TypeVar
 
+import certifi
+import urllib3
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
+from urllib3 import Retry
 from urllib3.exceptions import MaxRetryError
+from urllib3.util import Timeout
 
 from app.core.config import Settings
+from app.core.retry import retry_async
 from app.storage.contract import FileMetadata, FileStorage, StoredFile
 from app.storage.errors import (
     StorageConfigurationError,
@@ -35,6 +42,21 @@ from app.storage.errors import (
 from app.storage.keys import validate_object_key
 
 _NOT_FOUND_CODES = {"NoSuchKey", "NoSuchObject"}
+# S3 error codes worth retrying — a temporary server-side condition, not "this request is wrong."
+# Every other S3Error (NoSuchKey, auth failures, BucketAlreadyOwnedByYou, ...) is permanent and is
+# already handled by each method's own except-block logic immediately after this retry exhausts.
+_TRANSIENT_S3_CODES = {"ServiceUnavailable", "SlowDown", "InternalError"}
+_T = TypeVar("_T")
+
+
+def _is_transient_minio_error(exc: Exception) -> bool:
+    """MaxRetryError (connection-level) is always transient; an S3Error is transient only for
+    the specific server-side codes in _TRANSIENT_S3_CODES above."""
+    if isinstance(exc, MaxRetryError):
+        return True
+    if isinstance(exc, S3Error):
+        return exc.code in _TRANSIENT_S3_CODES
+    return False
 
 
 class MinioFileStorage(FileStorage):
@@ -48,12 +70,62 @@ class MinioFileStorage(FileStorage):
         self._bucket = settings.minio_bucket
         self._expiry_seconds = settings.minio_presigned_url_expiry_seconds
         self._create_bucket_if_missing = settings.minio_create_bucket_if_missing
+        # Phase 2.10: the minio SDK has no timeout parameter of its own — it accepts a urllib3
+        # PoolManager instead, and building one from scratch means losing the SDK's own defaults
+        # unless they're reproduced exactly. This is a verified-the-hard-way requirement: an
+        # earlier version of this change passed a bare `urllib3.PoolManager(timeout=...)` with no
+        # `retries=`, which broke the SDK's built-in retry-on-`RequestTimeTooSkewed`/5xx handling
+        # (confirmed via a full run of the real-MinIO integration suite) — every MinIO integration
+        # test failed with `RequestTimeTooSkewed`. This PoolManager reproduces
+        # `Minio.__init__`'s own default construction (cert_reqs/ca_certs/maxsize/retries)
+        # byte-for-byte, changing only the timeout.
         self._client = Minio(
             settings.minio_endpoint,
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
             secure=settings.minio_secure,
             region=settings.minio_region,
+            http_client=urllib3.PoolManager(
+                timeout=Timeout(
+                    connect=settings.minio_timeout_seconds, read=settings.minio_timeout_seconds
+                ),
+                maxsize=10,
+                cert_reqs="CERT_REQUIRED",
+                ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+                retries=Retry(total=5, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]),
+            ),
+        )
+        self._settings = settings
+
+    async def _call_sdk(self, fn: Callable[..., _T], *args: object, **kwargs: object) -> _T:
+        """Run one blocking SDK call in a thread, retrying transient failures (Phase 2.10).
+
+        Only for calls whose arguments are safely reusable across attempts (plain strings/ints —
+        `bucket_exists`, `make_bucket`, `remove_object`, `stat_object`, `presigned_get_object`).
+        A call whose argument is a stateful, single-use object (`save()`'s upload stream,
+        `read()`'s response) must build/consume that object fresh inside its own retryable
+        closure instead — see `_retry_call()` and `save()`/`read()` below — reusing an
+        already-partially-consumed stream across a retry would silently upload/read truncated
+        content.
+
+        Every existing call site already translates the final (post-retry) S3Error/MaxRetryError
+        into a StorageError subclass in its own try/except — this only adds bounded retry before
+        that translation happens, never changing what a caller ultimately sees on exhaustion.
+        """
+
+        async def _call() -> _T:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
+        return await self._retry_call(_call)
+
+    async def _retry_call(self, call: Callable[[], Awaitable[_T]]) -> _T:
+        """Retry an arbitrary zero-argument async callable using this instance's retry policy."""
+        return await retry_async(
+            call,
+            max_attempts=self._settings.provider_retry_max_attempts,
+            base_delay=self._settings.provider_retry_base_delay_seconds,
+            max_delay=self._settings.provider_retry_max_delay_seconds,
+            is_transient=_is_transient_minio_error,
         )
 
     async def ensure_bucket(self) -> None:
@@ -63,7 +135,7 @@ class MinioFileStorage(FileStorage):
         a `BucketAlreadyOwnedByYou`/`BucketAlreadyExists` S3Error, which is treated as success.
         """
         try:
-            exists = await asyncio.to_thread(self._client.bucket_exists, self._bucket)
+            exists = await self._call_sdk(self._client.bucket_exists, self._bucket)
             if exists:
                 return
             if not self._create_bucket_if_missing:
@@ -71,7 +143,7 @@ class MinioFileStorage(FileStorage):
                     f"MinIO bucket {self._bucket!r} does not exist and "
                     "MINIO_CREATE_BUCKET_IF_MISSING is false."
                 )
-            await asyncio.to_thread(self._client.make_bucket, self._bucket)
+            await self._call_sdk(self._client.make_bucket, self._bucket)
         except S3Error as exc:
             if exc.code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
                 return
@@ -89,8 +161,12 @@ class MinioFileStorage(FileStorage):
     ) -> StoredFile:
         """Upload `content` to `key`, overwriting any existing object at that key."""
         validate_object_key(key)
-        try:
-            result = await asyncio.to_thread(
+
+        async def _put():
+            # A fresh BytesIO every attempt — reusing one across a retry would silently upload
+            # zero (or partial) bytes on the second attempt, since the SDK already consumed the
+            # first attempt's stream up to wherever it failed.
+            return await asyncio.to_thread(
                 self._client.put_object,
                 self._bucket,
                 key,
@@ -99,6 +175,9 @@ class MinioFileStorage(FileStorage):
                 content_type=content_type or "application/octet-stream",
                 metadata=dict(metadata) if metadata else None,
             )
+
+        try:
+            result = await self._retry_call(_put)
         except (S3Error, MaxRetryError) as exc:
             raise StorageWriteError(f"Failed to write object at key {key!r}") from exc
         return StoredFile(
@@ -110,11 +189,16 @@ class MinioFileStorage(FileStorage):
         )
 
     async def read(self, key: str) -> bytes:
-        """Return the bytes stored at `key`; raises `StorageObjectNotFoundError` if missing."""
+        """Return the bytes stored at `key`; raises `StorageObjectNotFoundError` if missing.
+
+        Phase 2.10: only `get_object` (opening the connection) is retried on a transient
+        failure — `response.read()` is never retried, since a stream that failed partway through
+        cannot be safely re-read from the start on the same response object.
+        """
         validate_object_key(key)
         response = None
         try:
-            response = await asyncio.to_thread(self._client.get_object, self._bucket, key)
+            response = await self._call_sdk(self._client.get_object, self._bucket, key)
             return await asyncio.to_thread(response.read)
         except S3Error as exc:
             if exc.code in _NOT_FOUND_CODES:
@@ -131,7 +215,7 @@ class MinioFileStorage(FileStorage):
         """Delete the object at `key`; idempotent — a missing object is a successful no-op."""
         validate_object_key(key)
         try:
-            await asyncio.to_thread(self._client.remove_object, self._bucket, key)
+            await self._call_sdk(self._client.remove_object, self._bucket, key)
         except S3Error as exc:
             if exc.code in _NOT_FOUND_CODES:
                 return
@@ -143,7 +227,7 @@ class MinioFileStorage(FileStorage):
         """Return whether an object exists at `key`, using a stat (HEAD) call — never guesses."""
         validate_object_key(key)
         try:
-            await asyncio.to_thread(self._client.stat_object, self._bucket, key)
+            await self._call_sdk(self._client.stat_object, self._bucket, key)
             return True
         except S3Error as exc:
             if exc.code in _NOT_FOUND_CODES:
@@ -156,7 +240,7 @@ class MinioFileStorage(FileStorage):
         """Return `key`'s object metadata via a stat (HEAD) call — no content is downloaded."""
         validate_object_key(key)
         try:
-            stat = await asyncio.to_thread(self._client.stat_object, self._bucket, key)
+            stat = await self._call_sdk(self._client.stat_object, self._bucket, key)
         except S3Error as exc:
             if exc.code in _NOT_FOUND_CODES:
                 raise StorageObjectNotFoundError(f"No object found at key {key!r}") from exc
@@ -177,7 +261,7 @@ class MinioFileStorage(FileStorage):
         validate_object_key(key)
         expiry = expiry_seconds or self._expiry_seconds
         try:
-            return await asyncio.to_thread(
+            return await self._call_sdk(
                 self._client.presigned_get_object,
                 self._bucket,
                 key,

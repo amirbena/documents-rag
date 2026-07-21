@@ -47,7 +47,7 @@ class OllamaLLMProvider(LLMProvider):
 
         async with httpx.AsyncClient(
             base_url=self._settings.ollama_base_url,
-            timeout=60.0,
+            timeout=self._settings.ollama_llm_timeout_seconds,
             transport=self._transport,
         ) as client:
             try:

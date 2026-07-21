@@ -8,7 +8,9 @@ import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.correlation import correlation_headers
+from app.core.retry import retry_async
 from app.rag.providers.embedding_provider import EmbeddingProvider
+from app.rag.providers.http_retry_policy import is_transient_httpx_error
 
 # Category (Phase 2.10, see app/core/errors.py): ProviderError.
 
@@ -41,18 +43,31 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         if not text or not text.strip():
             raise ValueError("text must not be empty")
 
-        try:
+        async def _call() -> httpx.Response:
             async with httpx.AsyncClient(
                 base_url=self._settings.ollama_base_url,
-                timeout=30.0,
+                timeout=self._settings.ollama_embedding_timeout_seconds,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                resp = await client.post(
                     "/api/embeddings",
                     json={"model": self._settings.ollama_embedding_model, "prompt": text},
                     headers=correlation_headers(),
                 )
-                response.raise_for_status()
+                resp.raise_for_status()
+                return resp
+
+        try:
+            # Classification happens on the raw httpx exception (see http_retry_policy.py) —
+            # only connection/timeout failures and 429/502/503/504 are retried; every other
+            # status and any malformed-response error is permanent, exhausted after one attempt.
+            response = await retry_async(
+                _call,
+                max_attempts=self._settings.provider_retry_max_attempts,
+                base_delay=self._settings.provider_retry_base_delay_seconds,
+                max_delay=self._settings.provider_retry_max_delay_seconds,
+                is_transient=is_transient_httpx_error,
+            )
         except httpx.HTTPStatusError as exc:
             raise OllamaEmbeddingError(
                 f"Ollama returned {exc.response.status_code} for /api/embeddings"
