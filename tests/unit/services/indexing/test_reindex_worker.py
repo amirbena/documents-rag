@@ -357,8 +357,11 @@ async def test_worker_reconstructs_target_from_index_collection_not_live_setting
     )
     session.reindex_jobs[job.id] = job
     delegate = _RecordingBuildDelegate()
+    # EMBEDDING_PROVIDER is deliberately NOT varied here (as of Phase 2.10, Settings validates it
+    # against a closed set containing only "ollama" — there is no second valid value to prove
+    # non-leakage with). The other four fields remain free-form and still prove the worker
+    # reconstructs the target from the persisted IndexCollection row, not from live Settings.
     live_settings = _base_settings(
-        EMBEDDING_PROVIDER="a-different-live-provider",
         OLLAMA_EMBEDDING_MODEL="a-different-live-model",
         VECTOR_SIZE=1,
         EMBEDDING_VERSION="a-different-live-version",
@@ -376,7 +379,6 @@ async def test_worker_reconstructs_target_from_index_collection_not_live_setting
     assert delegate.calls[0]["target_chunk_size"] == 777  # test 14
     assert delegate.calls[0]["target_chunk_overlap"] == 88  # test 15
     # None of the live settings' values leaked into the reconstructed target (test 16).
-    assert used_config.provider != live_settings.embedding_provider
     assert used_config.model != live_settings.ollama_embedding_model
     assert used_config.dimension != live_settings.vector_size
     assert used_config.embedding_version != live_settings.embedding_version

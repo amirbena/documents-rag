@@ -63,12 +63,20 @@ class _FakePutResult:
 
 
 def test_missing_endpoint_or_bucket_raises_configuration_error() -> None:
-    """Constructing MinioFileStorage without endpoint/bucket must fail clearly, no SDK client built."""
+    """Constructing MinioFileStorage without endpoint/bucket must fail clearly, no SDK client built.
+
+    As of Phase 2.10, `Settings` itself rejects an incomplete MinIO configuration at construction
+    time (see test_storage_factory.py / test_config.py), so an incomplete `Settings` instance can
+    no longer be built through normal construction. This check in `MinioFileStorage.__init__`
+    remains as defense in depth — exercised here via `model_construct()`, which bypasses Settings'
+    own validators, to simulate the only way an incomplete instance could still reach this code.
+    """
+    base_fields = _settings().model_dump()
     with pytest.raises(StorageConfigurationError):
-        MinioFileStorage(settings=_settings(MINIO_ENDPOINT=None))
+        MinioFileStorage(settings=Settings.model_construct(**{**base_fields, "minio_endpoint": None}))
 
     with pytest.raises(StorageConfigurationError):
-        MinioFileStorage(settings=_settings(MINIO_BUCKET=None))
+        MinioFileStorage(settings=Settings.model_construct(**{**base_fields, "minio_bucket": None}))
 
 
 async def test_save_translates_s3_error(monkeypatch: pytest.MonkeyPatch) -> None:

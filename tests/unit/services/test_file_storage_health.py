@@ -17,9 +17,27 @@ async def test_local_storage_ready(tmp_path: Path) -> None:
     assert result.required is True
 
 
+def _unreachable_minio_settings() -> Settings:
+    """A structurally complete but genuinely unreachable MinIO configuration.
+
+    As of Phase 2.10, an *incomplete* MinIO configuration (missing MINIO_ENDPOINT/MINIO_BUCKET/
+    etc.) is rejected at Settings construction itself — see test_config.py's coverage of
+    Settings._validate_minio_configuration_complete(). This helper instead exercises the
+    connectivity-failure path check_file_storage() must still handle gracefully: complete,
+    well-formed settings pointing at a host nothing is listening on.
+    """
+    return Settings(
+        FILE_STORAGE_PROVIDER="minio",
+        MINIO_ENDPOINT="localhost:1",
+        MINIO_ACCESS_KEY="unreachable-key",
+        MINIO_SECRET_KEY="unreachable-secret",
+        MINIO_BUCKET="unreachable-bucket",
+    )
+
+
 async def test_minio_misconfiguration_reports_error_not_raise() -> None:
-    """An unusable MinIO configuration must surface as an 'error' check result, never raise."""
-    settings = Settings(FILE_STORAGE_PROVIDER="minio")  # missing MINIO_ENDPOINT/MINIO_BUCKET
+    """An unreachable MinIO endpoint must surface as an 'error' check result, never raise."""
+    settings = _unreachable_minio_settings()
 
     result = await check_file_storage(settings)
 
@@ -29,7 +47,7 @@ async def test_minio_misconfiguration_reports_error_not_raise() -> None:
 
 async def test_detail_never_exposes_internal_information(tmp_path: Path) -> None:
     """A failing check's detail must be a fixed, generic message — no path/credential/stack trace."""
-    settings = Settings(FILE_STORAGE_PROVIDER="minio")
+    settings = _unreachable_minio_settings()
 
     result = await check_file_storage(settings)
 
