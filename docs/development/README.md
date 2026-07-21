@@ -14,20 +14,9 @@ Local development setup, repository conventions, and the contribution workflow. 
 
 ## Local setup
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-docker compose up --build
-docker compose exec app alembic upgrade head
-curl http://localhost:8000/health
-docker compose exec ollama ollama pull llama3.1
-docker compose exec ollama ollama pull bge-m3
-curl http://localhost:8000/api/v1/providers/ollama/health
-./scripts/install-git-hooks.sh
-make verify
-```
+The full first-time onboarding walkthrough (prerequisites, virtualenv, Docker Compose, Alembic,
+Ollama models, pre-commit hook) lives in the root **[README.md](../../README.md#initial-setup)**
+— that is the canonical copy; this page does not repeat it.
 
 See [docs/deployment/](../deployment/README.md) for the full container topology and readiness
 contract, and [docs/configuration/](../configuration/README.md) for every environment variable.
@@ -35,12 +24,9 @@ contract, and [docs/configuration/](../configuration/README.md) for every enviro
 ## Running the app
 
 **`python app/main.py` does not start the server** — it only defines the FastAPI `app` object; the
-process imports the module and exits, with no error, which is easy to mistake for success.
-
-```bash
-docker compose up --build                    # recommended: full stack
-uvicorn app.main:app --reload                 # app-only, dependencies reachable separately
-```
+process imports the module and exits, with no error, which is easy to mistake for success. See
+the root [README.md](../../README.md#initial-setup) for the recommended `docker compose up --build`
+flow and the app-only `uvicorn` alternative.
 
 ## Repository conventions
 

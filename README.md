@@ -32,34 +32,72 @@ letting the custom and LangChain execution paths share one public API/SSE contra
 Full detail, module ownership map, and dependency-direction rules:
 **[docs/architecture/](docs/architecture/README.md)**.
 
-## Quick start
+## Initial setup
+
+**Prerequisites:** Python 3.11+, Docker + Docker Compose (`docker compose version`), Git, and
+optionally the [GitHub CLI](https://cli.github.com/) (`gh`) for the PR workflow.
+
+First-time onboarding, in order:
+
+1. **Create and activate a virtual environment:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+2. **Install dependencies:**
+   ```bash
+   pip install -e ".[dev]"
+   ```
+3. **Copy the environment file:**
+   ```bash
+   cp .env.example .env
+   ```
+4. **Start Docker Compose** (brings up `app`, `postgres`, `redis`, `qdrant`, `ollama`):
+   ```bash
+   docker compose up --build
+   ```
+5. **Run Alembic migrations** — Docker Compose starts Postgres but does not apply migrations
+   automatically:
+   ```bash
+   docker compose exec app alembic upgrade head
+   ```
+6. **Verify app health:**
+   ```bash
+   curl http://localhost:8000/health
+   # {"status":"ok","service":"documents-rag","version":"0.1.0"}
+   ```
+7. **Pull the required Ollama models:**
+   ```bash
+   docker compose exec ollama ollama pull llama3.1
+   docker compose exec ollama ollama pull bge-m3
+   ```
+8. **Verify Ollama health:**
+   ```bash
+   curl http://localhost:8000/api/v1/providers/ollama/health
+   ```
+9. **Install the git pre-commit hook** (runs `make verify` automatically before every commit):
+   ```bash
+   ./scripts/install-git-hooks.sh
+   ```
+10. **Run the full verification suite:**
+    ```bash
+    make verify
+    ```
+
+**Running the app without Docker** (once the steps above are done and Postgres/Redis/Qdrant/Ollama
+are reachable some other way, e.g. `docker compose up postgres redis qdrant ollama` with `.env`
+pointed at `localhost`):
 
 ```bash
-# 1. Environment
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-
-# 2. Infrastructure + app
-docker compose up --build
-
-# 3. Database migration (not automatic)
-docker compose exec app alembic upgrade head
-
-# 4. Pull required Ollama models
-docker compose exec ollama ollama pull llama3.1
-docker compose exec ollama ollama pull bge-m3
-
-# 5. Verify
-curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/providers/ollama/health
-
-# 6. Run the fast test suite
-make test
+uvicorn app.main:app --reload
 ```
 
-Full onboarding walkthrough, PyCharm setup, and running the app without Docker:
-**[docs/development/](docs/development/README.md)**.
+**`python app/main.py` does not start the server** — it only defines the FastAPI `app` object; the
+process imports the module and exits with no error, which is easy to mistake for success.
+
+Container topology, migration sequencing detail, and the full health/readiness contract:
+**[docs/deployment/](docs/deployment/README.md)**. Repository conventions, contribution workflow,
+and PyCharm run configuration: **[docs/development/](docs/development/README.md)**.
 
 ## Documentation index
 
