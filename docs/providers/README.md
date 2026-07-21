@@ -53,6 +53,41 @@ and re-indexing — see [docs/multilingual/](../multilingual/README.md).
 
 Full variable list, defaults, and required-vs-optional: [docs/configuration/](../configuration/README.md).
 
+## Timeout and retry policy (Phase 2.10)
+
+Every provider HTTP client (Ollama embedding, Ollama LLM, Ollama health, Qdrant, MinIO) has a
+settings-backed timeout — no unbounded-wait literal remains anywhere in `app/rag/providers/` or
+`app/storage/minio_storage.py`. Exact variables/defaults:
+[docs/configuration/](../configuration/README.md#provider-http-timeouts-phase-210).
+
+Ollama embedding, Qdrant, and MinIO calls additionally retry with bounded exponential backoff and
+full jitter (`app/core/retry.py`'s `retry_async`, `PROVIDER_RETRY_MAX_ATTEMPTS`/
+`PROVIDER_RETRY_BASE_DELAY_SECONDS`/`PROVIDER_RETRY_MAX_DELAY_SECONDS` — see
+[docs/configuration/](../configuration/README.md#provider-retry-policy-phase-210)). Classification
+(`app/rag/providers/http_retry_policy.py` for the raw-httpx providers):
+
+- **Transient (retried):** connection/timeout failures (any `httpx.HTTPError` that isn't a status
+  error), and HTTP 429/502/503/504.
+- **Permanent (never retried):** every other 4xx/5xx status (400/401/403/404/etc.), and any
+  malformed-response error (`ValueError`/`KeyError` from response-parsing code).
+
+MinIO uses its own classifier against the `minio` SDK's exception types: `MaxRetryError`
+(connection-level) is always transient; an `S3Error` is transient only for
+`ServiceUnavailable`/`SlowDown`/`InternalError` — every other `S3Error` code (`NoSuchKey`, auth
+failures, `BucketAlreadyOwnedByYou`, etc.) is permanent.
+
+**Retry exhaustion** re-raises the *last* transient exception unchanged — never a generic
+"retries exhausted" wrapper, and never swallowed — so a caller catching that provider's own error
+type sees no difference between a call that needed a retry and one that didn't.
+
+**Explicit exclusions — no retry attempted at all:**
+
+- `OllamaLLMProvider.stream_generate()` (streaming chat generation) — retrying would risk
+  re-emitting already-yielded tokens to a caller mid-stream.
+- `MinioFileStorage.read()`'s `response.read()` step — only the `get_object()` call that opens the
+  connection is retried; a partially-consumed response stream cannot be safely re-read from the
+  start on the same object.
+
 ## Extension points
 
 Adding a new LLM provider stub: create a class inheriting `LLMProviderStub`

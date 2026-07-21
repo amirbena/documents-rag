@@ -4,7 +4,7 @@ One row per build attempt, mirroring `IngestionJob`/`DocumentDeletionJob`'s appe
 style: a `FAILED` row is never reset or reused — retrying always creates a brand-new row for the
 same `document_id`. At most one `PENDING`/`PROCESSING` ("active") row may exist per document at a
 time, enforced by the partial unique index `ix_reindex_jobs_one_active_per_document`
-(migration `a8685da857f3`), not application logic alone — see
+(see `alembic/versions/` baseline migration), not application logic alone — see
 `app/services/indexing/reindex_scheduling_service.py`.
 
 `source_collection_name`/`target_collection_name`/`target_chunk_size`/`target_chunk_overlap` are a

@@ -61,6 +61,9 @@ from app.services.reconciliation.document_audit_service import FindingSeverity
 _COLLECTION_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,255}$")
 
 
+# Category (Phase 2.10, see app/core/errors.py): ValidationError.
+
+
 class InvalidCollectionNameError(ValueError):
     """Raised when a supplied collection_name is empty or contains a disallowed character."""
 

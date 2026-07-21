@@ -66,6 +66,11 @@ class UploadOutcome(StrEnum):
     REUSED_FAILED = "reused_failed"
 
 
+# Category (Phase 2.10, see app/core/errors.py): the four exceptions below are ConflictError
+# (DeletionActiveError/DeletionIncompleteError — a lifecycle-state conflict) or InternalError
+# (DeletionInvariantViolationError/MissingWinnerAfterRaceError — should-be-unreachable states).
+
+
 class DeletionActiveError(Exception):
     """A `PENDING`/`PROCESSING` deletion attempt exists for the matching document.
 
