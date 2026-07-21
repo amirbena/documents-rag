@@ -1,7 +1,8 @@
 # CLAUDE.md
 
 Operational guide for Claude Code in this repository. Read this before making changes. For system
-design/rationale see [ARCHITECTURE.md](ARCHITECTURE.md); for run/test instructions see
+design/rationale see [docs/architecture/](docs/architecture/README.md) and
+[docs/document-lifecycle/](docs/document-lifecycle/README.md); for run/test instructions see
 [README.md](README.md). This file favors tables and short rules over narrative — it should let a
 session answer quickly: where does this code go, which module owns it, which dependency direction
 is legal, which invariant must not break, which command verifies it.

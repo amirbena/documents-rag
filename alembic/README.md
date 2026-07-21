@@ -57,8 +57,9 @@ Or, with an activated local virtual environment and Postgres reachable directly:
 alembic upgrade head
 ```
 
-See the root [README.md](../README.md#database-migrations) "Database migrations" section for
-when this fits into the onboarding flow.
+See [docs/deployment/](../docs/deployment/README.md#migration-sequencing) for when this fits into
+the onboarding/deployment flow, and [docs/development/](../docs/development/README.md) for local
+setup in general.
 
 ## Common commands
 
@@ -70,9 +71,10 @@ when this fits into the onboarding flow.
 
 ## Current status
 
-`app/models/` has two ORM models — `Document` and `IngestionJob` (see
-[ARCHITECTURE.md](../ARCHITECTURE.md), "Document upload and ingestion job skeleton") — backed by
-one migration (`add documents and ingestion jobs tables`) that creates the `documents` and
-`ingestion_jobs` tables, including the `documents.id → ingestion_jobs.document_id` foreign key.
-Verified locally: `alembic upgrade head` and `alembic downgrade -1` both applied cleanly against
-a real Postgres container, and the resulting schema matches the models column-for-column.
+`app/models/` now has multiple ORM models spanning documents, ingestion, deletion, re-indexing,
+vector cleanup, and index-collection tracking — see
+[docs/architecture/](../docs/architecture/README.md) for the module ownership map and
+[docs/document-lifecycle/](../docs/document-lifecycle/README.md) for the lifecycle each model's
+job table backs. Run `alembic heads` to confirm the current single migration head (there must
+always be exactly one) — see [docs/troubleshooting/](../docs/troubleshooting/README.md) if it
+ever reports more than one.
