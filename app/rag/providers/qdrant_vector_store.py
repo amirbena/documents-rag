@@ -12,6 +12,8 @@ import httpx
 from app.core.config import Settings, get_settings
 from app.rag.providers.vector_store import VectorPoint, VectorSearchResult, VectorStore
 
+# Category (Phase 2.10, see app/core/errors.py): ProviderError.
+
 
 class QdrantVectorStoreError(Exception):
     """Raised when Qdrant is unreachable, returns an error, or responds unexpectedly."""

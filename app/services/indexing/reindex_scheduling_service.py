@@ -45,6 +45,9 @@ _ACTIVE_DELETION_STATUSES = (DocumentDeletionStatus.PENDING, DocumentDeletionSta
 _ONE_ACTIVE_REINDEX_JOB_CONSTRAINT_NAME = "ix_reindex_jobs_one_active_per_document"
 
 
+# Category (Phase 2.10, see app/core/errors.py): InternalError — should-be-unreachable race state.
+
+
 class MissingActiveReindexJobAfterRaceError(Exception):
     """A one-active-job unique-constraint conflict was raised, but no active job could be reloaded.
 

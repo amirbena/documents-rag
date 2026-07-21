@@ -13,6 +13,8 @@ import httpx
 from app.core.config import Settings, get_settings
 from app.rag.providers.llm_provider import LLMProvider
 
+# Category (Phase 2.10, see app/core/errors.py): ProviderError.
+
 
 class OllamaLLMError(Exception):
     """Raised when Ollama is unreachable, returns an error, or the stream is malformed."""

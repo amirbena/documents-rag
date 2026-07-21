@@ -263,6 +263,27 @@ def test_invalid_collection_name_returns_400(monkeypatch: pytest.MonkeyPatch) ->
     assert "detail" in response.json()
 
 
+def test_invalid_collection_name_error_never_leaks_the_raw_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 2.10: detail must be a fixed constant, never str(exc)."""
+    _install_fake_db_session()
+    raw_message = "collection_name must be 1-255 characters of a-sensitive-internal-detail."
+
+    async def _fake_raises(session, collection_name, settings, vector_store):
+        raise InvalidCollectionNameError(raw_message)
+
+    monkeypatch.setattr(
+        reconciliation_route_module, "build_collection_reconciliation_report", _fake_raises
+    )
+
+    response = client.get("/api/v1/reconciliation/collections/not..valid/report")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] != raw_message
+    assert "a-sensitive-internal-detail" not in response.json()["detail"]
+
+
 # --- unexpected failure propagation ---------------------------------------------------------------
 
 

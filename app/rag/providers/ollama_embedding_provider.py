@@ -9,6 +9,8 @@ import httpx
 from app.core.config import Settings, get_settings
 from app.rag.providers.embedding_provider import EmbeddingProvider
 
+# Category (Phase 2.10, see app/core/errors.py): ProviderError.
+
 
 class OllamaEmbeddingError(Exception):
     """Raised when Ollama is unreachable, returns an error, or responds unexpectedly."""

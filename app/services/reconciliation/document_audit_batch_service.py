@@ -72,6 +72,9 @@ _DEPENDENCY_UNAVAILABLE_CODES = frozenset(
 _MAX_CURSOR_SIZE_BYTES = 2048
 
 
+# Category (Phase 2.10, see app/core/errors.py): ValidationError (both classes below).
+
+
 class InvalidAuditBatchLimitError(ValueError):
     """Raised when a requested batch `limit` falls outside [MIN_BATCH_LIMIT, MAX_BATCH_LIMIT]."""
 

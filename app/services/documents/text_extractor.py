@@ -35,6 +35,10 @@ _DOCX_REQUIRED_ENTRY = "word/document.xml"
 _XLSX_REQUIRED_ENTRY = "xl/workbook.xml"
 
 
+# Category (Phase 2.10, see app/core/errors.py): ValidationError — the stored content doesn't
+# match what ingestion needs to proceed.
+
+
 class DocumentTextExtractionError(Exception):
     """Raised when a document's stored content is missing, unsupported, or has no extractable text."""
 
