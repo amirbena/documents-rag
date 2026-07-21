@@ -12,14 +12,15 @@ attempt. This is safe and requires no vector cleanup: see "Vector idempotency" b
 ## One active job per document
 
 At most one `IngestionJob` per `document_id` may be PENDING or PROCESSING at a time — enforced by
-a real Postgres partial unique index (`ix_ingestion_jobs_one_active_per_document`, migration
-`b7e2f6a1c9d4`), not merely application logic. `retry_ingestion()` additionally takes a blocking
-`SELECT ... FOR UPDATE` lock on the document's existing job rows before deciding whether to
-insert, and falls back to catching the unique index's `IntegrityError` (re-reading and returning
-the now-existing active job instead of raising) for the residual race the lock alone cannot close
-(inserting a brand-new row is never covered by a lock taken on rows that already existed at query
-time — see the module's test suite for the concurrent-retry proof). Two concurrent retries for
-the same document therefore always converge on exactly one new active job, never two.
+a real Postgres partial unique index (`ix_ingestion_jobs_one_active_per_document`, see the
+`alembic/versions/` baseline migration), not merely application logic. `retry_ingestion()`
+additionally takes a blocking `SELECT ... FOR UPDATE` lock on the document's existing job rows
+before deciding whether to insert, and falls back to catching the unique index's
+`IntegrityError` (re-reading and returning the now-existing active job instead of raising) for
+the residual race the lock alone cannot close (inserting a brand-new row is never covered by a
+lock taken on rows that already existed at query time — see the module's test suite for the
+concurrent-retry proof). Two concurrent retries for the same document therefore always converge
+on exactly one new active job, never two.
 
 ## Vector idempotency is free — no cleanup step is needed here
 

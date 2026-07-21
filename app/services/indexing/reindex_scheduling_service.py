@@ -7,7 +7,7 @@ a build, activation, Qdrant vector write, or object-storage read. Re-index attem
 `ReindexJob` rows, exactly like `IngestionJob`/`DocumentDeletionJob`: a `FAILED` row is never reset
 or reused, and at most one `PENDING`/`PROCESSING` ("active") row may exist per document at a time,
 enforced by the partial unique index `ix_reindex_jobs_one_active_per_document`
-(migration `a8685da857f3`) — not application logic alone.
+(see `alembic/versions/` baseline migration) — not application logic alone.
 
 No worker, script, or public API consumes this module yet — see `ReindexWorker`/activation/API in
 later subtasks.

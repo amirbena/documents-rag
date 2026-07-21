@@ -68,8 +68,8 @@ async def _clean_tables(migrated_schema: None, postgres_url: str) -> AsyncIterat
 async def _ensure_index_collection(session: AsyncSession, collection_name: str) -> None:
     """Seed collection_name's IndexCollection row if it doesn't already exist.
 
-    Document.collection_name carries a foreign key into index_collections (migration
-    07f849bf2b95) — a document can never reference a collection that isn't itself persisted there.
+    Document.collection_name carries a foreign key into index_collections (see the alembic
+    baseline migration) — a document can never reference a collection that isn't itself persisted there.
     """
     existing = await session.get(IndexCollection, collection_name)
     if existing is None:

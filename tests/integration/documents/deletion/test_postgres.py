@@ -7,7 +7,6 @@ claim stress tests live separately in test_concurrency.py — see that module's 
 Real Qdrant/MinIO cross-system cleanup is covered separately by test_qdrant.py / test_storage.py.
 """
 
-import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -86,38 +85,6 @@ async def test_migration_creates_document_deletion_jobs_table_and_partial_index(
 
     assert "document_deletion_jobs" in table_names
     assert "ix_document_deletion_jobs_one_active_per_document" in index_names
-
-
-async def test_migration_downgrade_and_reupgrade_removes_only_phase_2_8_4_objects(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """Downgrading to the prior revision removes document_deletion_jobs but leaves ingestion_jobs' index."""
-    from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
-
-    await asyncio.to_thread(run_alembic_downgrade, "b7e2f6a1c9d4")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names_before = await conn.run_sync(
-                lambda sync_conn: set(inspect(sync_conn).get_table_names())
-            )
-            ingestion_index_names = await conn.run_sync(
-                lambda sync_conn: {idx["name"] for idx in inspect(sync_conn).get_indexes("ingestion_jobs")}
-            )
-        assert "document_deletion_jobs" not in table_names_before
-        # The Phase 2.8.3 ingestion index must be untouched by this migration's downgrade.
-        assert "ix_ingestion_jobs_one_active_per_document" in ingestion_index_names
-
-        await asyncio.to_thread(run_alembic_upgrade, "head")
-
-        async with engine.connect() as conn:
-            table_names_after = await conn.run_sync(
-                lambda sync_conn: set(inspect(sync_conn).get_table_names())
-            )
-        assert "document_deletion_jobs" in table_names_after
-    finally:
-        await engine.dispose()
 
 
 async def test_partial_unique_index_rejects_two_active_deletion_jobs_for_one_document(

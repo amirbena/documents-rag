@@ -23,7 +23,7 @@ whatever the ingestion-derived status would otherwise be, so a completed deletio
 
 At most one `DocumentDeletionJob` per `document_id` may be `PENDING`/`PROCESSING` at a time,
 enforced by the partial unique index `ix_document_deletion_jobs_one_active_per_document`
-(migration `c8f3a2b6d1e7`). `request_document_deletion()` takes a blocking
+(see `alembic/versions/` baseline migration). `request_document_deletion()` takes a blocking
 `SELECT ... FOR UPDATE` on the document's existing deletion-job rows before deciding whether to
 insert, and falls back to catching the index's `IntegrityError` (re-reading and returning the
 now-active job) for the residual race the lock alone cannot close — identical strategy to
