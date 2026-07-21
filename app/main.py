@@ -8,14 +8,16 @@ from app.api.v1.routes import chat, documents, providers, reconciliation, reinde
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.exception_handlers import app_error_handler, unhandled_exception_handler
+from app.core.lifespan import build_lifespan
 from app.core.logging_config import configure_logging
 from app.core.middleware import correlation_id_middleware
 from app.core.version import SERVICE_NAME, SERVICE_VERSION
+from app.db.session import engine
 
 settings = get_settings()
 configure_logging(settings)
 
-app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION)
+app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION, lifespan=build_lifespan(engine))
 
 # Correlation ID first (outermost) — every subsequent middleware/handler/log line in this request
 # can read app.core.correlation.get_correlation_id(). See app/core/middleware.py.
