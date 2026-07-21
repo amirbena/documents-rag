@@ -83,12 +83,12 @@ Full onboarding walkthrough, PyCharm setup, and running the app without Docker:
 ## Verification
 
 ```bash
-make test               # fast unit suite (no Docker)
+make test              # fast unit suite (no Docker)
 make test-integration   # Testcontainers-based integration suite (needs Docker)
 make test-e2e-backend   # Testcontainers-based backend E2E suite (needs Docker)
-make lint                # ruff check .
-make typecheck           # mypy app
-make verify               # test + lint + typecheck + compose, stopping at the first failure
+make lint               # ruff check .
+make typecheck          # mypy app
+make verify             # test + lint + typecheck + compose, stopping at the first failure
 ```
 
 `make verify` is the canonical pre-commit/pre-PR gate. Install the git hook that runs it
