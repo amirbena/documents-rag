@@ -2,10 +2,12 @@
 exception handlers; no business logic here."""
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import health as platform_health
 from app.api.v1.routes import chat, documents, providers, reconciliation, reindex
 from app.core.config import get_settings
+from app.core.cors import cors_middleware_kwargs
 from app.core.errors import AppError
 from app.core.exception_handlers import app_error_handler, unhandled_exception_handler
 from app.core.lifespan import build_lifespan
@@ -18,6 +20,12 @@ settings = get_settings()
 configure_logging(settings)
 
 app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION, lifespan=build_lifespan(engine))
+
+# CORS (Phase 2.10) — registered before correlation ID so correlation stays the outermost
+# middleware: Starlette wraps middleware in reverse-registration order, so whichever of these two
+# is added *last* becomes outermost. See app/core/cors.py for the policy (origins from
+# CORS_ALLOW_ORIGINS; everything else fixed and non-speculative).
+app.add_middleware(CORSMiddleware, **cors_middleware_kwargs(settings))
 
 # Correlation ID first (outermost) — every subsequent middleware/handler/log line in this request
 # can read app.core.correlation.get_correlation_id(). See app/core/middleware.py.
