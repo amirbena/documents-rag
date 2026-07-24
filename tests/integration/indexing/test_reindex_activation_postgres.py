@@ -143,31 +143,6 @@ async def test_migration_adds_source_and_activation_columns_with_expected_nullab
     assert columns["activated_at"] is True
 
 
-async def test_migration_downgrade_and_reupgrade_succeeds(migrated_schema: None, postgres_url: str) -> None:
-    from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
-
-    await asyncio.to_thread(run_alembic_downgrade, "a8685da857f3")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            columns_before = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("reindex_jobs")}
-            )
-        assert "source_collection_name" not in columns_before
-        assert "activated_at" not in columns_before
-
-        await asyncio.to_thread(run_alembic_upgrade, "head")
-
-        async with engine.connect() as conn:
-            columns_after = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("reindex_jobs")}
-            )
-        assert {"source_collection_name", "activated_at"} <= columns_after
-    finally:
-        await engine.dispose()
-
-
 async def test_source_collection_name_foreign_key_is_enforced(
     migrated_schema: None, integration_db_session: AsyncSession
 ) -> None:

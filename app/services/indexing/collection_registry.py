@@ -17,6 +17,9 @@ from app.models.index_collection import IndexCollection, IndexCollectionStatus
 from app.rag.embedding_config import EmbeddingIndexConfig
 from app.rag.providers.vector_store import VectorStore
 
+# Category (Phase 2.10, see app/core/errors.py): ConflictError — a Postgres/Qdrant drift, not
+# a bare provider-call failure.
+
 
 class IncompatibleIndexConfigurationError(Exception):
     """Raised when an existing Qdrant collection's vector size doesn't match the active config.

@@ -53,6 +53,61 @@ and re-indexing — see [docs/multilingual/](../multilingual/README.md).
 
 Full variable list, defaults, and required-vs-optional: [docs/configuration/](../configuration/README.md).
 
+## Timeout and retry policy (Phase 2.10)
+
+Every provider HTTP client (Ollama embedding, Ollama LLM, Ollama health, Qdrant, MinIO) has a
+settings-backed timeout — no unbounded-wait literal remains anywhere in `app/rag/providers/` or
+`app/storage/minio_storage.py`. Exact variables/defaults:
+[docs/configuration/](../configuration/README.md#provider-http-timeouts-phase-210).
+
+Ollama embedding, Qdrant, and MinIO calls additionally retry with bounded exponential backoff and
+full jitter (`app/core/retry.py`'s `retry_async`, `PROVIDER_RETRY_MAX_ATTEMPTS`/
+`PROVIDER_RETRY_BASE_DELAY_SECONDS`/`PROVIDER_RETRY_MAX_DELAY_SECONDS` — see
+[docs/configuration/](../configuration/README.md#provider-retry-policy-phase-210)).
+`PROVIDER_RETRY_MAX_ATTEMPTS` is the **total number of attempts, including the first (non-retry)
+one** — `PROVIDER_RETRY_MAX_ATTEMPTS=3` means at most 3 real calls to the provider (1 initial + up
+to 2 retries), never 3 retries on top of the first. `retry_async` is the single authoritative retry
+layer for all three providers; no provider's own transport client is separately configured to
+retry underneath it (see the MinIO note below). Classification
+(`app/rag/providers/http_retry_policy.py` for the raw-httpx providers):
+
+- **Transient (retried):** connection/timeout failures (any `httpx.HTTPError` that isn't a status
+  error), and HTTP 429/502/503/504.
+- **Permanent (never retried):** every other 4xx/5xx status (400/401/403/404/etc.), and any
+  malformed-response error (`ValueError`/`KeyError` from response-parsing code).
+
+MinIO uses its own classifier against the `minio` SDK's exception types: `MaxRetryError`
+(connection-level) is always transient; an `S3Error` is transient only for
+`ServiceUnavailable`/`SlowDown`/`InternalError` — every other `S3Error` code (`NoSuchKey`, auth
+failures, `BucketAlreadyOwnedByYou`, etc.) is permanent. The underlying `urllib3.PoolManager`
+backing the `minio` SDK client (`app/storage/minio_storage.py`) is configured with
+`retries=Retry(total=None, connect=0, read=0, redirect=1, status=0, other=0)` — every
+*failure*-retry dimension (connect/read/status/other) disabled, so `retry_async` above remains the
+only layer that retries a transient MinIO failure; `PROVIDER_RETRY_MAX_ATTEMPTS` therefore has the
+same total-attempts meaning for MinIO as it does for Ollama/Qdrant. `redirect=1` is deliberately
+left non-zero: the `minio` SDK has no redirect-following logic of its own, so it depends entirely
+on urllib3 to follow a legitimate S3-compatible redirect — zeroing `redirect` too (as an earlier
+version of this fix did) would have silently broken that, turning a normal redirect into a
+`MaxRetryError` that then gets retried against the same redirect indefinitely. One redirect hop is
+followed transparently (not counted as a `retry_async` attempt at all); a genuine redirect loop
+still fails, at the second hop, as a `MaxRetryError`, which `_is_transient_minio_error` treats as
+transient — so `retry_async`'s attempt ceiling still bounds a real redirect loop overall. (An
+explicit `Retry` object is always passed, never the `retries=` argument omitted entirely —
+omitting it previously broke the `minio` SDK's own `RequestTimeTooSkewed` handling; see that
+constructor's comment for detail.)
+
+**Retry exhaustion** re-raises the *last* transient exception unchanged — never a generic
+"retries exhausted" wrapper, and never swallowed — so a caller catching that provider's own error
+type sees no difference between a call that needed a retry and one that didn't.
+
+**Explicit exclusions — no retry attempted at all:**
+
+- `OllamaLLMProvider.stream_generate()` (streaming chat generation) — retrying would risk
+  re-emitting already-yielded tokens to a caller mid-stream.
+- `MinioFileStorage.read()`'s `response.read()` step — only the `get_object()` call that opens the
+  connection is retried; a partially-consumed response stream cannot be safely re-read from the
+  start on the same object.
+
 ## Extension points
 
 Adding a new LLM provider stub: create a class inheriting `LLMProviderStub`

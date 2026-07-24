@@ -67,6 +67,29 @@ tests/unit/
 production file is `app/services/foo/bar.py`, its unit test is
 `tests/unit/services/foo/test_bar.py`.
 
+## Backend-readiness test ownership (Phase 2.10)
+
+All unit-tier, fakes-only — no Docker, no real signal delivery beyond what `signal.raise_signal`
+exercises safely within one process.
+
+| Behavior | Test file |
+|---|---|
+| Lifespan startup/shutdown, engine disposal, startup-failure resource release | `tests/unit/core/test_lifespan.py` |
+| Real app runs its lifespan without probing external dependencies | `tests/unit/api/test_app_lifespan.py` |
+| Connection pool kwargs wiring, dialect gate | `tests/unit/core/test_db_session.py` |
+| Bounded retry/backoff mechanics | `tests/unit/core/test_retry.py` |
+| Provider retry classification and exhaustion | `tests/unit/rag/providers/test_provider_retry.py` |
+| Provider timeouts sourced from `Settings` | `tests/unit/rag/providers/test_provider_timeouts.py` |
+| Correlation ID generation/propagation | `tests/unit/core/test_correlation.py`, `tests/unit/api/test_correlation_middleware.py`, `tests/unit/rag/providers/test_correlation_propagation.py` |
+| Structured JSON logging | `tests/unit/core/test_logging_config.py` |
+| `AppError` fallback mapping | `tests/unit/api/test_exception_handler.py` |
+| Config validation | `tests/unit/core/test_config.py` |
+| CORS policy (allowed/disallowed origin, preflight, wildcard, correlation-ID interaction) | `tests/unit/api/test_cors.py` |
+| SIGINT/SIGTERM handler mechanics | `tests/unit/scripts/test_shutdown_signal.py` |
+| Worker-script stop-before-claim behavior | `tests/unit/scripts/test_process_pending_document_deletions.py`, `test_process_pending_reindex_jobs.py`, `test_process_pending_vector_cleanups.py` |
+
+Run the whole set: `make test` (part of the default unit tier, no special flags needed).
+
 ## Integration test layout (grouped by feature, real infrastructure per contract)
 
 ```

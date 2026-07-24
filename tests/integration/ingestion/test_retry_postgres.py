@@ -7,7 +7,6 @@ tests/integration/documents/read/test_postgres.py's fixtures/style. Concurrent-r
 covered separately by tests/integration/ingestion/test_concurrency.py.
 """
 
-import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -112,36 +111,6 @@ async def test_migration_creates_the_partial_unique_index(
         await engine.dispose()
 
     assert "ix_ingestion_jobs_one_active_per_document" in index_names
-
-
-async def test_migration_downgrade_and_reupgrade_from_prior_revision(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """Downgrading to the immediately-prior revision then upgrading head again must be stable."""
-    from sqlalchemy import inspect
-    from sqlalchemy.ext.asyncio import AsyncEngine
-
-    from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
-
-    await asyncio.to_thread(run_alembic_downgrade, "a3f9c7d2e1b5")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            index_names_before = await conn.run_sync(
-                lambda sync_conn: {idx["name"] for idx in inspect(sync_conn).get_indexes("ingestion_jobs")}
-            )
-        assert "ix_ingestion_jobs_one_active_per_document" not in index_names_before
-
-        await asyncio.to_thread(run_alembic_upgrade, "head")
-
-        async with engine.connect() as conn:
-            index_names_after = await conn.run_sync(
-                lambda sync_conn: {idx["name"] for idx in inspect(sync_conn).get_indexes("ingestion_jobs")}
-            )
-        assert "ix_ingestion_jobs_one_active_per_document" in index_names_after
-    finally:
-        await engine.dispose()
 
 
 async def test_partial_unique_index_rejects_two_active_jobs_for_one_document(

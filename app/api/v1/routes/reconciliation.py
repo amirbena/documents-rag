@@ -56,6 +56,12 @@ router = APIRouter()
 # Never exposes the underlying cursor's implementation (Base64/JSON) or the service's own
 # validation-failure message — a single fixed detail for every InvalidAuditCursorError case.
 _CURSOR_ERROR_DETAIL = "The cursor is invalid or has expired."
+# Phase 2.10: normalized to fixed constants, matching _CURSOR_ERROR_DETAIL's pattern — these two
+# call sites previously returned the raw service exception text (str(exc)) as `detail`. Today's
+# actual messages are benign, but never depending on a service's internal message text staying
+# safe is the point; a fixed, reviewed string is guaranteed never to leak an internal detail.
+_BATCH_LIMIT_ERROR_DETAIL = "The requested limit is out of the supported range."
+_COLLECTION_NAME_ERROR_DETAIL = "The collection name is invalid."
 
 
 def get_file_storage() -> FileStorage:
@@ -177,7 +183,9 @@ async def audit_documents_batch_route(
     except InvalidAuditCursorError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_CURSOR_ERROR_DETAIL) from exc
     except InvalidAuditBatchLimitError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=_BATCH_LIMIT_ERROR_DETAIL
+        ) from exc
 
     return DocumentBatchAuditResponse(
         items=[_item_response(summary) for summary in result.documents],
@@ -251,7 +259,9 @@ async def collection_reconciliation_report_route(
     try:
         report = await build_collection_reconciliation_report(db, collection_name, settings, vector_store)
     except InvalidCollectionNameError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=_COLLECTION_NAME_ERROR_DETAIL
+        ) from exc
 
     return CollectionReportResponse(
         collection_name=report.collection_name,

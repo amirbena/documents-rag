@@ -99,6 +99,37 @@ Container topology, migration sequencing detail, and the full health/readiness c
 **[docs/deployment/](docs/deployment/README.md)**. Repository conventions, contribution workflow,
 and PyCharm run configuration: **[docs/development/](docs/development/README.md)**.
 
+## Backend readiness (Phase 2.10)
+
+Deployment-readiness hardening across process lifecycle, configuration, timeouts/retries, error
+handling, logging, correlation IDs, worker cancellation, connection pooling, CORS, and the Alembic
+migration history. Summary only — canonical detail lives in each linked document, not here:
+
+- **Startup/shutdown** — the process starts regardless of remote-dependency reachability;
+  `GET /health/ready` remains the sole readiness gate; the shared DB engine is disposed on
+  shutdown. [docs/architecture/](docs/architecture/README.md#process-lifecycle-phase-210)
+- **Configuration** — fail-fast validation at process import; every provider timeout, retry, and
+  DB-pool setting is documented, defaulted, and validated.
+  [docs/configuration/](docs/configuration/README.md)
+- **Provider timeouts/retries** — bounded exponential backoff with jitter; transient-vs-permanent
+  classification; streaming/non-idempotent paths excluded by design.
+  [docs/providers/](docs/providers/README.md#timeout-and-retry-policy-phase-210)
+- **Structured logging & correlation IDs** — JSON logs, `X-Correlation-ID` request header,
+  generated/echoed/propagated to outbound Ollama/Qdrant calls; standalone scripts are excluded.
+  [docs/operations/](docs/operations/README.md#structured-logging)
+- **Worker signal handling** — `process_pending_*.py` scripts stop cooperatively on SIGINT/SIGTERM,
+  between job claims, never mid-job; a separate process model from the API lifespan.
+  [docs/operations/](docs/operations/README.md#worker-signal-handling-phase-210)
+- **Connection pooling** — the shared PostgreSQL engine's pool size/overflow/recycle are
+  configurable and disposed on shutdown; the isolated `/health/ready` check connection is
+  deliberately separate. [docs/operations/](docs/operations/README.md#connection-pool-ownership)
+- **CORS** — configurable allowed origins (empty/secure by default), `GET`/`POST`/`DELETE` only,
+  credentials disabled, `X-Correlation-ID` exposed to browser JS.
+  [docs/deployment/](docs/deployment/README.md#cors)
+- **Alembic baseline reset** — the 9 development migrations were squashed into one baseline
+  (`a1a302e871c3`); existing local databases must be recreated, never upgraded in place.
+  [alembic/README.md](alembic/README.md#migration-history-reset-phase-210)
+
 ## Documentation index
 
 | Directory | Covers |
@@ -135,11 +166,16 @@ convenience commands: [docs/testing/](docs/testing/README.md).
 
 ## Current limitations
 
-No stale-`PROCESSING` recovery for deletion or re-index jobs (only ingestion has this); only the
-latest ingestion attempt is exposed via the API (full history is retained in Postgres but not
-enumerable); download/upload buffer the full object in memory rather than streaming; no CI
-workflow exists in this repository. Full, per-domain limitation lists live in each documentation
-directory above — see in particular
+No automated stale-`PROCESSING` recovery for deletion or re-index jobs (only ingestion has this;
+neither can be safely mid-operation-cancelled either — see
+[docs/operations/](docs/operations/README.md#current-limitations)); only the latest ingestion
+attempt is exposed via the API (full history is retained in Postgres but not enumerable);
+download/upload buffer the full object in memory rather than streaming; provider clients remain
+per-operation rather than application-owned shared clients; no in-place Alembic upgrade path exists
+from the pre-Phase-2.10 deleted revisions (existing local databases must be recreated — see
+[alembic/README.md](alembic/README.md#migration-history-reset-phase-210)); no CI workflow exists in
+this repository. Full, per-domain limitation lists live in each documentation directory above —
+see in particular
 [docs/document-lifecycle/](docs/document-lifecycle/README.md#current-limitations) and
 [docs/operations/](docs/operations/README.md#current-limitations).
 

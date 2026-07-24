@@ -20,6 +20,18 @@ def _settings(**overrides: str) -> Settings:
     return Settings(**overrides)
 
 
+def _settings_bypassing_provider_validation(**field_overrides: str) -> Settings:
+    """Build a Settings instance with a provider name Settings' own validation would reject.
+
+    As of Phase 2.10, Settings validates *_PROVIDER fields against a closed set at construction
+    time (the same names the factory itself recognizes), so a truly-unsupported name can no
+    longer reach the factory via normal construction — Settings itself now raises first. This
+    helper uses `model_construct()` (bypasses Settings' validators) to still exercise the
+    factory's own UnsupportedProviderError as defense in depth, keyed by field name (not alias).
+    """
+    return Settings.model_construct(**{**Settings().model_dump(), **field_overrides})
+
+
 def test_get_embedding_provider_returns_ollama_when_configured() -> None:
     """EMBEDDING_PROVIDER=ollama should resolve to OllamaEmbeddingProvider."""
     settings = _settings(EMBEDDING_PROVIDER="ollama")
@@ -40,7 +52,7 @@ def test_get_llm_provider_returns_ollama_when_configured() -> None:
 
 def test_get_embedding_provider_raises_on_unsupported_provider() -> None:
     """An unrecognized EMBEDDING_PROVIDER should raise a clear configuration error."""
-    settings = _settings(EMBEDDING_PROVIDER="openai")
+    settings = _settings_bypassing_provider_validation(embedding_provider="openai")
 
     with pytest.raises(UnsupportedProviderError, match="openai"):
         get_embedding_provider(settings)
@@ -48,7 +60,7 @@ def test_get_embedding_provider_raises_on_unsupported_provider() -> None:
 
 def test_get_llm_provider_raises_on_unsupported_provider() -> None:
     """An unrecognized LLM_PROVIDER should raise a clear configuration error."""
-    settings = _settings(LLM_PROVIDER="cohere")
+    settings = _settings_bypassing_provider_validation(llm_provider="cohere")
 
     with pytest.raises(UnsupportedProviderError, match="cohere"):
         get_llm_provider(settings)
@@ -74,7 +86,7 @@ def test_get_vector_store_returns_qdrant_when_configured() -> None:
 
 def test_get_vector_store_raises_on_unsupported_provider() -> None:
     """An unrecognized VECTOR_STORE_PROVIDER should raise a clear configuration error."""
-    settings = _settings(VECTOR_STORE_PROVIDER="pinecone")
+    settings = _settings_bypassing_provider_validation(vector_store_provider="pinecone")
 
     with pytest.raises(UnsupportedProviderError, match="pinecone"):
         get_vector_store(settings)

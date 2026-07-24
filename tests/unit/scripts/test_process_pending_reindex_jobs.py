@@ -9,10 +9,33 @@ exception exits 1 without leaking a raw stack trace, and the session context man
 exited (dependencies are not leaked).
 """
 
+from contextlib import contextmanager
+
 import pytest
 
 from app.services.indexing.reindex_worker import ReindexWorkerOutcome, ReindexWorkerResult
 from scripts import process_pending_reindex_jobs as script
+
+
+class _FakeStop:
+    """Controllable stand-in for scripts._shutdown.StopRequested."""
+
+    def __init__(self, *, already_stopped: bool) -> None:
+        self._requested = already_stopped
+        self.signal_name = "SIGTERM" if already_stopped else None
+
+    def __bool__(self) -> bool:
+        return self._requested
+
+
+def _install_fake_stop(monkeypatch: pytest.MonkeyPatch, *, already_stopped: bool) -> None:
+    stop = _FakeStop(already_stopped=already_stopped)
+
+    @contextmanager
+    def _fake_install_stop_signal_handlers():
+        yield stop
+
+    monkeypatch.setattr(script, "install_stop_signal_handlers", _fake_install_stop_signal_handlers)
 
 
 class _FakeSession:
@@ -180,3 +203,24 @@ async def test_worker_is_constructed_with_the_created_file_storage(monkeypatch: 
     await script.main()
 
     assert calls["file_storage"] is sentinel
+
+
+async def test_stop_requested_before_the_claim_prevents_any_processing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Phase 2.10: a SIGINT/SIGTERM received before this script's one claim must skip it entirely."""
+    _install_fake_file_storage(monkeypatch)
+    _install_fake_session_factory(monkeypatch)
+    _install_fake_stop(monkeypatch, already_stopped=True)
+    calls = _install_fake_worker(
+        monkeypatch,
+        result=ReindexWorkerResult(
+            outcome=ReindexWorkerOutcome.COMPLETED, job_id="job-1", document_id="doc-1"
+        ),
+    )
+
+    exit_code = await script.main()
+
+    assert exit_code == 0
+    assert calls["count"] == 0
+    assert "Stop requested" in capsys.readouterr().out

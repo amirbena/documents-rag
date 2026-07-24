@@ -38,7 +38,7 @@ class OllamaClient:
         try:
             async with httpx.AsyncClient(
                 base_url=self._settings.ollama_base_url,
-                timeout=5.0,
+                timeout=self._settings.ollama_health_timeout_seconds,
                 transport=self._transport,
             ) as client:
                 response = await client.get("/api/tags")

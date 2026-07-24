@@ -7,6 +7,9 @@ original exception is always preserved as `__cause__` (via `raise ... from exc`)
 include the operation and object key where safe, and never a credential, secret, or signed URL.
 """
 
+# Category (Phase 2.10, see app/core/errors.py): ProviderError — this hierarchy is not reparented
+# under AppError; each route already maps it via its own outcome-specific handling.
+
 
 class StorageError(Exception):
     """Base class for every provider-neutral storage failure."""

@@ -28,6 +28,28 @@ process imports the module and exits, with no error, which is easy to mistake fo
 the root [README.md](../../README.md#initial-setup) for the recommended `docker compose up --build`
 flow and the app-only `uvicorn` alternative.
 
+## Recreating your local database after the Alembic history reset (Phase 2.10)
+
+This project's development migration history was squashed into a single baseline,
+`a1a302e871c3` — see [alembic/README.md](../../alembic/README.md#migration-history-reset-phase-210)
+for the full policy. If your local database was created before this reset (it's stamped at any of
+the 9 deleted revision IDs), `alembic upgrade head` will fail with
+`Can't locate revision identified by '<old-id>'`. Recreate it:
+
+```bash
+# Local venv, Postgres reachable directly:
+dropdb rag_db && createdb rag_db
+alembic upgrade head
+
+# Or, via Docker Compose:
+docker compose exec postgres dropdb -U postgres rag_db
+docker compose exec postgres createdb -U postgres rag_db
+docker compose exec app alembic upgrade head
+```
+
+Do not use `alembic stamp head` as a substitute — it only rewrites Alembic's own bookkeeping row,
+never creates or verifies a schema.
+
 ## Repository conventions
 
 - **Package `__init__.py` files stay minimal** (a one-line docstring) — they never re-export

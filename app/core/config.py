@@ -2,21 +2,42 @@
 
 Defaults match the docker-compose service names (postgres, redis, qdrant, ollama),
 so the app works out of the box inside the Compose network without an .env file.
+
+Validation here is deliberately fail-fast: a malformed URL, an unsupported provider name, an
+incomplete MinIO configuration, or a non-positive timeout/pool/retry value all raise at
+`Settings()` construction (which happens at process import time via the module-level
+`get_settings()` calls in `app/main.py`/`app/db/session.py`) rather than surfacing later on the
+first request that happens to exercise the broken path. Error messages name the offending field
+only — never a secret value (e.g. `minio_secret_key` is checked for presence, never echoed).
 """
 
 from functools import lru_cache
+from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_RESPONSE_LANGUAGES = ("he", "en")
 SUPPORTED_FILE_STORAGE_PROVIDERS = ("local", "minio")
+SUPPORTED_EMBEDDING_PROVIDERS = ("ollama",)
+SUPPORTED_VECTOR_STORE_PROVIDERS = ("qdrant",)
+# 'openai'/'gemini'/'anthropic' are recognized-but-not-yet-implemented LLM providers (see
+# app/rag/providers/provider_factory.py's _LLM_STUBS) — a config-time-valid name that still fails
+# loudly and explicitly at first use via ProviderNotImplementedError, never a silent Ollama fallback.
+SUPPORTED_LLM_PROVIDERS = ("ollama", "openai", "gemini", "anthropic")
+SUPPORTED_RAG_ENGINES = ("custom", "langchain")
 
 
 class Settings(BaseSettings):
     """Typed application settings, one field per environment variable."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # hide_input_in_errors: Pydantic's default ValidationError repr embeds the full offending
+    # input (the whole constructor kwargs dict, for a model_validator(mode="after") failure) —
+    # without this, a validation error on an unrelated field (e.g. an incomplete MinIO
+    # configuration) would echo minio_secret_key's raw value into the exception's str().
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
+    )
 
     app_env: str = Field(default="local", alias="APP_ENV")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -104,6 +125,55 @@ class Settings(BaseSettings):
     # bounds how much work one recovery run (script or future scheduler tick) does at once.
     ingestion_recovery_batch_size: int = Field(default=50, alias="INGESTION_RECOVERY_BATCH_SIZE")
 
+    # Provider HTTP timeouts (Phase 2.10) — promoted from what were previously hardcoded literals
+    # in each provider module, so they're a documented, validated, tunable surface. Defaults match
+    # exactly what those literals already were — no behavior changes until overridden.
+    ollama_embedding_timeout_seconds: float = Field(
+        default=30.0, alias="OLLAMA_EMBEDDING_TIMEOUT_SECONDS"
+    )
+    ollama_llm_timeout_seconds: float = Field(default=60.0, alias="OLLAMA_LLM_TIMEOUT_SECONDS")
+    ollama_health_timeout_seconds: float = Field(
+        default=5.0, alias="OLLAMA_HEALTH_TIMEOUT_SECONDS"
+    )
+    qdrant_timeout_seconds: float = Field(default=30.0, alias="QDRANT_TIMEOUT_SECONDS")
+    minio_timeout_seconds: float = Field(default=30.0, alias="MINIO_TIMEOUT_SECONDS")
+
+    # Postgres connection pool (Phase 2.10) — promoted from SQLAlchemy's implicit defaults (which
+    # `create_async_engine` previously received none of) into an explicit, documented, tunable
+    # surface. Defaults mirror SQLAlchemy's own defaults for a single-process deployment.
+    db_pool_size: int = Field(default=5, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=10, alias="DB_MAX_OVERFLOW")
+    db_pool_timeout: float = Field(default=30.0, alias="DB_POOL_TIMEOUT")
+    db_pool_recycle: int = Field(default=1800, alias="DB_POOL_RECYCLE")
+    db_pool_pre_ping: bool = Field(default=True, alias="DB_POOL_PRE_PING")
+
+    # Provider retry policy (Phase 2.10) — bounded exponential backoff with jitter, applied inside
+    # each provider adapter (see app/core/retry.py). Only transient failures are retried; a
+    # permanent error (auth, validation, unsupported request) never triggers a retry.
+    provider_retry_max_attempts: int = Field(default=3, alias="PROVIDER_RETRY_MAX_ATTEMPTS")
+    provider_retry_base_delay_seconds: float = Field(
+        default=0.5, alias="PROVIDER_RETRY_BASE_DELAY_SECONDS"
+    )
+    provider_retry_max_delay_seconds: float = Field(
+        default=5.0, alias="PROVIDER_RETRY_MAX_DELAY_SECONDS"
+    )
+
+    # CORS (Phase 2.10) — comma-separated list of allowed origins for frontend integration.
+    # Empty by default: this backend never allows cross-origin requests until an operator
+    # explicitly names the frontend origin(s); "*" is deliberately not a supported shorthand here
+    # (see `cors_allow_origins_list` below) — every origin must be spelled out explicitly.
+    cors_allow_origins: str = Field(default="", alias="CORS_ALLOW_ORIGINS")
+
+    # Startup dependency validation (Phase 2.10) — off by default so a fresh `docker compose up`
+    # (before Ollama models are pulled, or before Alembic migrations run) doesn't prevent the
+    # process from starting at all; an operator opts in once the deployment is otherwise ready.
+    startup_dependency_check: bool = Field(default=False, alias="STARTUP_DEPENDENCY_CHECK")
+
+    @property
+    def cors_allow_origins_list(self) -> list[str]:
+        """Parse CORS_ALLOW_ORIGINS into a list of origins; empty string -> empty list."""
+        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
+
     @field_validator("ingestion_stale_after_seconds", "ingestion_recovery_batch_size")
     @classmethod
     def _validate_positive_ingestion_recovery_settings(cls, value: int, info) -> int:
@@ -149,6 +219,128 @@ class Settings(BaseSettings):
                 f"FILE_STORAGE_PROVIDER must be one of {SUPPORTED_FILE_STORAGE_PROVIDERS}, got {value!r}"
             )
         return value
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _validate_llm_provider(cls, value: str) -> str:
+        """LLM_PROVIDER must be a real implementation or a recognized (stub) placeholder.
+
+        A recognized stub (openai/gemini/anthropic) still passes here — it fails loudly and
+        explicitly at first use via ProviderNotImplementedError (see provider_factory.py), never
+        silently at config time and never by falling back to Ollama.
+        """
+        if value not in SUPPORTED_LLM_PROVIDERS:
+            raise ValueError(f"LLM_PROVIDER must be one of {SUPPORTED_LLM_PROVIDERS}, got {value!r}")
+        return value
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def _validate_embedding_provider(cls, value: str) -> str:
+        """EMBEDDING_PROVIDER must name a provider the factory can construct."""
+        if value not in SUPPORTED_EMBEDDING_PROVIDERS:
+            raise ValueError(
+                f"EMBEDDING_PROVIDER must be one of {SUPPORTED_EMBEDDING_PROVIDERS}, got {value!r}"
+            )
+        return value
+
+    @field_validator("vector_store_provider")
+    @classmethod
+    def _validate_vector_store_provider(cls, value: str) -> str:
+        """VECTOR_STORE_PROVIDER must name a provider the factory can construct."""
+        if value not in SUPPORTED_VECTOR_STORE_PROVIDERS:
+            raise ValueError(
+                f"VECTOR_STORE_PROVIDER must be one of {SUPPORTED_VECTOR_STORE_PROVIDERS}, "
+                f"got {value!r}"
+            )
+        return value
+
+    @field_validator("rag_engine")
+    @classmethod
+    def _validate_rag_engine(cls, value: str) -> str:
+        """RAG_ENGINE must name an engine the factory can construct."""
+        if value not in SUPPORTED_RAG_ENGINES:
+            raise ValueError(f"RAG_ENGINE must be one of {SUPPORTED_RAG_ENGINES}, got {value!r}")
+        return value
+
+    @field_validator("database_url", "redis_url", "qdrant_url", "ollama_base_url")
+    @classmethod
+    def _validate_url_format(cls, value: str, info) -> str:
+        """These connection strings must at least be well-formed URLs (scheme + host present).
+
+        This only catches structurally malformed values (typos, missing scheme) — it never
+        attempts to connect, so a well-formed but unreachable URL still fails later, at the
+        relevant health check or first call, exactly as today.
+        """
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(
+                f"{info.field_name} must be a well-formed URL with a scheme and host, got {value!r}"
+            )
+        return value
+
+    @field_validator(
+        "ollama_embedding_timeout_seconds",
+        "ollama_llm_timeout_seconds",
+        "ollama_health_timeout_seconds",
+        "qdrant_timeout_seconds",
+        "minio_timeout_seconds",
+        "db_pool_timeout",
+        "provider_retry_base_delay_seconds",
+        "provider_retry_max_delay_seconds",
+    )
+    @classmethod
+    def _validate_positive_float(cls, value: float, info) -> float:
+        """Every timeout/delay setting must be a positive number of seconds."""
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be a positive number of seconds")
+        return value
+
+    @field_validator("db_pool_size", "db_max_overflow", "db_pool_recycle", "provider_retry_max_attempts")
+    @classmethod
+    def _validate_positive_int(cls, value: int, info) -> int:
+        """Pool sizing and retry-attempt settings must be positive integers."""
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_retry_delay_ordering(self) -> "Settings":
+        """PROVIDER_RETRY_MAX_DELAY_SECONDS must be >= the base delay it backs off from."""
+        if self.provider_retry_max_delay_seconds < self.provider_retry_base_delay_seconds:
+            raise ValueError(
+                "PROVIDER_RETRY_MAX_DELAY_SECONDS must be >= PROVIDER_RETRY_BASE_DELAY_SECONDS "
+                f"(got max={self.provider_retry_max_delay_seconds}, "
+                f"base={self.provider_retry_base_delay_seconds})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_minio_configuration_complete(self) -> "Settings":
+        """When FILE_STORAGE_PROVIDER=minio, every required MinIO field must be present.
+
+        Moves what was previously a runtime StorageConfigurationError (raised only when
+        create_file_storage() actually constructed a MinioFileStorage) earlier, to config
+        construction time — the runtime check in MinioFileStorage.__init__ remains as defense in
+        depth for any caller that bypasses Settings validation. Never echoes minio_secret_key.
+        """
+        if self.file_storage_provider != "minio":
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("MINIO_ENDPOINT", self.minio_endpoint),
+                ("MINIO_ACCESS_KEY", self.minio_access_key),
+                ("MINIO_SECRET_KEY", self.minio_secret_key),
+                ("MINIO_BUCKET", self.minio_bucket),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "FILE_STORAGE_PROVIDER=minio requires the following settings to be set: "
+                f"{', '.join(missing)}"
+            )
+        return self
 
     @property
     def resolved_llm_model(self) -> str:

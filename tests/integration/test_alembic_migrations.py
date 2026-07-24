@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
 
@@ -167,148 +167,6 @@ async def test_downgrade_and_reupgrade_is_stable(migrated_schema: None, postgres
     assert "ingestion_jobs" in table_names_after_reupgrade
 
 
-async def test_upgrade_from_previous_revision_adds_indexing_metadata(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """Upgrading from the prior revision alone should add index_collections + the new columns.
-
-    Runs downgrade to the prior revision (acf1b01d5a02) first, confirming the new table/columns
-    are genuinely absent, then upgrades to head and confirms they appear — proving `head` is
-    reachable incrementally from the previous revision, not just from a fresh database.
-    """
-    await asyncio.to_thread(run_alembic_downgrade, "acf1b01d5a02")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
-            document_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
-            )
-    finally:
-        await engine.dispose()
-
-    assert "index_collections" not in table_names
-    assert "indexed_at" not in document_columns
-
-    await asyncio.to_thread(run_alembic_upgrade, "head")
-
-    engine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
-            document_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
-            )
-    finally:
-        await engine.dispose()
-
-    assert "index_collections" in table_names
-    assert "indexed_at" in document_columns
-
-
-async def test_upgrade_from_prior_revision_adds_vector_cleanup_jobs_table(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """Upgrading from 07f849bf2b95 alone should add the vector_cleanup_jobs table.
-
-    Runs downgrade to the immediately-prior revision first, confirming the new table is
-    genuinely absent, then upgrades to head and confirms it appears with the expected columns.
-    """
-    await asyncio.to_thread(run_alembic_downgrade, "07f849bf2b95")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
-    finally:
-        await engine.dispose()
-
-    assert "vector_cleanup_jobs" not in table_names
-
-    await asyncio.to_thread(run_alembic_upgrade, "head")
-
-    engine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
-            cleanup_job_columns = await conn.run_sync(
-                lambda sync_conn: {
-                    col["name"] for col in inspect(sync_conn).get_columns("vector_cleanup_jobs")
-                }
-            )
-    finally:
-        await engine.dispose()
-
-    assert "vector_cleanup_jobs" in table_names
-    assert cleanup_job_columns == {
-        "id",
-        "document_id",
-        "collection_name",
-        "status",
-        "attempts",
-        "last_error",
-        "created_at",
-        "completed_at",
-    }
-
-
-async def test_upgrade_backfills_storage_identity_for_pre_migration_rows(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """A document row written before the storage-identity migration must be backfilled safely.
-
-    Downgrades to the immediately-prior revision (1c2d9f3a7b4e), inserts a row the way the old
-    LocalFileStorage wrote it (flat stored_filename, stored_path under the local root), then
-    upgrades to head and confirms storage_provider/storage_key are backfilled deterministically
-    from the existing columns — no file content is read, no row becomes unreadable.
-    """
-    from app.models.document import Document
-
-    await asyncio.to_thread(run_alembic_downgrade, "1c2d9f3a7b4e")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    document_id = str(uuid.uuid4())
-    stored_filename = f"{uuid.uuid4().hex}.pdf"
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(
-                text(
-                    "INSERT INTO documents "
-                    "(id, original_filename, stored_filename, content_type, file_size, stored_path) "
-                    "VALUES (:id, :original_filename, :stored_filename, :content_type, :file_size, "
-                    ":stored_path)"
-                ),
-                {
-                    "id": document_id,
-                    "original_filename": "legacy.pdf",
-                    "stored_filename": stored_filename,
-                    "content_type": "application/pdf",
-                    "file_size": 10,
-                    "stored_path": f"storage/documents/{stored_filename}",
-                },
-            )
-            await conn.commit()
-    finally:
-        await engine.dispose()
-
-    await asyncio.to_thread(run_alembic_upgrade, "head")
-
-    engine = create_async_engine(postgres_url, future=True)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    try:
-        async with session_factory() as session:
-            document = await session.get(Document, document_id)
-    finally:
-        await engine.dispose()
-
-    assert document is not None
-    assert document.storage_provider == "local"
-    assert document.storage_key == stored_filename
-    assert document.storage_bucket is None
-    assert document.storage_etag is None
-
-
 def _make_document(*, document_id: str | None = None, content_hash: str | None = None) -> "Document":
     """Build a minimal valid Document row for content_hash persistence tests."""
     from app.models.document import Document
@@ -322,37 +180,6 @@ def _make_document(*, document_id: str | None = None, content_hash: str | None =
         stored_path="storage/documents/report.pdf",
         content_hash=content_hash,
     )
-
-
-async def test_upgrade_from_prior_revision_adds_content_hash_column(
-    migrated_schema: None, postgres_url: str
-) -> None:
-    """Upgrading from c8f3a2b6d1e7 alone should add the nullable content_hash column."""
-    await asyncio.to_thread(run_alembic_downgrade, "c8f3a2b6d1e7")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            document_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
-            )
-    finally:
-        await engine.dispose()
-
-    assert "content_hash" not in document_columns
-
-    await asyncio.to_thread(run_alembic_upgrade, "head")
-
-    engine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            document_columns = await conn.run_sync(
-                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("documents")}
-            )
-    finally:
-        await engine.dispose()
-
-    assert "content_hash" in document_columns
 
 
 async def test_content_hash_unique_index_exists(migrated_schema: None, postgres_url: str) -> None:

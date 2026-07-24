@@ -45,6 +45,8 @@ from app.services.indexing.collection_registry import ensure_active_collection, 
 from app.services.ingestion.worker import to_vector_point
 from app.storage.contract import FileStorage
 
+# Category (Phase 2.10, see app/core/errors.py): ConfigurationError.
+
 
 class TargetConfigurationMismatchError(ValueError):
     """Raised when settings derived for a build do not reproduce the exact requested target.

@@ -189,6 +189,26 @@ def test_service_limit_validation_error_is_translated_to_400(monkeypatch: pytest
     assert "detail" in response.json()
 
 
+def test_service_limit_validation_error_never_leaks_the_raw_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 2.10: detail must be a fixed constant, never str(exc) — even if the service's own
+    message text ever changed to include something less safe."""
+    _install_fake_db_session()
+    raw_message = "limit must be between 1 and 50, got a-sensitive-internal-detail."
+
+    async def _fake_raises(session, settings, file_storage, vector_store, *, limit, cursor=None):
+        raise InvalidAuditBatchLimitError(raw_message)
+
+    monkeypatch.setattr(reconciliation_route_module, "audit_document_lifecycle_batch", _fake_raises)
+
+    response = client.get("/api/v1/reconciliation/documents/audit", params={"limit": MIN_BATCH_LIMIT})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] != raw_message
+    assert "a-sensitive-internal-detail" not in response.json()["detail"]
+
+
 # --- cursor handling ---------------------------------------------------------------------------
 
 

@@ -35,6 +35,15 @@ liveness staying up when readiness fails.
   ephemeral MinIO container (Testcontainers, dynamic port, unique bucket per test), selected purely
   through the app's real `Settings`/`create_file_storage()` dependency chain.
 
+## Database schema (Phase 2.10 baseline)
+
+Each test session's ephemeral Postgres container is migrated via `run_alembic_upgrade("head")`
+against Alembic's single baseline revision, `a1a302e871c3` — see
+[alembic/README.md](../../alembic/README.md#migration-history-reset-phase-210). This tier never
+depends on any of the 9 deleted incremental revisions; a genuinely empty container migrating
+straight to `a1a302e871c3` is exactly what this suite already exercises on every run, so the
+history reset required no fixture changes here.
+
 ## Infrastructure startup
 
 Handled entirely by `tests/e2e/backend/conftest.py` — no manual setup beyond having Docker

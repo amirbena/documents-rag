@@ -3,7 +3,6 @@
 import pytest
 
 from app.core.config import Settings
-from app.storage.errors import StorageConfigurationError
 from app.storage.factory import create_file_storage
 from app.storage.local_storage import LocalFileStorage
 from app.storage.minio_storage import MinioFileStorage
@@ -34,11 +33,16 @@ def test_minio_provider_selection() -> None:
 
 
 def test_minio_provider_requires_endpoint_and_bucket() -> None:
-    """Selecting minio without MINIO_ENDPOINT/MINIO_BUCKET must fail clearly, not construct a client."""
-    settings = Settings(FILE_STORAGE_PROVIDER="minio")
+    """Selecting minio without MINIO_ENDPOINT/MINIO_BUCKET must fail clearly, not construct a client.
 
-    with pytest.raises(StorageConfigurationError):
-        create_file_storage(settings)
+    As of Phase 2.10, this is caught at Settings construction (fail-fast config validation) rather
+    than only when create_file_storage() later tries to build a MinioFileStorage — see
+    Settings._validate_minio_configuration_complete(). The runtime StorageConfigurationError in
+    MinioFileStorage.__init__ remains as defense in depth for any caller that bypasses Settings
+    validation, but is no longer reachable via normal Settings construction.
+    """
+    with pytest.raises(ValueError, match="FILE_STORAGE_PROVIDER=minio requires"):
+        Settings(FILE_STORAGE_PROVIDER="minio")
 
 
 def test_local_settings_not_required_in_minio_mode() -> None:

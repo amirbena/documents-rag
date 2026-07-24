@@ -73,8 +73,8 @@ def _target_config(**overrides: object) -> EmbeddingIndexConfig:
 
 
 # The "old"/currently-serving config every seeded document defaults to `collection_name` under.
-# `Document.collection_name` carries a foreign key into `index_collections` (migration
-# 07f849bf2b95) — a document can never reference a collection that isn't itself persisted there.
+# `Document.collection_name` carries a foreign key into `index_collections` (see the alembic
+# baseline migration) — a document can never reference a collection that isn't itself persisted there.
 _OLD_CONFIG = _target_config(model="old-model", embedding_version="v0", chunking_version="v0")
 
 
@@ -154,31 +154,6 @@ async def test_migration_creates_reindex_jobs_table_with_expected_columns(
         "activated_at",
     }
     assert "ix_reindex_jobs_one_active_per_document" in index_names
-
-
-async def test_migration_downgrade_and_reupgrade_succeeds(migrated_schema: None, postgres_url: str) -> None:
-    """Downgrading to the prior revision removes reindex_jobs; re-upgrading restores it."""
-    from tests.integration.conftest import run_alembic_downgrade, run_alembic_upgrade
-
-    await asyncio.to_thread(run_alembic_downgrade, "4a4f5c0674f4")
-
-    engine: AsyncEngine = create_async_engine(postgres_url, future=True)
-    try:
-        async with engine.connect() as conn:
-            table_names_before = await conn.run_sync(
-                lambda sync_conn: set(inspect(sync_conn).get_table_names())
-            )
-        assert "reindex_jobs" not in table_names_before
-
-        await asyncio.to_thread(run_alembic_upgrade, "head")
-
-        async with engine.connect() as conn:
-            table_names_after = await conn.run_sync(
-                lambda sync_conn: set(inspect(sync_conn).get_table_names())
-            )
-        assert "reindex_jobs" in table_names_after
-    finally:
-        await engine.dispose()
 
 
 # --- foreign keys -----------------------------------------------------------------------------

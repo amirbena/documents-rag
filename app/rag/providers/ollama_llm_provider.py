@@ -11,7 +11,10 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.correlation import correlation_headers
 from app.rag.providers.llm_provider import LLMProvider
+
+# Category (Phase 2.10, see app/core/errors.py): ProviderError.
 
 
 class OllamaLLMError(Exception):
@@ -44,7 +47,7 @@ class OllamaLLMProvider(LLMProvider):
 
         async with httpx.AsyncClient(
             base_url=self._settings.ollama_base_url,
-            timeout=60.0,
+            timeout=self._settings.ollama_llm_timeout_seconds,
             transport=self._transport,
         ) as client:
             try:
@@ -56,6 +59,7 @@ class OllamaLLMProvider(LLMProvider):
                         "prompt": prompt,
                         "stream": True,
                     },
+                    headers=correlation_headers(),
                 ) as response:
                     try:
                         response.raise_for_status()
