@@ -81,12 +81,20 @@ MinIO uses its own classifier against the `minio` SDK's exception types: `MaxRet
 `ServiceUnavailable`/`SlowDown`/`InternalError` — every other `S3Error` code (`NoSuchKey`, auth
 failures, `BucketAlreadyOwnedByYou`, etc.) is permanent. The underlying `urllib3.PoolManager`
 backing the `minio` SDK client (`app/storage/minio_storage.py`) is configured with
-`retries=Retry(total=0)` — zero automatic urllib3-level retries — specifically so `retry_async`
-above remains the only layer that retries a transient MinIO failure; `PROVIDER_RETRY_MAX_ATTEMPTS`
-therefore has the same total-attempts meaning for MinIO as it does for Ollama/Qdrant. (An explicit
-`Retry(total=0)` object is still passed, never the `retries=` argument omitted entirely — omitting
-it previously broke the `minio` SDK's own `RequestTimeTooSkewed` handling; see that constructor's
-comment for detail.)
+`retries=Retry(total=None, connect=0, read=0, redirect=1, status=0, other=0)` — every
+*failure*-retry dimension (connect/read/status/other) disabled, so `retry_async` above remains the
+only layer that retries a transient MinIO failure; `PROVIDER_RETRY_MAX_ATTEMPTS` therefore has the
+same total-attempts meaning for MinIO as it does for Ollama/Qdrant. `redirect=1` is deliberately
+left non-zero: the `minio` SDK has no redirect-following logic of its own, so it depends entirely
+on urllib3 to follow a legitimate S3-compatible redirect — zeroing `redirect` too (as an earlier
+version of this fix did) would have silently broken that, turning a normal redirect into a
+`MaxRetryError` that then gets retried against the same redirect indefinitely. One redirect hop is
+followed transparently (not counted as a `retry_async` attempt at all); a genuine redirect loop
+still fails, at the second hop, as a `MaxRetryError`, which `_is_transient_minio_error` treats as
+transient — so `retry_async`'s attempt ceiling still bounds a real redirect loop overall. (An
+explicit `Retry` object is always passed, never the `retries=` argument omitted entirely —
+omitting it previously broke the `minio` SDK's own `RequestTimeTooSkewed` handling; see that
+constructor's comment for detail.)
 
 **Retry exhaustion** re-raises the *last* transient exception unchanged — never a generic
 "retries exhausted" wrapper, and never swallowed — so a caller catching that provider's own error

@@ -79,14 +79,31 @@ class MinioFileStorage(FileStorage):
         # integration test failed with `RequestTimeTooSkewed`. This PoolManager still reproduces
         # `Minio.__init__`'s own default construction (cert_reqs/ca_certs/maxsize) byte-for-byte,
         # changing only the timeout — `retries=` stays an explicit `Retry` object (never omitted,
-        # which is what caused that historical failure), but with `total=0`: zero automatic
-        # urllib3-level retries, so `retry_async`/`_is_transient_minio_error` below is the single
-        # authoritative retry layer for MinIO, exactly as it already is for Ollama/Qdrant. A
+        # which is what caused that historical failure).
+        #
+        # The `Retry` object below disables every *failure*-retry dimension urllib3 offers
+        # (`connect`/`read`/`status`/`other`, each set to 0 — one real attempt, then immediately
+        # exhausted) so `retry_async`/`_is_transient_minio_error` below is the single authoritative
+        # retry layer for a transient MinIO failure, exactly as it already is for Ollama/Qdrant. A
         # transient 5xx that used to be retried silently inside urllib3 now surfaces immediately as
         # a `MaxRetryError` (connection-level) or a body-parsed `S3Error` (e.g. `InternalError`/
-        # `ServiceUnavailable`) on the very first attempt, which `_is_transient_minio_error`
-        # already classifies as transient — so `retry_async` retries it at the application layer
-        # instead of it being retried twice, once inside urllib3 and again at the application layer.
+        # `ServiceUnavailable`) on the very first attempt, which `_is_transient_minio_error` already
+        # classifies as transient — so `retry_async` retries it at the application layer instead of
+        # it being retried twice, once inside urllib3 and again at the application layer.
+        #
+        # `redirect=1` (with `total=None`, so it never also decrements — see urllib3's own
+        # `Retry.increment()`) is deliberately kept nonzero: the `minio` SDK has no redirect-
+        # following logic of its own (confirmed by reading `Minio._url_open`/`_execute` — neither
+        # handles a 3xx response directly) and depends entirely on urllib3's automatic
+        # redirect-following for a legitimate S3-compatible redirect (e.g. a region-specific
+        # endpoint). Zeroing every counter including `redirect` (as an earlier version of this
+        # fix did) silently broke that: a real redirect would raise `MaxRetryError` instead of
+        # being followed, then get retried at the application layer against the exact same
+        # redirect — never succeeding. `redirect=1` allows exactly one redirect hop to be followed
+        # transparently (matching how a single MinIO redirect actually plays out in practice); a
+        # genuine redirect *loop* still fails, at the second redirect, with `MaxRetryError` — which
+        # `_is_transient_minio_error` treats as transient, so `retry_async` still bounds how many
+        # times a real redirect loop is retried overall.
         self._client = Minio(
             settings.minio_endpoint,
             access_key=settings.minio_access_key,
@@ -100,7 +117,7 @@ class MinioFileStorage(FileStorage):
                 maxsize=10,
                 cert_reqs="CERT_REQUIRED",
                 ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
-                retries=Retry(total=0),
+                retries=Retry(total=None, connect=0, read=0, redirect=1, status=0, other=0),
             ),
         )
         self._settings = settings
