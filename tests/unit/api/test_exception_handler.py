@@ -95,6 +95,29 @@ def test_generic_unhandled_exception_maps_to_fixed_500_never_leaking_str_exc() -
     assert "RuntimeError" not in body["detail"]
 
 
+def test_generic_unhandled_exception_is_logged_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`UnhandledExceptionCorsBoundary` builds+logs the fallback response itself and then
+    re-raises so the exception still reaches the ASGI server/test client unchanged from before —
+    that re-raise must never cause `unhandled_exception_handler` (or any other handler) to log the
+    same exception a second time."""
+    _install_fake_db_session()
+    _raise(monkeypatch, RuntimeError("boom"))
+
+    with caplog.at_level("ERROR"):
+        with TestClient(app, raise_server_exceptions=False) as raising_client:
+            response = raising_client.get(f"/api/v1/reconciliation/documents/{uuid.uuid4()}/audit")
+
+    assert response.status_code == 500
+    fallback_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "unhandled_exception_fallback"
+    ]
+    assert len(fallback_records) == 1
+
+
 class _FakeSessionWithNoDocuments:
     async def get(self, model: object, key: object) -> None:
         return None

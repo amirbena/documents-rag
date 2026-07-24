@@ -74,11 +74,19 @@ class MinioFileStorage(FileStorage):
         # PoolManager instead, and building one from scratch means losing the SDK's own defaults
         # unless they're reproduced exactly. This is a verified-the-hard-way requirement: an
         # earlier version of this change passed a bare `urllib3.PoolManager(timeout=...)` with no
-        # `retries=`, which broke the SDK's built-in retry-on-`RequestTimeTooSkewed`/5xx handling
-        # (confirmed via a full run of the real-MinIO integration suite) — every MinIO integration
-        # test failed with `RequestTimeTooSkewed`. This PoolManager reproduces
-        # `Minio.__init__`'s own default construction (cert_reqs/ca_certs/maxsize/retries)
-        # byte-for-byte, changing only the timeout.
+        # `retries=` at all, which broke the SDK's built-in retry-on-`RequestTimeTooSkewed`/5xx
+        # handling (confirmed via a full run of the real-MinIO integration suite) — every MinIO
+        # integration test failed with `RequestTimeTooSkewed`. This PoolManager still reproduces
+        # `Minio.__init__`'s own default construction (cert_reqs/ca_certs/maxsize) byte-for-byte,
+        # changing only the timeout — `retries=` stays an explicit `Retry` object (never omitted,
+        # which is what caused that historical failure), but with `total=0`: zero automatic
+        # urllib3-level retries, so `retry_async`/`_is_transient_minio_error` below is the single
+        # authoritative retry layer for MinIO, exactly as it already is for Ollama/Qdrant. A
+        # transient 5xx that used to be retried silently inside urllib3 now surfaces immediately as
+        # a `MaxRetryError` (connection-level) or a body-parsed `S3Error` (e.g. `InternalError`/
+        # `ServiceUnavailable`) on the very first attempt, which `_is_transient_minio_error`
+        # already classifies as transient — so `retry_async` retries it at the application layer
+        # instead of it being retried twice, once inside urllib3 and again at the application layer.
         self._client = Minio(
             settings.minio_endpoint,
             access_key=settings.minio_access_key,
@@ -92,7 +100,7 @@ class MinioFileStorage(FileStorage):
                 maxsize=10,
                 cert_reqs="CERT_REQUIRED",
                 ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
-                retries=Retry(total=5, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504]),
+                retries=Retry(total=0),
             ),
         )
         self._settings = settings

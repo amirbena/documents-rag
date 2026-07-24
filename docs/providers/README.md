@@ -63,7 +63,12 @@ settings-backed timeout — no unbounded-wait literal remains anywhere in `app/r
 Ollama embedding, Qdrant, and MinIO calls additionally retry with bounded exponential backoff and
 full jitter (`app/core/retry.py`'s `retry_async`, `PROVIDER_RETRY_MAX_ATTEMPTS`/
 `PROVIDER_RETRY_BASE_DELAY_SECONDS`/`PROVIDER_RETRY_MAX_DELAY_SECONDS` — see
-[docs/configuration/](../configuration/README.md#provider-retry-policy-phase-210)). Classification
+[docs/configuration/](../configuration/README.md#provider-retry-policy-phase-210)).
+`PROVIDER_RETRY_MAX_ATTEMPTS` is the **total number of attempts, including the first (non-retry)
+one** — `PROVIDER_RETRY_MAX_ATTEMPTS=3` means at most 3 real calls to the provider (1 initial + up
+to 2 retries), never 3 retries on top of the first. `retry_async` is the single authoritative retry
+layer for all three providers; no provider's own transport client is separately configured to
+retry underneath it (see the MinIO note below). Classification
 (`app/rag/providers/http_retry_policy.py` for the raw-httpx providers):
 
 - **Transient (retried):** connection/timeout failures (any `httpx.HTTPError` that isn't a status
@@ -74,7 +79,14 @@ full jitter (`app/core/retry.py`'s `retry_async`, `PROVIDER_RETRY_MAX_ATTEMPTS`/
 MinIO uses its own classifier against the `minio` SDK's exception types: `MaxRetryError`
 (connection-level) is always transient; an `S3Error` is transient only for
 `ServiceUnavailable`/`SlowDown`/`InternalError` — every other `S3Error` code (`NoSuchKey`, auth
-failures, `BucketAlreadyOwnedByYou`, etc.) is permanent.
+failures, `BucketAlreadyOwnedByYou`, etc.) is permanent. The underlying `urllib3.PoolManager`
+backing the `minio` SDK client (`app/storage/minio_storage.py`) is configured with
+`retries=Retry(total=0)` — zero automatic urllib3-level retries — specifically so `retry_async`
+above remains the only layer that retries a transient MinIO failure; `PROVIDER_RETRY_MAX_ATTEMPTS`
+therefore has the same total-attempts meaning for MinIO as it does for Ollama/Qdrant. (An explicit
+`Retry(total=0)` object is still passed, never the `retries=` argument omitted entirely — omitting
+it previously broke the `minio` SDK's own `RequestTimeTooSkewed` handling; see that constructor's
+comment for detail.)
 
 **Retry exhaustion** re-raises the *last* transient exception unchanged — never a generic
 "retries exhausted" wrapper, and never swallowed — so a caller catching that provider's own error

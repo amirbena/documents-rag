@@ -44,13 +44,24 @@ produce this same event contract from the same underlying pieces — see
 ## Process lifecycle (Phase 2.10)
 
 `app/main.py` registers a FastAPI `lifespan` (`app/core/lifespan.py`) around the ASGI app, and
-wires middleware in this order: `CORSMiddleware` (`app/core/cors.py`) first, then
-`correlation_id_middleware` (`app/core/middleware.py`) last. Starlette wraps middleware in
-reverse-registration order, so correlation ID stays the **outermost** layer — every subsequent
-middleware, exception handler, and log line inside a request can read
-`app.core.correlation.get_correlation_id()`, and even a CORS-preflight response that
-`CORSMiddleware` short-circuits internally still gets `X-Correlation-ID` echoed on the way back
-out, since correlation wraps around whatever `call_next` returns.
+wires three middlewares in this order: `UnhandledExceptionCorsBoundary` (`app/core/middleware.py`)
+first, then `CORSMiddleware` (`app/core/cors.py`), then `correlation_id_middleware`
+(`app/core/middleware.py`) last. Starlette wraps middleware in reverse-registration order, so the
+effective outside-in order is correlation ID → CORS → the exception boundary → routing —
+correlation ID stays the **outermost** layer, so every subsequent middleware, exception handler,
+and log line inside a request can read `app.core.correlation.get_correlation_id()`, and even a
+CORS-preflight response that `CORSMiddleware` short-circuits internally still gets
+`X-Correlation-ID` echoed on the way back out.
+
+`UnhandledExceptionCorsBoundary` sits *inside* `CORSMiddleware` deliberately: Starlette always
+routes a handler registered for the bare `Exception`/`500` key to `ServerErrorMiddleware`, which
+wraps everything else including `CORSMiddleware` — so a handler registered that way builds a
+correct, sanitized 500 response that never passes back through CORS, silently dropping CORS
+headers on a request from an allowed Origin. Implementing the same fallback as ordinary ASGI
+middleware one layer further in means its response does pass back through `CORSMiddleware`'s own
+header logic like any other response. `AppError`/`HTTPException`/`RequestValidationError` are
+unaffected either way — FastAPI's `ExceptionMiddleware` (further in still) handles all three
+directly and this boundary never sees them.
 
 **Startup order:** `get_settings()` (fail-fast config validation — see
 [docs/configuration/](../configuration/README.md)) → `configure_logging()` → FastAPI app/
