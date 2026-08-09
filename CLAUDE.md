@@ -211,6 +211,15 @@ replace running it explicitly before considering a task done.
 
 ## Pull Request Workflow
 
+- Before modifying any file for a new implementation task: inspect repo state (`git status`,
+  `git branch --show-current`); fetch and verify the intended base (`git fetch origin` +
+  `git log origin/main`); ensure any existing work is clean or safely preserved (commit/stash —
+  never discard); switch to the base branch and sync it with `origin/main`; create a fresh
+  task-specific branch from it; switch to that branch. Only then edit files. Creating the branch
+  after edits have already started does not satisfy this rule.
+- Never modify files directly on `main`; never start editing before switching branches; never
+  continue a new task on a branch created for a previous task or on an already-open PR branch;
+  never mix unrelated tasks on the same branch. Each implementation task gets its own branch.
 - Verify `gh --version` / `gh auth status` before any GitHub operation; stop and report if either
   fails.
 - Confirm `git branch --show-current` is the intended feature branch before pushing — never push
