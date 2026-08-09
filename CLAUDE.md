@@ -211,6 +211,19 @@ replace running it explicitly before considering a task done.
 
 ## Pull Request Workflow
 
+- **Fresh branch before implementation — always, no exceptions.** Before making the first edit for
+  any implementation task, in this exact order: (1) inspect repository state (`git status`,
+  `git branch --show-current`); (2) fetch and verify/sync the intended base branch (`git fetch
+  origin`, then `git checkout <base>` and pull it up to date with `origin/<base>`); (3) make sure
+  any existing work is clean or safely preserved — commit or stash it, never discard it; (4)
+  create a fresh, task-specific branch from that synced base; (5) switch to it. Only once all five
+  steps are done may implementation begin. Creating or switching to a branch *after* editing has
+  already started does not satisfy this rule — branch isolation must exist before the first
+  implementation change, not be retrofitted around it.
+- **Branch reuse is prohibited.** An implementing Agent must never: work directly on `main`;
+  continue a new task on a branch created for a previous task; or reuse a branch that is already
+  associated with an open PR, even a related one. Every implementation task gets its own fresh
+  branch, created before that task's first change — no task shares a branch with another task.
 - Verify `gh --version` / `gh auth status` before any GitHub operation; stop and report if either
   fails.
 - Confirm `git branch --show-current` is the intended feature branch before pushing — never push
