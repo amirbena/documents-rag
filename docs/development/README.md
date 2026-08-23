@@ -15,7 +15,7 @@ Local development setup, repository conventions, and the contribution workflow. 
 ## Local setup
 
 The full first-time onboarding walkthrough (prerequisites, virtualenv, Docker Compose, Alembic,
-Ollama models, pre-commit hook) lives in the root **[README.md](../../README.md#initial-setup)**
+Ollama models, pre-commit hook) lives in the root **[README.md](../../README.md#3-installation--first-time-setup)**
 — that is the canonical copy; this page does not repeat it.
 
 See [docs/deployment/](../deployment/README.md) for the full container topology and readiness
@@ -25,7 +25,7 @@ contract, and [docs/configuration/](../configuration/README.md) for every enviro
 
 **`python app/main.py` does not start the server** — it only defines the FastAPI `app` object; the
 process imports the module and exits, with no error, which is easy to mistake for success. See
-the root [README.md](../../README.md#initial-setup) for the recommended `docker compose up --build`
+the root [README.md](../../README.md#3-installation--first-time-setup) for the recommended `docker compose up --build`
 flow and the app-only `uvicorn` alternative.
 
 ## Recreating your local database after the Alembic history reset (Phase 2.10)
