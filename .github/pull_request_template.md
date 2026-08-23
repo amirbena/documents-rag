@@ -1,11 +1,27 @@
-## Summary
+## What changed
+
+<!-- Concise list of the actual changes -->
 
 ## Why
 
-## Changes
+<!-- Why this change is needed -->
 
-## Verification
+## Files / areas changed
 
-## Explicit exclusions / intentionally not implemented
+<!-- Important files, modules, or system areas touched -->
 
-## Next recommended milestone
+## Agent impact
+
+<!--
+State explicitly whether this PR changes agent behavior,
+agent instructions, agent workflows, prompts, skills, or generated code.
+-->
+
+None.
+
+## Validation
+
+- [ ] Relevant tests pass
+- [ ] Lint / static checks pass where applicable
+- [ ] Diff reviewed for unrelated changes
+- [ ] Branch synchronized with current `main`

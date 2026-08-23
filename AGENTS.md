@@ -199,6 +199,101 @@ storage behavior, a `documents/` package migration beyond what's landed (query/u
 chunk/extract/deletion), an ingestion/indexing package split beyond what's landed, or a new
 abstraction layer (`repositories/`, `domain/`, `application/`) for a hypothetical future need.
 
+## Git Branch and Workflow Policy
+
+### Before every implementation task
+
+Inspect current state before touching any file:
+
+```bash
+git status
+git branch --show-current
+git log --oneline --decorate -n 10
+```
+
+Determine whether the current branch or working tree already contains implementation work — from
+this task or another one. Never silently discard existing work.
+
+- If the working tree holds uncommitted changes that belong to the *new* task, keep them and carry
+  them onto the correct dedicated branch (see below) rather than stashing them away.
+- If it holds unrelated changes that must be moved aside temporarily, use a descriptive stash,
+  including untracked files when needed:
+
+  ```bash
+  git stash push -u -m "preserve existing work before <task>"
+  ```
+
+### Dedicated implementation branches
+
+Every distinct implementation task gets its own branch, created from an up-to-date `main`:
+
+```bash
+git switch main
+git pull --ff-only
+git switch -c <type>/<short-description>
+```
+
+Use a descriptive, type-prefixed name: `feat/<short-description>`, `fix/<short-description>`,
+`chore/<short-description>`, `docs/<short-description>`.
+
+The following are explicit, standalone rules — not merely implied by "every task gets its own
+branch":
+
+- Never modify files directly on `main`.
+- Never start implementation/editing before switching to the dedicated task branch.
+- Every implementation task — including a small docs/config change — must use its own dedicated
+  branch. No task is small enough to skip this.
+- Never continue a new task on an unrelated existing branch, or on an already-open PR branch from a
+  different task, merely because it happens to be checked out.
+- Never mix unrelated tasks on the same branch.
+
+### Destructive Git operations
+
+Never use destructive cleanup as a shortcut for managing repository state. Without explicit user
+authorization, do not run `git reset --hard`, `git checkout -- .`, `git restore .`, `git clean -fd`,
+`git branch -D`, or any equivalent command that can delete user work.
+
+### Before push
+
+The branch must be based on current `origin/main` before it is pushed:
+
+1. `git fetch origin`.
+2. If `origin/main` advanced since the branch was created or last synced, rebase the task branch
+   onto current `origin/main` (`git rebase origin/main`) — never push a stale branch without
+   checking this first.
+3. Resolve any conflicts explicitly; never use a destructive conflict-resolution shortcut
+   (`--theirs`/`--ours` blanket resolution, `git checkout -- .`, `git reset --hard`) to discard
+   existing work instead of resolving it.
+4. Re-run the applicable validation (see Quality Gates below) after the rebase, since it changes
+   the branch's content relative to what was last verified.
+5. Inspect the final diff and state: `git status`, `git diff --check`, `git diff origin/main...HEAD`.
+6. Confirm there are no accidental files, unrelated changes, or unexpected untracked artifacts
+   before pushing or opening a PR.
+
+**Pushing after a rebase depends on whether the branch was already published:**
+
+- **Never pushed yet** (no remote counterpart, e.g. `git rev-parse --abbrev-ref --symbolic-full-name @{u}` fails): rebase and push normally — a plain `git push -u origin <branch>` is safe, since no one else can be relying on its history.
+- **Already pushed / has an open PR**: a rebase rewrites history that is already published. Updating
+  the remote branch afterward requires `git push --force-with-lease` — never plain `--force`, which
+  skips the check that someone else hasn't pushed to the branch in the meantime. Do not perform this
+  force-push silently: explicitly report to the user that the rebase rewrote published branch
+  history and that a force-push is required, and obtain their authorization before running it.
+
+### After merge
+
+```bash
+git switch main
+git pull --ff-only
+git fetch --prune
+git branch -d <branch>          # local cleanup
+git push origin --delete <branch>  # remote cleanup, if not already deleted by the host
+```
+
+If `git branch -d` refuses because the branch isn't recognized as merged, investigate why before
+ever reaching for `-D` — do not force-delete as a default response. The expected end state: checked
+out on `main`, `main` synchronized with `origin/main`, working tree clean, and the merged branch
+removed both locally and remotely.
+
 ## Quality Gates
 
 Run `make verify` before finishing any implementation task and before pushing/opening a PR — it
@@ -211,15 +306,10 @@ replace running it explicitly before considering a task done.
 
 ## Pull Request Workflow
 
-- Before modifying any file for a new implementation task: inspect repo state (`git status`,
-  `git branch --show-current`); fetch and verify the intended base (`git fetch origin` +
-  `git log origin/main`); ensure any existing work is clean or safely preserved (commit/stash —
-  never discard); switch to the base branch and sync it with `origin/main`; create a fresh
-  task-specific branch from it; switch to that branch. Only then edit files. Creating the branch
-  after edits have already started does not satisfy this rule.
-- Never modify files directly on `main`; never start editing before switching branches; never
-  continue a new task on a branch created for a previous task or on an already-open PR branch;
-  never mix unrelated tasks on the same branch. Each implementation task gets its own branch.
+Repository-state inspection, preserving existing work, dedicated branch creation, pre-push
+synchronization, and post-merge cleanup are governed exclusively by "Git Branch and Workflow
+Policy" above — this section covers only PR-specific requirements on top of that.
+
 - Verify `gh --version` / `gh auth status` before any GitHub operation; stop and report if either
   fails.
 - Confirm `git branch --show-current` is the intended feature branch before pushing — never push
@@ -227,10 +317,13 @@ replace running it explicitly before considering a task done.
 - Review `git status`/diff before committing; stage only files that belong to the change; never
   push unrelated files.
 - Prefer small, focused PRs — one milestone or concern per PR.
-- Use `.github/pull_request_template.md`'s sections (Summary, Why, Changes, Verification,
-  Explicit exclusions, Next recommended milestone) as the PR body structure; write it to a file
-  and pass via `gh pr create --body-file`, not an ad-hoc inline `--body`.
+- Use `.github/pull_request_template.md`'s sections (What changed, Why, Files / areas changed,
+  Agent impact, Validation) as the PR body structure; write it to a file and pass via
+  `gh pr create --body-file`, not an ad-hoc inline `--body`.
 - PR title: short, imperative, present tense, no trailing period.
+- `Agent impact` must be explicit. If the change touches agent behavior, instructions, workflows,
+  prompts, skills, or generated code, state that plainly and list the affected behavior — do not
+  leave a reviewer to infer it from the diff. Otherwise, state `None.`
 
 ## Final Report Format
 
